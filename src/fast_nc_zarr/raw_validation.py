@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
+import gc
 import json
 from pathlib import Path
 import time
@@ -92,6 +93,8 @@ def _sample_source_values(inventory, sample_files: int) -> list[dict[str, Any]]:
             )
         finally:
             dataset.close()
+            del dataset
+            gc.collect()
     return results
 
 

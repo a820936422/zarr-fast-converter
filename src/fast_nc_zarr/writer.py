@@ -72,6 +72,8 @@ class ChunkTask:
     output_fill: float | int | None = None
     source_dtype: str | None = None
     output_variable: str | None = None
+    reverse_lat: bool = False
+    reverse_lon: bool = False
 
 
 def make_compressor(name: str, level: int, shuffle: str):
@@ -224,6 +226,12 @@ def initialize_zarr(
             source_time_attrs["source_time_units"] = source_time_units
         if source_time_calendar is not None:
             source_time_attrs["source_time_calendar"] = source_time_calendar
+        lat_values = inventory.lat_values[selection.lat_start : selection.lat_stop]
+        lon_values = inventory.lon_values[selection.lon_start : selection.lon_stop]
+        if output_layout is not None and "lat" in output_layout.axis_reversals:
+            lat_values = lat_values[::-1]
+        if output_layout is not None and "lon" in output_layout.axis_reversals:
+            lon_values = lon_values[::-1]
         coordinates = {
             "time": xr.Variable(
                 ("time",),
@@ -232,12 +240,12 @@ def initialize_zarr(
             ),
             "lat": xr.Variable(
                 ("lat",),
-                inventory.lat_values[selection.lat_start : selection.lat_stop],
+                lat_values,
                 attrs=source[source_dimensions["lat"]].attrs.copy(),
             ),
             "lon": xr.Variable(
                 ("lon",),
-                inventory.lon_values[selection.lon_start : selection.lon_stop],
+                lon_values,
                 attrs=source[source_dimensions["lon"]].attrs.copy(),
             ),
         }
@@ -359,6 +367,10 @@ def _write_chunk(task: ChunkTask) -> int:
             destination = [slice(None)] * len(shape)
             destination[time_axis] = slice(segment.destination_start, segment.destination_stop)
             data[tuple(destination)] = output_order(_read_segment(task, segment))
+    if task.reverse_lat and "lat" in task.output_dims:
+        data = np.flip(data, axis=task.output_dims.index("lat"))
+    if task.reverse_lon and "lon" in task.output_dims:
+        data = np.flip(data, axis=task.output_dims.index("lon"))
     data = _apply_transform(
         data,
         task.fill_values,
@@ -422,6 +434,7 @@ def _chunk_task(
     x1: int,
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
 ) -> ChunkTask:
     spec = inventory.variables[name]
     output_dims = (
@@ -449,6 +462,12 @@ def _chunk_task(
             if isinstance(value, (int, float, np.number)):
                 output_fill = value
                 break
+    reverse_lat = output_layout is not None and "lat" in output_layout.axis_reversals
+    reverse_lon = output_layout is not None and "lon" in output_layout.axis_reversals
+    ny = selection.shape[1]
+    nx = selection.shape[2]
+    source_y0, source_y1 = (ny - y1, ny - y0) if reverse_lat else (y0, y1)
+    source_x0, source_x1 = (nx - x1, nx - x0) if reverse_lon else (x0, x1)
     return ChunkTask(
         variable=name,
         output_variable=(variable_names or {}).get(name, name),
@@ -456,13 +475,15 @@ def _chunk_task(
         output_dims=output_dims,
         dtype=output_dtype,
         output_ranges=tuple(ranges_by_dim[dim] for dim in output_dims),
-        source_lat=(selection.lat_start + y0, selection.lat_start + y1),
-        source_lon=(selection.lon_start + x0, selection.lon_start + x1),
+        source_lat=(selection.lat_start + source_y0, selection.lat_start + source_y1),
+        source_lon=(selection.lon_start + source_x0, selection.lon_start + source_x1),
         segments=_segments(lookup, t0, t1),
         fill_values=transform.fill_values if transform is not None else None,
         scale_factor=transform.scale_factor if transform is not None else None,
         output_fill=output_fill,
         source_dtype=spec.dtype,
+        reverse_lat=reverse_lat,
+        reverse_lon=reverse_lon,
     )
 
 
@@ -472,6 +493,7 @@ def chunk_tasks(
     plan: ConversionPlan,
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
 ) -> list[ChunkTask]:
     nt, ny, nx = selection.shape
     lookup = _time_lookup(inventory, selection)
@@ -484,7 +506,11 @@ def chunk_tasks(
                 for x0 in range(0, nx, plan.chunk_lon):
                     x1 = min(nx, x0 + plan.chunk_lon)
                     tasks.append(
-                        _chunk_task(inventory, selection, plan, lookup, name, t0, t1, y0, y1, x0, x1, variable_transforms, variable_names)
+                        _chunk_task(
+                            inventory, selection, plan, lookup, name,
+                            t0, t1, y0, y1, x0, x1,
+                            variable_transforms, variable_names, output_layout,
+                        )
                     )
     return tasks
 
@@ -495,6 +521,7 @@ def file_tasks(
     plan: ConversionPlan,
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
 ) -> list[tuple[ChunkTask, ...]]:
     if plan.chunk_time != 1:
         raise ValueError("文件优先策略当前要求 chunk_time=1。")
@@ -509,7 +536,11 @@ def file_tasks(
                 for x0 in range(0, nx, plan.chunk_lon):
                     x1 = min(nx, x0 + plan.chunk_lon)
                     one_time.append(
-                        _chunk_task(inventory, selection, plan, lookup, name, t0, t0 + 1, y0, y1, x0, x1, variable_transforms, variable_names)
+                        _chunk_task(
+                            inventory, selection, plan, lookup, name,
+                            t0, t0 + 1, y0, y1, x0, x1,
+                            variable_transforms, variable_names, output_layout,
+                        )
                     )
         time_batches.append(tuple(one_time))
     if plan.task_batch <= 1:
@@ -566,9 +597,13 @@ def direct_write(
         output_layout,
     )
     if plan.strategy == "file":
-        tasks: list = file_tasks(inventory, selection, plan, variable_transforms, variable_names)
+        tasks: list = file_tasks(
+            inventory, selection, plan, variable_transforms, variable_names, output_layout
+        )
     elif plan.strategy == "chunk":
-        tasks = chunk_tasks(inventory, selection, plan, variable_transforms, variable_names)
+        tasks = chunk_tasks(
+            inventory, selection, plan, variable_transforms, variable_names, output_layout
+        )
     else:
         raise ValueError(f"direct_write 不支持策略 {plan.strategy}")
 

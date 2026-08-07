@@ -19,7 +19,12 @@ from fast_nc_zarr.filename_mode import (
     scan_filename_times,
 )
 from fast_nc_zarr.inspection import choose_inspection_workers
-from fast_nc_zarr.models import ConversionPlan, VariableTransform
+from fast_nc_zarr.models import (
+    ConversionPlan,
+    OutputLayout,
+    VariableOutputLayout,
+    VariableTransform,
+)
 from fast_nc_zarr.models import StorageProfile
 from fast_nc_zarr.selection import make_selection
 
@@ -253,6 +258,66 @@ class FilenameModeTests(unittest.TestCase):
         self.assertEqual(plan.chunks, (2, 2, 3))
         with xr.open_zarr(output, consolidated=False, chunks=None, decode_times=False) as dataset:
             self.assertEqual(dataset["value"].encoding["chunks"], (2, 2, 3))
+
+    def test_filename_conversion_applies_axis_reversals(self) -> None:
+        folder = ROOT / "axis-reversals"
+        folder.mkdir()
+        lat = np.asarray([10, 20, 30], dtype="float32")
+        lon = np.asarray([60, 50, 40, 30], dtype="float32")
+        source_values = np.arange(12, dtype="float32").reshape(3, 4)
+        for index, doy in enumerate(("001", "005")):
+            dataset = xr.Dataset(
+                {"value": (("latitude", "longitude"), source_values + index * 100)},
+                coords={"latitude": lat, "longitude": lon},
+            )
+            dataset.to_netcdf(folder / f"product_2001{doy}.nc", engine="h5netcdf")
+            dataset.close()
+
+        inventory = inspect_filename_inventory(
+            scan_filename_times(folder), workers=1, progress=False
+        )
+        selection = make_selection(inventory)
+        shape = selection.shape
+        output_layout = OutputLayout(
+            variables=(
+                VariableOutputLayout(
+                    "value", "value", ("time", "lat", "lon"), shape,
+                    "float32", (1, 2, 3),
+                ),
+                VariableOutputLayout(
+                    "time", "time", ("time",), (shape[0],),
+                    str(inventory.times.dtype), (shape[0],), is_coord=True,
+                ),
+                VariableOutputLayout(
+                    "lat", "lat", ("lat",), (shape[1],),
+                    str(inventory.lat_values.dtype), (shape[1],), is_coord=True,
+                ),
+                VariableOutputLayout(
+                    "lon", "lon", ("lon",), (shape[2],),
+                    str(inventory.lon_values.dtype), (shape[2],), is_coord=True,
+                ),
+            ),
+            axis_reversals=("lat", "lon"),
+        )
+        output = ROOT / "axis-reversals-output.zarr"
+        convert_filename(
+            inventory,
+            selection,
+            output,
+            plan=ConversionPlan("file", 1, 1, 2, 3),
+            output_layout=output_layout,
+            validate=True,
+            progress=False,
+        )
+        with xr.open_zarr(
+            output, consolidated=False, chunks=None, decode_times=False
+        ) as dataset:
+            np.testing.assert_equal(dataset.lat.values, lat[::-1])
+            np.testing.assert_equal(dataset.lon.values, lon[::-1])
+            np.testing.assert_equal(
+                dataset.value.isel(time=0).values,
+                source_values[::-1, ::-1],
+            )
 
     def test_netcdf4_low_level_metadata_scan_for_hdf_eos_grid(self) -> None:
         try:

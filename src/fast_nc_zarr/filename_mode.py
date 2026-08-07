@@ -1279,6 +1279,12 @@ def _initialize_filename_zarr(
             encoding[output_name] = {"chunks": chunks}
             if compressor is not None:
                 encoding[output_name]["compressors"] = [compressor]
+        lat_values = inventory.lat_values[selection.lat_start : selection.lat_stop]
+        lon_values = inventory.lon_values[selection.lon_start : selection.lon_stop]
+        if output_layout is not None and "lat" in output_layout.axis_reversals:
+            lat_values = lat_values[::-1]
+        if output_layout is not None and "lon" in output_layout.axis_reversals:
+            lon_values = lon_values[::-1]
         coords = {
             "time": xr.Variable(
                 ("time",),
@@ -1287,12 +1293,12 @@ def _initialize_filename_zarr(
             ),
             "lat": xr.Variable(
                 ("lat",),
-                inventory.lat_values[selection.lat_start : selection.lat_stop],
+                lat_values,
                 attrs=ref.lat.attrs.copy(),
             ),
             "lon": xr.Variable(
                 ("lon",),
-                inventory.lon_values[selection.lon_start : selection.lon_stop],
+                lon_values,
                 attrs=ref.lon.attrs.copy(),
             ),
         }
@@ -1356,6 +1362,7 @@ def validate_filename_output(
     transforms: dict[str, VariableTransform],
     effective: dict[str, tuple[np.dtype, float | int]],
     variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
     *,
     points: int = 3,
 ) -> None:
@@ -1373,8 +1380,14 @@ def validate_filename_output(
         if any(ds.sizes.get(dim) != size for dim, size in expected.items()):
             raise RuntimeError(f"输出维度不符合预期：{dict(ds.sizes)}，期望 {expected}")
         np.testing.assert_equal(ds.time.values, inventory.times[selection.time_start : selection.time_stop])
-        np.testing.assert_equal(ds.lat.values, inventory.lat_values[selection.lat_start : selection.lat_stop])
-        np.testing.assert_equal(ds.lon.values, inventory.lon_values[selection.lon_start : selection.lon_stop])
+        expected_lat = inventory.lat_values[selection.lat_start : selection.lat_stop]
+        expected_lon = inventory.lon_values[selection.lon_start : selection.lon_stop]
+        if output_layout is not None and "lat" in output_layout.axis_reversals:
+            expected_lat = expected_lat[::-1]
+        if output_layout is not None and "lon" in output_layout.axis_reversals:
+            expected_lon = expected_lon[::-1]
+        np.testing.assert_equal(ds.lat.values, expected_lat)
+        np.testing.assert_equal(ds.lon.values, expected_lon)
         output_names = {
             name: (variable_names or {}).get(name, name)
             for name in selection.variables
@@ -1408,6 +1421,10 @@ def validate_filename_output(
                 expected_data = _prepare_filename_data(
                     raw, inventory.variables[name], transforms.get(name), dtype, fill
                 )
+                if output_layout is not None and "lat" in output_layout.axis_reversals:
+                    expected_data = np.flip(expected_data, axis=0)
+                if output_layout is not None and "lon" in output_layout.axis_reversals:
+                    expected_data = np.flip(expected_data, axis=1)
             del ds
             actual = group[output_name][index]
             np.testing.assert_equal(actual, expected_data)
@@ -1433,6 +1450,10 @@ def _filename_worker_init(
     effective: dict[str, tuple[str, Any]],
     lat_start: int,
     lon_start: int,
+    lat_size: int,
+    lon_size: int,
+    reverse_lat: bool,
+    reverse_lon: bool,
     variable_names: dict[str, str] | None = None,
 ) -> None:
     """Open one output group per process and retain immutable write context."""
@@ -1449,6 +1470,10 @@ def _filename_worker_init(
         },
         "lat_start": lat_start,
         "lon_start": lon_start,
+        "lat_size": lat_size,
+        "lon_size": lon_size,
+        "reverse_lat": reverse_lat,
+        "reverse_lon": reverse_lon,
         "variable_names": variable_names or {},
     }
 
@@ -1479,11 +1504,29 @@ def _filename_write_task(task: FilenameTimeWriteTask) -> int:
             Path(source_path), context["engine"]
         ) as (ds, _):
             for y0, y1, x0, x1 in task.blocks:
-                source_lat = slice(context["lat_start"] + y0, context["lat_start"] + y1)
-                source_lon = slice(context["lon_start"] + x0, context["lon_start"] + x1)
+                source_y0, source_y1 = (
+                    (context["lat_size"] - y1, context["lat_size"] - y0)
+                    if context["reverse_lat"] else (y0, y1)
+                )
+                source_x0, source_x1 = (
+                    (context["lon_size"] - x1, context["lon_size"] - x0)
+                    if context["reverse_lon"] else (x0, x1)
+                )
+                source_lat = slice(
+                    context["lat_start"] + source_y0,
+                    context["lat_start"] + source_y1,
+                )
+                source_lon = slice(
+                    context["lon_start"] + source_x0,
+                    context["lon_start"] + source_x1,
+                )
                 for name in names:
                     dtype, fill = effective[name]
                     raw = ds[name].isel(lat=source_lat, lon=source_lon).values
+                    if context["reverse_lat"]:
+                        raw = np.flip(raw, axis=0)
+                    if context["reverse_lon"]:
+                        raw = np.flip(raw, axis=1)
                     data = _prepare_filename_data(
                         raw, specs[name], transforms.get(name), dtype, fill
                     )
@@ -1573,6 +1616,10 @@ def filename_direct_write(
                 effective_for_workers,
                 selection.lat_start,
                 selection.lon_start,
+                ny,
+                nx,
+                output_layout is not None and "lat" in output_layout.axis_reversals,
+                output_layout is not None and "lon" in output_layout.axis_reversals,
                 variable_names,
             ),
             cancel_event=cancel_event,
@@ -1609,6 +1656,7 @@ def filename_direct_write(
             transforms,
             effective,
             variable_names,
+            output_layout,
         )
     return {
         "elapsed": elapsed,

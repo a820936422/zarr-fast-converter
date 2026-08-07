@@ -368,12 +368,27 @@ def run_pipeline(
     cancel_event=None,
     progress: bool = True,
 ) -> dict[str, object]:
-    """Execute conversion, optional resampling, and finalization atomically."""
+    """Execute the selected product operations and publish one final Zarr."""
 
     plan = build_pipeline_plan(inspection, config)
     paths = _paths(config)
     paths.root.mkdir(parents=True, exist_ok=False)
+    requested_operations = {
+        "conversion": True,
+        "resampling": bool(config.operations.resample),
+        "rechunking": bool(config.operations.rechunk),
+        "recompression": bool(config.operations.recompress),
+    }
+    operation_decisions = {
+        decision.operation: asdict(decision) for decision in plan.operation_decisions
+    }
+    physical_stages = ["conversion"]
+    if plan.needs_resample:
+        physical_stages.append("resampling")
+    if plan.finalization_required:
+        physical_stages.append("finalization")
     manifest = {
+        "schema_version": 2,
         "job_id": paths.root.name,
         "status": "running",
         "source": str(inspection.path),
@@ -382,6 +397,9 @@ def run_pipeline(
         "cleanup_intermediate": bool(config.general.cleanup_intermediate),
         "needs_resample": bool(plan.needs_resample),
         "direct_finalization": bool(plan.direct_finalization),
+        "requested_operations": requested_operations,
+        "operation_decisions": operation_decisions,
+        "physical_stages": physical_stages,
         "output_layout": asdict(plan.output_layout) if plan.output_layout else None,
         "source_read_window": asdict(plan.source_read_window),
         "target_shape": plan.target_grid.dimensions,
@@ -395,8 +413,8 @@ def run_pipeline(
     current = paths.converted
     try:
         conversion = config.conversion
-        conversion_is_final = plan.direct_finalization and not plan.needs_resample
-        resampling_is_final = plan.direct_finalization and plan.needs_resample
+        conversion_is_final = not plan.needs_resample and not plan.finalization_required
+        resampling_is_final = plan.needs_resample and not plan.finalization_required
         final_target = Path(config.general.output).expanduser().resolve()
         if resampling_is_final:
             validate_publish_target(
@@ -431,7 +449,7 @@ def run_pipeline(
             validate=config.validate,
         )
         if progress:
-            stage_total = 1 if conversion_is_final else (2 if resampling_is_final else 3)
+            stage_total = len(physical_stages)
             print(
                 f"一条龙阶段 1/{stage_total}：转换源读取窗口 "
                 f"lat={plan.source_read_window.lat_bounds}，"
@@ -466,7 +484,7 @@ def run_pipeline(
             resample_config = ResampleConfig(
                 input=paths.converted,
                 output=resample_output,
-                resolution=config.general.resolution,
+                resolution=config.resampling.resolution,
                 method=resampling.method,
                 skipna=resampling.skipna,
                 na_thres=resampling.na_thres,
@@ -495,9 +513,8 @@ def run_pipeline(
             )
             if progress:
                 print(
-                    "一条龙阶段 "
-                    + ("2/2" if resampling_is_final else "2/3")
-                    + "：xESMF 重采样到目标网格"
+                    f"一条龙阶段 2/{len(physical_stages)}："
+                    "xESMF 重采样到目标网格"
                 )
             resample_metrics = run_resample(
                 resample_config,
@@ -542,7 +559,7 @@ def run_pipeline(
                 manifest["stages"]["conversion"]["status"] = "validated_and_cleaned"
                 _write_manifest(paths.manifest, manifest)
 
-        if plan.direct_finalization:
+        if not plan.finalization_required:
             rechunk_metrics = {
                 "skipped": True,
                 "reason": (
@@ -554,27 +571,34 @@ def run_pipeline(
                 "avoided_full_store_writes": 1,
             }
             manifest["stages"]["finalization"] = {
-                "status": "skipped_direct_layout",
+                "status": "not_required_direct_layout",
                 "metrics": rechunk_metrics,
             }
         else:
-            finalization = config.finalization
+            chunking = config.chunking
             rechunk_config = RechunkConfig(
                 input=current,
                 output=Path(config.general.output).expanduser().resolve(),
-                strategy=finalization.strategy,
-                target_mib=finalization.target_mib,
-                custom_chunks=finalization.custom_chunks,
-                compression=finalization.compression,
-                workers=finalization.workers,
+                strategy=chunking.strategy,
+                target_mib=chunking.target_mib,
+                custom_chunks=chunking.custom_chunks,
+                compression=(
+                    config.compression.profile
+                    if config.operations.recompress
+                    else "none"
+                ),
+                workers=chunking.workers,
                 overwrite=config.general.overwrite,
                 validate=config.validate,
-                rechunk=True,
-                recompress=finalization.compression != "none",
+                rechunk=config.operations.rechunk,
+                recompress=config.operations.recompress,
                 temporary_dir=paths.root,
             )
             if progress:
-                print("一条龙阶段 3/3：最终重分块与重压缩")
+                print(
+                    f"一条龙阶段 {len(physical_stages)}/{len(physical_stages)}："
+                    "执行布局兼容性最终化"
+                )
             rechunk_metrics = run_rechunk(rechunk_config, cancel_event=cancel_event)
             manifest["stages"]["finalization"] = {
                 "status": "published_and_validated",
@@ -593,7 +617,7 @@ def run_pipeline(
             )
             if not resampling_is_final:
                 temporary_logical_writes += int(resample_metrics.get("logical_bytes", 0))
-        if not plan.direct_finalization:
+        if plan.finalization_required:
             # The rechunk engine writes one full logical intermediate before
             # publishing its final staging store.
             temporary_logical_writes += int(rechunk_metrics.get("logical_bytes", 0))
@@ -606,10 +630,10 @@ def run_pipeline(
                 / max(1, final_logical_bytes)
             ),
             "avoided_finalization_read_bytes": (
-                final_logical_bytes if plan.direct_finalization else 0
+                final_logical_bytes if not plan.finalization_required else 0
             ),
             "avoided_finalization_write_bytes": (
-                final_logical_bytes if plan.direct_finalization else 0
+                final_logical_bytes if not plan.finalization_required else 0
             ),
         }
         manifest["logical_io"] = logical_io
@@ -622,6 +646,9 @@ def run_pipeline(
             "output": str(Path(config.general.output).expanduser().resolve()),
             "elapsed": manifest["elapsed"],
             "needs_resample": plan.needs_resample,
+            "requested_operations": requested_operations,
+            "operation_decisions": operation_decisions,
+            "physical_stages": physical_stages,
             "manifest": str(paths.manifest),
             "conversion": conversion_metrics,
             "resampling": validation_metrics,

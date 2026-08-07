@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -65,10 +66,12 @@ from ..rechunking.planning import DEFAULT_TARGET_MIB, default_workers
 from ..models import VariableTransform
 from ..pipeline.engine import preview_pipeline, run_pipeline
 from ..pipeline.models import (
+    PipelineChunkingOptions,
+    PipelineCompressionOptions,
     PipelineConfig,
     PipelineConversionOptions,
-    PipelineFinalizationOptions,
     PipelineGeneralConfig,
+    PipelineOperations,
     PipelineResamplingOptions,
 )
 from ..selection import parse_list
@@ -1514,7 +1517,7 @@ class ResamplePage(QWidget):
 
 
 class PipelinePage(QWidget):
-    """Four-panel GUI for the end-to-end source-to-final-Zarr pipeline."""
+    """Composable source-to-final-Zarr workflow page."""
 
     task_requested = Signal(str, object, object)
 
@@ -1526,15 +1529,31 @@ class PipelinePage(QWidget):
         title = QLabel("一条龙模块")
         title.setObjectName("pageTitle")
         root.addWidget(title)
-        root.addWidget(
-            QLabel(
-                "先在“数据检查”页完成时间规则确认；本页随后统一执行转换、重采样、"
-                "最终重分块和压缩。"
-            )
-        )
 
-        general = QGroupBox("通用参数")
-        general_form = QFormLayout(general)
+        operations = QGroupBox("处理流程")
+        operations_layout = QHBoxLayout(operations)
+        self.conversion_checkbox = QCheckBox("转换")
+        self.conversion_checkbox.setChecked(True)
+        self.conversion_checkbox.setEnabled(False)
+        self.resample_checkbox = QCheckBox("重采样")
+        self.rechunk_checkbox = QCheckBox("重分块")
+        self.recompress_checkbox = QCheckBox("重压缩")
+        for widget in (
+            self.conversion_checkbox,
+            self.resample_checkbox,
+            self.rechunk_checkbox,
+            self.recompress_checkbox,
+        ):
+            operations_layout.addWidget(widget)
+        operations_layout.addStretch(1)
+        root.addWidget(operations)
+
+        settings = QWidget()
+        settings_layout = QVBoxLayout(settings)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.general_group = QGroupBox("通用参数")
+        general_form = QFormLayout(self.general_group)
         time_row = QHBoxLayout()
         self.time_start = QDateEdit()
         self.time_start.setCalendarPopup(True)
@@ -1550,18 +1569,16 @@ class PipelinePage(QWidget):
         self.lon_min = self._double(-180, 180, -180)
         self.lon_max = self._double(-180, 180, 180)
         general_form.addRow("经度范围", self._pair(self.lon_min, self.lon_max))
-        self.resolution = self._double(0.000001, 180, 0.1, decimals=6)
-        general_form.addRow("目标分辨率", self.resolution)
         temp_row, self.temporary_dir = self._path_row("选择临时处理目录", directory=True)
         general_form.addRow("临时处理目录", temp_row)
         output_row, self.output = self._path_row("选择最终输出目录", directory=False)
         general_form.addRow("最终输出目录", output_row)
         self.cleanup_intermediate = QCheckBox("下游验证通过后立即删除上游中间 Zarr")
-        general_form.addRow("空间策略", self.cleanup_intermediate)
-        root.addWidget(general)
+        general_form.addRow("清理策略", self.cleanup_intermediate)
+        settings_layout.addWidget(self.general_group)
 
-        conversion = QGroupBox("Zarr 转换参数")
-        conversion_layout = QVBoxLayout(conversion)
+        self.conversion_group = QGroupBox("Zarr 转换参数")
+        conversion_layout = QVBoxLayout(self.conversion_group)
         self.variables = QTableWidget(0, 6)
         self.variables.setHorizontalHeaderLabels(
             ("处理", "源变量", "输出变量名", "填充值", "缩放因子", "输出填充值")
@@ -1585,10 +1602,12 @@ class PipelinePage(QWidget):
         self.max_workers.setSpecialValueText("自动")
         conversion_options.addRow("最大并行核心", self.max_workers)
         conversion_layout.addLayout(conversion_options)
-        root.addWidget(conversion)
+        settings_layout.addWidget(self.conversion_group)
 
-        resampling = QGroupBox("重采样参数")
-        resampling_form = QFormLayout(resampling)
+        self.resampling_group = QGroupBox("重采样参数")
+        resampling_form = QFormLayout(self.resampling_group)
+        self.resolution = self._double(0.000001, 180, 0.1, decimals=6)
+        resampling_form.addRow("目标分辨率", self.resolution)
         self.method = QComboBox()
         for value in ("bilinear", "conservative", "conservative_normed", "patch", "nearest_s2d", "nearest_d2s"):
             self.method.addItem(value, value)
@@ -1602,45 +1621,69 @@ class PipelinePage(QWidget):
         self.compute_dtype.addItem("保持源浮点 dtype", "source")
         self.compute_dtype.addItem("浮点转 float32", "float32")
         resampling_form.addRow("计算 dtype", self.compute_dtype)
-        root.addWidget(resampling)
+        settings_layout.addWidget(self.resampling_group)
 
-        final = QGroupBox("重分块与重压缩参数")
-        final_form = QFormLayout(final)
+        self.chunking_group = QGroupBox("重分块参数")
+        chunking_form = QFormLayout(self.chunking_group)
         self.strategy = QComboBox()
         for label, value in (("时间连续", "time"), ("空间连续", "space"), ("自定义", "custom")):
             self.strategy.addItem(label, value)
-        final_form.addRow("分块模式", self.strategy)
+        chunking_form.addRow("分块模式", self.strategy)
         self.target_mib = self._double(32, 256, 128, decimals=1)
-        final_form.addRow("目标 chunk（MiB）", self.target_mib)
+        chunking_form.addRow("目标 chunk（MiB）", self.target_mib)
         custom_row = QHBoxLayout()
         self.custom_chunks = [QSpinBox() for _ in range(3)]
         for box in self.custom_chunks:
             box.setRange(1, 10_000_000)
             custom_row.addWidget(box)
-        final_form.addRow("自定义 chunks", custom_row)
-        self.compression = QComboBox()
-        for value in ("fast", "balanced", "maximum", "none"):
-            self.compression.addItem(value, value)
-        final_form.addRow("最终压缩", self.compression)
+        chunking_form.addRow("自定义 chunks", custom_row)
         self.final_workers = QSpinBox()
         self.final_workers.setRange(1, 256)
         self.final_workers.setValue(1)
-        final_form.addRow("最终 worker", self.final_workers)
-        root.addWidget(final)
+        chunking_form.addRow("兼容性最终化 worker", self.final_workers)
+        settings_layout.addWidget(self.chunking_group)
+
+        self.compression_group = QGroupBox("重压缩参数")
+        compression_form = QFormLayout(self.compression_group)
+        self.compression = QComboBox()
+        for value in ("fast", "balanced", "maximum"):
+            self.compression.addItem(value, value)
+        self.compression.setCurrentIndex(self.compression.findData("balanced"))
+        compression_form.addRow("压缩方案", self.compression)
+        settings_layout.addWidget(self.compression_group)
 
         actions = QHBoxLayout()
-        self.preview_button = _button("生成一条龙计划", self._request_preview)
-        self.run_button = _button("开始一条龙处理", self._request_run)
+        self.preview_button = _button("生成处理计划", self._request_preview)
+        self.run_button = _button("开始处理", self._request_run)
         self.run_button.setEnabled(False)
         actions.addWidget(self.preview_button)
         actions.addWidget(self.run_button)
         actions.addStretch(1)
-        root.addLayout(actions)
+        settings_layout.addLayout(actions)
         self.status = QLabel("等待数据检查结果。")
-        root.addWidget(self.status)
+        settings_layout.addWidget(self.status)
+        settings_layout.addStretch(1)
+
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setWidget(settings)
         self.report = QTextBrowser()
-        root.addWidget(self.report, 1)
-        self.strategy.currentIndexChanged.connect(self._update_custom_state)
+        self.report.setPlaceholderText("尚未生成处理计划。")
+        content = QSplitter(Qt.Orientation.Horizontal)
+        content.addWidget(self.settings_scroll)
+        content.addWidget(self.report)
+        content.setStretchFactor(0, 3)
+        content.setStretchFactor(1, 2)
+        root.addWidget(content, 1)
+        self.strategy.currentIndexChanged.connect(self._update_operation_state)
+        for checkbox in (
+            self.resample_checkbox,
+            self.rechunk_checkbox,
+            self.recompress_checkbox,
+        ):
+            checkbox.toggled.connect(self._update_operation_state)
+            checkbox.toggled.connect(self._invalidate_plan)
+        self._connect_plan_invalidation()
         self._set_enabled(False)
 
     @staticmethod
@@ -1681,25 +1724,56 @@ class PipelinePage(QWidget):
         if value:
             edit.setText(value)
 
+    def _connect_plan_invalidation(self) -> None:
+        for widget in (
+            self.time_start,
+            self.time_end,
+        ):
+            widget.dateChanged.connect(self._invalidate_plan)
+        for widget in (
+            self.lat_min,
+            self.lat_max,
+            self.lon_min,
+            self.lon_max,
+            self.resolution,
+            self.tune_budget,
+            self.max_workers,
+            self.na_thres,
+            self.target_mib,
+            self.final_workers,
+            *self.custom_chunks,
+        ):
+            widget.valueChanged.connect(self._invalidate_plan)
+        for widget in (self.method, self.compute_dtype, self.strategy, self.compression):
+            widget.currentIndexChanged.connect(self._invalidate_plan)
+        for widget in (self.auto_tune, self.skipna, self.cleanup_intermediate):
+            widget.toggled.connect(self._invalidate_plan)
+        for widget in (self.temporary_dir, self.output):
+            widget.textChanged.connect(self._invalidate_plan)
+
+    def _invalidate_plan(self, *_args) -> None:
+        had_plan = self.plan is not None
+        self.plan = None
+        self.run_button.setEnabled(False)
+        if had_plan:
+            self.status.setText("参数已变更，请重新生成处理计划。")
+
     def _set_enabled(self, enabled: bool) -> None:
+        self.general_group.setEnabled(enabled)
+        self.conversion_group.setEnabled(enabled)
         for widget in (
             self.preview_button,
             self.variables,
             self.auto_tune,
             self.tune_budget,
             self.max_workers,
-            self.method,
-            self.skipna,
-            self.na_thres,
-            self.compute_dtype,
-            self.strategy,
-            self.target_mib,
-            self.compression,
-            self.final_workers,
             self.cleanup_intermediate,
+            self.resample_checkbox,
+            self.rechunk_checkbox,
+            self.recompress_checkbox,
         ):
             widget.setEnabled(enabled)
-        self._update_custom_state()
+        self._update_operation_state()
 
     def set_inspection(self, result: InspectionResult) -> None:
         self.inspection = result
@@ -1710,11 +1784,15 @@ class PipelinePage(QWidget):
             self.variables.insertRow(row)
             check = QCheckBox()
             check.setChecked(True)
+            check.toggled.connect(self._invalidate_plan)
             self.variables.setCellWidget(row, 0, check)
             self.variables.setItem(row, 1, QTableWidgetItem(name))
-            self.variables.setCellWidget(row, 2, QLineEdit(name))
+            output_name = QLineEdit(name)
+            output_name.textChanged.connect(self._invalidate_plan)
+            self.variables.setCellWidget(row, 2, output_name)
             spec = info.variables[name]
             fill_edit = QLineEdit()
+            fill_edit.textChanged.connect(self._invalidate_plan)
             source_fill = ", ".join(
                 str(spec.attrs[key])
                 for key in ("_FillValue", "missing_value")
@@ -1723,6 +1801,7 @@ class PipelinePage(QWidget):
             fill_edit.setPlaceholderText(f"源: {source_fill}" if source_fill else "不处理")
             self.variables.setCellWidget(row, 3, fill_edit)
             scale_edit = QLineEdit()
+            scale_edit.textChanged.connect(self._invalidate_plan)
             scale_edit.setPlaceholderText(
                 f"源: {spec.attrs['scale_factor']}"
                 if "scale_factor" in spec.attrs
@@ -1730,18 +1809,29 @@ class PipelinePage(QWidget):
             )
             self.variables.setCellWidget(row, 4, scale_edit)
             output_fill = QLineEdit()
+            output_fill.textChanged.connect(self._invalidate_plan)
             output_fill.setPlaceholderText("默认浮点为 NaN")
             self.variables.setCellWidget(row, 5, output_fill)
         if len(info.times):
             self.time_start.setDate(_qdate(info.times[0]))
             self.time_end.setDate(_qdate(info.times[-1]))
-        self.status.setText("检查结果已载入，请填写四个参数面板并生成计划。")
+        self.status.setText("检查结果已载入，请选择处理操作并生成计划。")
         self._set_enabled(True)
 
-    def _update_custom_state(self) -> None:
-        custom = self.strategy.currentData() == "custom"
+    def _update_operation_state(self, *_args) -> None:
+        available = self.inspection is not None
+        resample = self.resample_checkbox.isChecked()
+        rechunk = self.rechunk_checkbox.isChecked()
+        recompress = self.recompress_checkbox.isChecked()
+        self.resampling_group.setVisible(resample)
+        self.chunking_group.setVisible(rechunk)
+        self.compression_group.setVisible(recompress)
+        self.resampling_group.setEnabled(available and resample)
+        self.chunking_group.setEnabled(available and rechunk)
+        self.compression_group.setEnabled(available and recompress)
+        custom = rechunk and self.strategy.currentData() == "custom"
         for box in self.custom_chunks:
-            box.setEnabled(custom and self.inspection is not None)
+            box.setEnabled(custom and available)
 
     def _selected_variables(self) -> tuple[str, ...]:
         selected = []
@@ -1796,6 +1886,9 @@ class PipelinePage(QWidget):
             raise ValueError("请选择最终输出目录。")
         strategy = self.strategy.currentData()
         custom = tuple(box.value() for box in self.custom_chunks) if strategy == "custom" else None
+        selected_variables = self._selected_variables()
+        if not selected_variables:
+            raise ValueError("至少选择一个转换变量。")
         variable_names, variable_transforms = self._variable_settings()
         return PipelineConfig(
             general=PipelineGeneralConfig(
@@ -1807,29 +1900,36 @@ class PipelinePage(QWidget):
                 lat_max=self.lat_max.value(),
                 lon_min=self.lon_min.value(),
                 lon_max=self.lon_max.value(),
-                resolution=self.resolution.value(),
                 cleanup_intermediate=self.cleanup_intermediate.isChecked(),
             ),
             conversion=PipelineConversionOptions(
-                variables=self._selected_variables(),
+                variables=selected_variables,
                 variable_names=variable_names,
                 variable_transforms=variable_transforms,
                 auto_tune=self.auto_tune.isChecked(),
                 tune_budget=self.tune_budget.value(),
                 max_workers=self.max_workers.value() or None,
             ),
+            operations=PipelineOperations(
+                resample=self.resample_checkbox.isChecked(),
+                rechunk=self.rechunk_checkbox.isChecked(),
+                recompress=self.recompress_checkbox.isChecked(),
+            ),
             resampling=PipelineResamplingOptions(
+                resolution=self.resolution.value(),
                 method=self.method.currentData(),
                 skipna=self.skipna.isChecked(),
                 na_thres=self.na_thres.value(),
                 compute_dtype=self.compute_dtype.currentData(),
             ),
-            finalization=PipelineFinalizationOptions(
+            chunking=PipelineChunkingOptions(
                 strategy=strategy,
                 target_mib=self.target_mib.value(),
                 custom_chunks=custom,
-                compression=self.compression.currentData(),
                 workers=self.final_workers.value(),
+            ),
+            compression=PipelineCompressionOptions(
+                profile=self.compression.currentData(),
             ),
         )
 
@@ -1860,15 +1960,20 @@ class PipelinePage(QWidget):
     def _preview_done(self, plan) -> None:
         self.plan = plan
         self.run_button.setEnabled(True)
+        decisions = "\n".join(
+            f"{item.operation}: {item.disposition} - {item.reason}"
+            for item in plan.operation_decisions
+        )
         self.report.setPlainText(
-            "一条龙计划\n"
+            "处理计划\n"
             f"目标 shape(lat, lon)=({plan.target_grid.lat.size}, {plan.target_grid.lon.size})\n"
             f"目标范围={plan.target_grid.spatial_extent}\n"
             f"最终 chunks(time, lat, lon)={plan.final_chunks}\n"
             f"源读取窗口=lat {plan.source_read_window.lat_bounds}，"
             f"lon {plan.source_read_window.lon_bounds}\n"
             f"halo={plan.source_read_window.halo_description}\n"
-            f"需要重采样={'是' if plan.needs_resample else '否'}"
+            f"需要实际重采样={'是' if plan.needs_resample else '否'}\n"
+            f"操作决策：\n{decisions}"
             + (f"\n覆盖提醒：{plan.coverage_warning}" if plan.coverage_warning else "")
         )
         self.status.setText("计划已生成，请确认报告后开始处理。")

@@ -72,6 +72,7 @@ class OutputLayout:
     """Complete final storage contract shared by planning and execution."""
 
     variables: tuple[VariableOutputLayout, ...]
+    axis_reversals: tuple[Literal["lat", "lon"], ...] = ()
 
     def for_source(self, name: str) -> VariableOutputLayout:
         try:

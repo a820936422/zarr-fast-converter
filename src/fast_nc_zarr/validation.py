@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .models import Inventory, Selection, VariableTransform
+from .models import Inventory, OutputLayout, Selection, VariableTransform
 
 
 def _lookup(inventory: Inventory, selection: Selection) -> list[tuple[Path, int]]:
@@ -23,6 +23,7 @@ def validate_output(
     points: int = 3,
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
 ) -> None:
     import netCDF4
     import xarray as xr
@@ -34,14 +35,14 @@ def validate_output(
         for dim, size in expected_sizes.items():
             if ds.sizes.get(dim) != size:
                 raise RuntimeError(f"输出 {dim}={ds.sizes.get(dim)}，期望 {size}")
-        np.testing.assert_equal(
-            ds.lat.values,
-            inventory.lat_values[selection.lat_start : selection.lat_stop],
-        )
-        np.testing.assert_equal(
-            ds.lon.values,
-            inventory.lon_values[selection.lon_start : selection.lon_stop],
-        )
+        expected_lat = inventory.lat_values[selection.lat_start : selection.lat_stop]
+        expected_lon = inventory.lon_values[selection.lon_start : selection.lon_stop]
+        if output_layout is not None and "lat" in output_layout.axis_reversals:
+            expected_lat = expected_lat[::-1]
+        if output_layout is not None and "lon" in output_layout.axis_reversals:
+            expected_lon = expected_lon[::-1]
+        np.testing.assert_equal(ds.lat.values, expected_lat)
+        np.testing.assert_equal(ds.lon.values, expected_lon)
         np.testing.assert_equal(
             ds.time.values,
             inventory.times[selection.time_start : selection.time_stop],
@@ -74,9 +75,21 @@ def validate_output(
                     if dim == "time":
                         source_indices.append(local_t)
                     elif dim == "lat":
-                        source_indices.append(selection.lat_start + y_index)
+                        source_y = (
+                            ny - 1 - y_index
+                            if output_layout is not None
+                            and "lat" in output_layout.axis_reversals
+                            else y_index
+                        )
+                        source_indices.append(selection.lat_start + source_y)
                     elif dim == "lon":
-                        source_indices.append(selection.lon_start + x_index)
+                        source_x = (
+                            nx - 1 - x_index
+                            if output_layout is not None
+                            and "lon" in output_layout.axis_reversals
+                            else x_index
+                        )
+                        source_indices.append(selection.lon_start + source_x)
                 expected = source.variables[name][tuple(source_indices)]
             output_indices = tuple(
                 {"time": t_index, "lat": y_index, "lon": x_index}[dim]

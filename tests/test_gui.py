@@ -223,6 +223,43 @@ class GuiServiceTests(unittest.TestCase):
         window.close()
         app.processEvents()
 
+    def test_pipeline_page_builds_composable_operation_config(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        result = inspect_source(
+            SourceInspectionConfig(ROOT / "source", engine="h5netcdf", workers=1)
+        )
+        page = window.pipeline_page
+        page.set_inspection(result)
+        page.output.setText(str(ROOT / "pipeline-output.zarr"))
+
+        self.assertTrue(page.conversion_checkbox.isChecked())
+        self.assertFalse(page.conversion_checkbox.isEnabled())
+        self.assertFalse(page.resampling_group.isEnabled())
+        self.assertFalse(page.chunking_group.isEnabled())
+        self.assertFalse(page.compression_group.isEnabled())
+
+        page.resample_checkbox.setChecked(True)
+        page.rechunk_checkbox.setChecked(True)
+        page.recompress_checkbox.setChecked(True)
+        config = page._config()
+        self.assertTrue(config.operations.resample)
+        self.assertTrue(config.operations.rechunk)
+        self.assertTrue(config.operations.recompress)
+        self.assertEqual(config.resampling.resolution, 0.1)
+        self.assertEqual(config.compression.profile, "balanced")
+        self.assertTrue(page.resampling_group.isEnabled())
+        self.assertTrue(page.chunking_group.isEnabled())
+        self.assertTrue(page.compression_group.isEnabled())
+
+        page.plan = object()
+        page.run_button.setEnabled(True)
+        page.recompress_checkbox.setChecked(False)
+        self.assertIsNone(page.plan)
+        self.assertFalse(page.run_button.isEnabled())
+        window.close()
+        app.processEvents()
+
     def test_time_check_is_required_before_source_operation_pages(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = MainWindow()

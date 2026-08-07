@@ -11,7 +11,7 @@ from ..resampling.models import TargetGrid
 
 @dataclass(frozen=True)
 class PipelineGeneralConfig:
-    """The five common fields plus the V1 temporary-store policy."""
+    """Source selection, publication and temporary-store policy."""
 
     output: Path
     temporary_dir: Path | None = None
@@ -21,7 +21,6 @@ class PipelineGeneralConfig:
     lat_max: float = 90.0
     lon_min: float = -180.0
     lon_max: float = 180.0
-    resolution: float = 0.1
     cleanup_intermediate: bool = False
     overwrite: bool = False
 
@@ -39,6 +38,7 @@ class PipelineConversionOptions:
 
 @dataclass(frozen=True)
 class PipelineResamplingOptions:
+    resolution: float = 0.1
     method: str = "bilinear"
     skipna: bool = True
     na_thres: float = 1.0
@@ -50,21 +50,58 @@ class PipelineResamplingOptions:
 
 
 @dataclass(frozen=True)
-class PipelineFinalizationOptions:
+class PipelineOperations:
+    """Optional product operations selected by the user.
+
+    Conversion is intentionally absent: raw NC/HDF/TIFF input always requires
+    conversion before it can become a Zarr product.
+    """
+
+    resample: bool = False
+    rechunk: bool = False
+    recompress: bool = False
+
+
+@dataclass(frozen=True)
+class PipelineChunkingOptions:
     strategy: Literal["time", "space", "custom"] = "time"
     target_mib: float = 128.0
     custom_chunks: tuple[int, int, int] | None = None
-    compression: Literal["fast", "balanced", "maximum", "none"] = "balanced"
     workers: int = 1
+
+
+@dataclass(frozen=True)
+class PipelineCompressionOptions:
+    profile: Literal["fast", "balanced", "maximum"] = "balanced"
 
 
 @dataclass(frozen=True)
 class PipelineConfig:
     general: PipelineGeneralConfig
     conversion: PipelineConversionOptions = field(default_factory=PipelineConversionOptions)
+    operations: PipelineOperations = field(default_factory=PipelineOperations)
     resampling: PipelineResamplingOptions = field(default_factory=PipelineResamplingOptions)
-    finalization: PipelineFinalizationOptions = field(default_factory=PipelineFinalizationOptions)
+    chunking: PipelineChunkingOptions = field(default_factory=PipelineChunkingOptions)
+    compression: PipelineCompressionOptions = field(default_factory=PipelineCompressionOptions)
     validate: bool = True
+
+
+OperationName = Literal["conversion", "resampling", "rechunking", "recompression"]
+OperationDisposition = Literal[
+    "executed_as_stage",
+    "fused_into_conversion",
+    "fused_into_resampling",
+    "satisfied_as_noop",
+    "not_requested",
+]
+
+
+@dataclass(frozen=True)
+class OperationDecision:
+    operation: OperationName
+    requested: bool
+    disposition: OperationDisposition
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -103,6 +140,16 @@ class PipelinePlan:
     final_compression: CompressionPlan | None = None
     output_layout: OutputLayout | None = None
     direct_finalization: bool = False
+    finalization_required: bool = False
+    operation_decisions: tuple[OperationDecision, ...] = ()
+
+    def decision(self, operation: OperationName) -> OperationDecision:
+        try:
+            return next(
+                item for item in self.operation_decisions if item.operation == operation
+            )
+        except StopIteration as exc:
+            raise KeyError(f"处理计划缺少操作决策：{operation}") from exc
 
 
 @dataclass(frozen=True)

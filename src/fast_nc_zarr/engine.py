@@ -316,6 +316,7 @@ def convert(
                 staging,
                 variable_transforms=variable_transforms,
                 variable_names=variable_names,
+                output_layout=output_layout,
             )
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("任务已取消，未发布输出。")

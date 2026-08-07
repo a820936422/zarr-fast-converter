@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import json
 from dataclasses import replace
+from itertools import product
 from pathlib import Path
 import sys
 import unittest
@@ -18,10 +19,12 @@ sys.path.insert(0, str(PROJECT / "src"))
 from fast_nc_zarr.application.services import SourceInspectionConfig, inspect_source  # noqa: E402
 from fast_nc_zarr.pipeline.engine import preview_pipeline, run_pipeline  # noqa: E402
 from fast_nc_zarr.pipeline.models import (  # noqa: E402
+    PipelineChunkingOptions,
+    PipelineCompressionOptions,
     PipelineConfig,
     PipelineConversionOptions,
-    PipelineFinalizationOptions,
     PipelineGeneralConfig,
+    PipelineOperations,
     PipelineResamplingOptions,
 )
 from fast_nc_zarr.pipeline.planner import build_pipeline_plan  # noqa: E402
@@ -84,25 +87,30 @@ class PipelineTests(unittest.TestCase):
                 lat_max=0.3,
                 lon_min=-0.1,
                 lon_max=0.1,
-                resolution=resolution,
             ),
             conversion=PipelineConversionOptions(
                 auto_tune=False,
                 max_workers=1,
             ),
+            operations=PipelineOperations(
+                resample=True,
+                rechunk=True,
+                recompress=True,
+            ),
             resampling=PipelineResamplingOptions(
+                resolution=resolution,
                 method="bilinear",
                 compute_workers=1,
                 space_workers=1,
                 tile_size=2,
                 time_block=1,
             ),
-            finalization=PipelineFinalizationOptions(
+            chunking=PipelineChunkingOptions(
                 strategy="time",
                 target_mib=1,
-                compression="fast",
                 workers=1,
             ),
+            compression=PipelineCompressionOptions(profile="fast"),
         )
 
     def test_source_window_expands_beyond_target_boundary(self) -> None:
@@ -122,6 +130,151 @@ class PipelineTests(unittest.TestCase):
         np.testing.assert_allclose(plan.target_grid.lat[-1], 0.15)
         np.testing.assert_allclose(plan.target_grid.lon[0], -0.05)
         np.testing.assert_allclose(plan.target_grid.lon[-1], 0.05)
+
+    def test_planner_covers_all_optional_operation_combinations(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        for resample, rechunk, recompress in product((False, True), repeat=3):
+            with self.subTest(
+                resample=resample,
+                rechunk=rechunk,
+                recompress=recompress,
+            ):
+                base = self._config(ROOT / "combination-plan.zarr")
+                config = replace(
+                    base,
+                    operations=PipelineOperations(
+                        resample=resample,
+                        rechunk=rechunk,
+                        recompress=recompress,
+                    ),
+                )
+                plan = preview_pipeline(inspection, config)
+                self.assertEqual(plan.needs_resample, resample)
+                self.assertEqual(plan.decision("resampling").requested, resample)
+                self.assertEqual(plan.decision("rechunking").requested, rechunk)
+                self.assertEqual(plan.decision("recompression").requested, recompress)
+                self.assertEqual(plan.final_compression.enabled, recompress)
+                self.assertFalse(plan.finalization_required)
+                terminal = "fused_into_resampling" if resample else "fused_into_conversion"
+                self.assertEqual(
+                    plan.decision("rechunking").disposition,
+                    terminal if rechunk else "not_requested",
+                )
+                self.assertEqual(
+                    plan.decision("recompression").disposition,
+                    terminal if recompress else "not_requested",
+                )
+
+    def test_resampling_parameters_are_ignored_when_operation_is_not_selected(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        base = self._config(ROOT / "ignored-resampling-options.zarr")
+        invalid_options = replace(base.resampling, resolution=-1, method="invalid")
+        conversion_only = replace(
+            base,
+            operations=PipelineOperations(),
+            resampling=invalid_options,
+        )
+        plan = preview_pipeline(inspection, conversion_only)
+        self.assertFalse(plan.needs_resample)
+        self.assertEqual(plan.decision("resampling").disposition, "not_requested")
+        with self.assertRaisesRegex(ValueError, "目标分辨率"):
+            preview_pipeline(
+                inspection,
+                replace(
+                    conversion_only,
+                    operations=PipelineOperations(resample=True),
+                ),
+            )
+
+    def test_conversion_only_plan_supports_single_source_grid_cell(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        base = self._config(ROOT / "single-cell.zarr")
+        config = replace(
+            base,
+            operations=PipelineOperations(),
+            general=replace(
+                base.general,
+                lat_min=0.12,
+                lat_max=0.13,
+                lon_min=-0.08,
+                lon_max=-0.07,
+            ),
+        )
+        plan = preview_pipeline(inspection, config)
+        self.assertEqual(plan.target_grid.dimensions, {"lat": 1, "lon": 1})
+        self.assertEqual(len(plan.target_grid.lat_bounds), 2)
+        self.assertEqual(len(plan.target_grid.lon_bounds), 2)
+
+    def test_conversion_only_normalizes_source_axis_orientation(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        base = self._config(ROOT / "conversion-only-orientation.zarr")
+        config = replace(base, operations=PipelineOperations())
+        result = run_pipeline(inspection, config, progress=False)
+        self.assertEqual(result["physical_stages"], ["conversion"])
+        with xr.open_zarr(
+            config.general.output,
+            consolidated=False,
+            chunks=None,
+            decode_times=False,
+        ) as dataset:
+            np.testing.assert_allclose(dataset.lat.values, [0.275, 0.225, 0.175, 0.125])
+            np.testing.assert_allclose(dataset.lon.values, [-0.075, -0.025, 0.025, 0.075])
+            self.assertEqual(float(dataset["value"].isel(time=0, lat=0, lon=0)), 42.0)
+
+    def test_executor_manifest_covers_all_identity_grid_combinations(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(
+                ROOT / "canonical", mode="complete", engine="h5netcdf", workers=1
+            )
+        )
+        for index, (resample, rechunk, recompress) in enumerate(
+            product((False, True), repeat=3)
+        ):
+            with self.subTest(
+                resample=resample,
+                rechunk=rechunk,
+                recompress=recompress,
+            ):
+                base = self._config(ROOT / f"combination-{index}.zarr")
+                config = replace(
+                    base,
+                    operations=PipelineOperations(
+                        resample=resample,
+                        rechunk=rechunk,
+                        recompress=recompress,
+                    ),
+                    validate=False,
+                )
+                result = run_pipeline(inspection, config, progress=False)
+                manifest = json.loads(
+                    Path(result["manifest"]).read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["schema_version"], 2)
+                self.assertEqual(manifest["physical_stages"], ["conversion"])
+                self.assertEqual(
+                    manifest["requested_operations"],
+                    {
+                        "conversion": True,
+                        "resampling": resample,
+                        "rechunking": rechunk,
+                        "recompression": recompress,
+                    },
+                )
+                expected_resampling = "satisfied_as_noop" if resample else "not_requested"
+                self.assertEqual(
+                    manifest["operation_decisions"]["resampling"]["disposition"],
+                    expected_resampling,
+                )
+                self.assertEqual(result["logical_io"]["write_amplification"], 1.0)
+                self.assertTrue(config.general.output.exists())
 
     def test_pipeline_writes_canonical_target_zarr(self) -> None:
         inspection = inspect_source(
@@ -154,7 +307,7 @@ class PipelineTests(unittest.TestCase):
         converted = Path(manifest["temporary_root"]) / "source-crop.zarr"
         self.assertEqual(
             manifest["stages"]["finalization"]["status"],
-            "skipped_direct_layout",
+            "not_required_direct_layout",
         )
         self.assertFalse((Path(manifest["temporary_root"]) / "resampled.zarr").exists())
         with xr.open_zarr(converted, consolidated=False, chunks=None, decode_times=False) as dataset:
@@ -163,6 +316,31 @@ class PipelineTests(unittest.TestCase):
         value_layout = plan.output_layout.for_source("value")
         self.assertEqual(group["value"].chunks, value_layout.chunks)
         self.assertIn("shuffle", repr(group["value"].compressors).lower())
+
+    def test_resampling_without_storage_operations_uses_baseline_layout(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        base = self._config(ROOT / "resample-baseline-layout.zarr")
+        config = replace(
+            base,
+            operations=PipelineOperations(resample=True),
+        )
+        plan = preview_pipeline(inspection, config)
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["physical_stages"], ["conversion", "resampling"])
+        self.assertEqual(
+            manifest["operation_decisions"]["rechunking"]["disposition"],
+            "not_requested",
+        )
+        self.assertEqual(
+            manifest["operation_decisions"]["recompression"]["disposition"],
+            "not_requested",
+        )
+        group = zarr.open_group(config.general.output, mode="r")
+        self.assertEqual(group["value"].chunks, plan.output_layout.for_source("value").chunks)
+        self.assertIn("zstd", repr(group["value"].compressors).lower())
 
     def test_auto_pipeline_conversion_time_chunk_uses_resampling_batch(self) -> None:
         inspection = inspect_source(
@@ -207,11 +385,12 @@ class PipelineTests(unittest.TestCase):
                 lat_max=0.3,
                 lon_min=-0.1,
                 lon_max=0.1,
-                resolution=0.1,
             ),
             conversion=config.conversion,
+            operations=config.operations,
             resampling=config.resampling,
-            finalization=config.finalization,
+            chunking=config.chunking,
+            compression=config.compression,
         )
         plan = preview_pipeline(inspection, config)
         self.assertFalse(plan.needs_resample)
@@ -226,7 +405,7 @@ class PipelineTests(unittest.TestCase):
         manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
         self.assertEqual(
             manifest["stages"]["finalization"]["status"],
-            "skipped_direct_layout",
+            "not_required_direct_layout",
         )
         self.assertFalse((Path(manifest["temporary_root"]) / "source-crop.zarr").exists())
         group = zarr.open_group(config.general.output, mode="r")

@@ -70,10 +70,12 @@ PYTHONPATH=/media/owen/机械硬盘/代码/zarr快速转换器v1/src \
 fast-zarr-gui
 ```
 
-## 一条龙模块（V1）
+## 可组合一条龙模块（v1.3.0）
 
-一条龙模块会先执行完整的数据检查和时间规则确认，然后按统一 `OutputLayout` 完成源读取范围
-裁剪转换、可选的 xESMF 重采样和无损压缩。转换阶段的源窗口会根据目标边界、源/目标
+一条龙模块会先执行完整的数据检查和时间规则确认。原始数据转换是必经步骤；
+重采样、重分块和重压缩可以独立选择，所有组合始终只发布一份最终 Zarr。规划器按统一
+`OutputLayout` 融合用户意图：选择的 chunks 和 codec 优先由转换器或重采样器直接写出，
+而不是强制再写一遍完整数据。需要重采样时，转换阶段的源窗口会根据目标边界、源/目标
 分辨率和重采样方法自动增加边界 stencil，避免直接裁到用户填写的边界导致海岸线或边界
 像元结果偏差。最终 Zarr 统一使用 `time/lat/lon`，纬度从北到南、经度从西到东。
 网格完全一致时转换器直接写最终 chunks 和 codec；需要重采样时，重采样器直接写最终布局。
@@ -87,7 +89,9 @@ PYTHONPATH=src /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
   -m fast_nc_zarr.pipeline \
   --input /path/to/gosif-tif \
   --output /path/to/gosif.zarr \
-  --lat 30 90 --lon -180 180 --resolution 0.1 \
+  --lat 30 90 --lon -180 180 \
+  --resample --resolution 0.1 \
+  --rechunk --recompress \
   --method conservative --skipna \
   --strategy time --compression balanced \
   --inspection-cache /path/to/cache/gosif-inspection.json \
@@ -95,6 +99,8 @@ PYTHONPATH=src /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
 ```
 
 也可以使用已安装的 `fast-zarr-pipeline` 入口。`--dry-run` 只执行检查和计划，不写数据；
+`--resample`、`--rechunk`、`--recompress` 分别开启对应可选操作；三者都不提供时
+执行仅转换流程。`--resolution` 只在同时选择 `--resample` 时有效。
 `--cleanup-intermediate` 会在下游验证通过后删除已不再需要的上游临时 Zarr。完整设计与
 阶段边界见 [docs/ONE_STOP_PIPELINE_V1.md](docs/ONE_STOP_PIPELINE_V1.md)。
 对于数千个源文件，建议固定使用同一个 `--inspection-cache` 路径。快照记录文件路径、
