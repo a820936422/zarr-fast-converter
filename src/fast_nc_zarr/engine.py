@@ -9,9 +9,10 @@ import numpy as np
 from .benchmark import COMPRESSION_SAFETY, tune
 from .models import ConversionPlan, Inventory, Selection, VariableTransform
 from .planner import candidate_plans, initial_plan
+from .publication import make_staging_path, publish_staging, validate_publish_target
 from .selection import selected_logical_bytes
 from .validation import validate_output
-from .writer import direct_write, make_compressor, remove_output
+from .writer import direct_write, make_compressor
 
 
 def _canonicalize_dimensions(ds, source_dimensions: tuple[str, str, str]):
@@ -215,17 +216,13 @@ def convert(
     chunks: tuple[int, int, int] | None = None,
     cancel_event=None,
 ) -> tuple[ConversionPlan, dict]:
-    output = output.expanduser().resolve()
+    output = validate_publish_target(
+        output,
+        overwrite=overwrite,
+        operation="转换",
+    )
     if output == inventory.input_dir:
         raise ValueError("输入目录和输出目录不能相同。")
-    if output.exists():
-        if not output.is_dir():
-            raise FileExistsError(f"输出路径存在但不是目录：{output}")
-        if any(output.iterdir()):
-            if not overwrite:
-                raise FileExistsError(f"输出目录非空：{output}")
-            remove_output(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
 
     plan = initial_plan(inventory, selection, output, reserve_gib=reserve_gib)
     if chunks is not None:
@@ -308,35 +305,43 @@ def convert(
         print("正式执行计划：" + plan.label())
         for reason in plan.rationale:
             print("  - " + reason)
-    if plan.strategy == "dask":
-        metrics = _dask_write(
-            inventory,
-            selection,
-            output,
-            plan,
-            variable_transforms=variable_transforms,
-            variable_names=variable_names,
-            chunks=chunks,
-            cancel_event=cancel_event,
-            progress=progress,
-        )
-    else:
-        metrics = direct_write(
-            inventory,
-            selection,
-            output,
-            plan,
-            variable_transforms=variable_transforms,
-            variable_names=variable_names,
-            cancel_event=cancel_event,
-            progress=progress,
-        )
-    if validate:
-        validate_output(
-            inventory,
-            selection,
-            output,
-            variable_transforms=variable_transforms,
-            variable_names=variable_names,
-        )
+    staging = make_staging_path(output, "convert")
+    try:
+        if plan.strategy == "dask":
+            metrics = _dask_write(
+                inventory,
+                selection,
+                staging,
+                plan,
+                variable_transforms=variable_transforms,
+                variable_names=variable_names,
+                chunks=chunks,
+                cancel_event=cancel_event,
+                progress=progress,
+            )
+        else:
+            metrics = direct_write(
+                inventory,
+                selection,
+                staging,
+                plan,
+                variable_transforms=variable_transforms,
+                variable_names=variable_names,
+                cancel_event=cancel_event,
+                progress=progress,
+            )
+        if validate:
+            validate_output(
+                inventory,
+                selection,
+                staging,
+                variable_transforms=variable_transforms,
+                variable_names=variable_names,
+            )
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("任务已取消，未发布输出。")
+        publish_staging(staging, output, "convert", overwrite=overwrite)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return plan, metrics

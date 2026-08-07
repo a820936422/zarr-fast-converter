@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import gc
 import itertools
-import multiprocessing
 import os
 import shutil
 import time
@@ -21,6 +20,8 @@ import zarr
 from .compression import codec_for, make_compression_plan
 from .inspection import inspect_store
 from .models import ChunkPlan, CompressionPlan, DatasetInfo
+from ..publication import publish_staging
+from ..runtime import spawn_context
 
 
 class RechunkExecutionError(RuntimeError):
@@ -59,6 +60,8 @@ def next_available_output(path: str | Path) -> Path:
 
 
 def _prepare_target(path: Path, overwrite: bool) -> None:
+    if path.is_symlink():
+        raise RechunkExecutionError(f"拒绝将输出路径写入符号链接：{path}")
     if path.exists() and not path.is_dir():
         raise RechunkExecutionError(f"输出路径存在但不是目录：{path}")
     if not path.exists():
@@ -731,7 +734,7 @@ def _run_process_tasks(
 
     if workers <= 1:
         raise ValueError("并行任务至少需要 2 个 worker。")
-    context = multiprocessing.get_context("spawn")
+    context = spawn_context()
     started = time.perf_counter()
     processed_bytes = 0
     processed_chunks = 0
@@ -1624,15 +1627,16 @@ def run_rechunk(
 
         if cancel_event is not None and cancel_event.is_set():
             raise RechunkExecutionError("任务已取消。")
-        if target.exists():
-            if any(target.iterdir()):
-                shutil.rmtree(target)
-            else:
-                target.rmdir()
-        # staging is always beside target, so publication is an atomic rename
-        # on the destination filesystem.  The user-selected temporary root
-        # contains only the intermediate store.
-        os.replace(staging, target)
+        # Staging is beside target, so publication is an atomic rename on the
+        # destination filesystem.  An existing valid output is moved to a
+        # recoverable backup until the new store has been installed.
+        publish_staging(
+            staging,
+            target,
+            "rechunk",
+            overwrite=overwrite,
+            require_zarr_v3=True,
+        )
         shutil.rmtree(intermediate)
         elapsed = time.perf_counter() - started
         physical_bytes = _directory_size(target)

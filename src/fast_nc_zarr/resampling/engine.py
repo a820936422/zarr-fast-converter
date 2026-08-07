@@ -4,8 +4,6 @@ import json
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, replace
 import itertools
-import multiprocessing as mp
-import os
 from pathlib import Path
 import shutil
 import time
@@ -18,6 +16,8 @@ import xarray as xr
 import zarr
 
 from ..rechunking.models import DatasetInfo, VariableInfo
+from ..publication import publish_staging
+from ..runtime import configure_process_runtime, spawn_context
 from .autotune import (
     resolve_auto_space_workers,
     resolve_auto_tile_size,
@@ -132,21 +132,16 @@ def _resolve_temporary_root(
     return root
 
 
-def _publish_staging(staging: Path, target: Path) -> None:
+def _publish_staging(staging: Path, target: Path, overwrite: bool) -> None:
     """Publish a completed store while keeping an existing output recoverable."""
 
-    backup: Path | None = None
-    if target.exists():
-        backup = target.parent / f".{target.name}.resample-backup-{uuid4().hex}"
-        target.rename(backup)
-    try:
-        os.replace(staging, target)
-    except Exception:
-        if backup is not None and not target.exists():
-            backup.rename(target)
-        raise
-    if backup is not None:
-        shutil.rmtree(backup, ignore_errors=True)
+    publish_staging(
+        staging,
+        target,
+        "resample",
+        overwrite=overwrite,
+        require_zarr_v3=True,
+    )
 
 
 def _directory_size(path: Path) -> int:
@@ -163,9 +158,7 @@ def _directory_size(path: Path) -> int:
 def _configure_runtime() -> None:
     """Keep ESMF and numerical libraries from multiplying threads."""
 
-    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-        os.environ.setdefault(name, "1")
-    os.environ.setdefault("ESMF_RUNTIME_LOG_KIND", "NONE")
+    configure_process_runtime()
 
 
 def _grid_dataset(
@@ -1237,7 +1230,7 @@ def _run_parallel_tiles(
 ) -> dict[str, float]:
     """Run bounded, spawn-safe spatial work without submitting all tiles."""
 
-    context = mp.get_context("spawn")
+    context = spawn_context()
     executor = ProcessPoolExecutor(
         max_workers=max(1, int(plan.space_workers)),
         mp_context=context,
@@ -1778,7 +1771,7 @@ def run_resample(
         )
         source.close()
         source = None
-        _publish_staging(staging, target_path)
+        _publish_staging(staging, target_path, config.overwrite)
         if intermediate is not None:
             shutil.rmtree(intermediate, ignore_errors=True)
         elapsed = time.perf_counter() - started

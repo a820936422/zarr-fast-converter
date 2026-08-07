@@ -4,7 +4,7 @@ from collections import Counter
 from typing import Any
 
 import numpy as np
-from zarr.codecs import BloscCodec, BloscShuffle, ZstdCodec
+from zarr.codecs import BloscCodec, ZstdCodec
 
 from .models import CompressionPlan, DatasetInfo, VariableInfo
 
@@ -29,12 +29,12 @@ def make_compression_plan(profile: str) -> CompressionPlan:
     return CompressionPlan(profile, _LEVELS[profile], descriptions[profile])
 
 
-def _shuffle_for(variable: VariableInfo) -> BloscShuffle:
+def _shuffle_for(variable: VariableInfo) -> str:
     if variable.kind == "integer":
-        return BloscShuffle.bitshuffle
+        return "bitshuffle"
     if variable.kind == "floating":
-        return BloscShuffle.shuffle
-    return BloscShuffle.noshuffle
+        return "shuffle"
+    return "noshuffle"
 
 
 def codec_for(

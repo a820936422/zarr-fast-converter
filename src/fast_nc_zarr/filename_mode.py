@@ -33,7 +33,9 @@ from .inspection import (
 from .benchmark import COMPRESSION_SAFETY, tune
 from .models import ConversionPlan, FileRecord, Inventory, Selection, VariableSpec, VariableTransform
 from .planner import candidate_plans, initial_plan
-from .writer import _monitor, make_compressor, progress_line, remove_output
+from .publication import make_staging_path, publish_staging, validate_publish_target
+from .runtime import spawn_context
+from .writer import _monitor, make_compressor, progress_line
 
 
 FILENAME_SUFFIXES = {".nc", ".nc4", ".nc3", ".cdf", ".hdf", ".tif", ".tiff"}
@@ -1001,7 +1003,10 @@ def inspect_filename_inventory(
             records.append(_inspect_filename_file(task))
     else:
         chunksize = max(1, min(16, len(tasks) // max(1, worker_count * 8)))
-        executor = ProcessPoolExecutor(max_workers=worker_count)
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=spawn_context(),
+        )
         terminated = False
         try:
             records = []
@@ -1449,8 +1454,6 @@ def filename_direct_write(
     progress: bool = True,
 ) -> dict[str, float | int]:
     """Parallel writer for files that contribute one reconstructed time slice."""
-    import multiprocessing as mp
-
     transforms = transforms or {}
     variable_names = variable_names or {}
     effective = _initialize_filename_zarr(
@@ -1500,7 +1503,7 @@ def filename_direct_write(
     try:
         executor = ProcessPoolExecutor(
             max_workers=worker_count,
-            mp_context=mp.get_context("spawn"),
+            mp_context=spawn_context(),
             initializer=_filename_worker_init,
             initargs=(
                 str(output),
@@ -1588,14 +1591,13 @@ def convert_filename(
     progress: bool = True,
 ) -> tuple[ConversionPlan, dict[str, float | int]]:
     """Tune and write one 2-D source file per reconstructed time coordinate."""
-    output = output.expanduser().resolve()
+    output = validate_publish_target(
+        output,
+        overwrite=overwrite,
+        operation="文件名时间转换",
+    )
     if output == inventory.input_dir:
         raise ValueError("输入目录和输出目录不能相同。")
-    if output.exists() and any(output.iterdir()):
-        if not overwrite:
-            raise FileExistsError(f"输出目录非空：{output}")
-        remove_output(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
     transforms = transforms or {}
     plan = plan or initial_plan(inventory, selection, output)
     if chunks is not None:
@@ -1672,15 +1674,23 @@ def convert_filename(
         print("正式执行计划：" + plan.label())
         for reason in plan.rationale:
             print("  - " + reason)
-    metrics = filename_direct_write(
-        inventory,
-        selection,
-        output,
-        plan,
-        transforms=transforms,
-        variable_names=variable_names,
-        cancel_event=cancel_event,
-        validate=validate,
-        progress=progress,
-    )
+    staging = make_staging_path(output, "filename-convert")
+    try:
+        metrics = filename_direct_write(
+            inventory,
+            selection,
+            staging,
+            plan,
+            transforms=transforms,
+            variable_names=variable_names,
+            cancel_event=cancel_event,
+            validate=validate,
+            progress=progress,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("任务已取消，未发布输出。")
+        publish_staging(staging, output, "filename-convert", overwrite=overwrite)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return plan, metrics

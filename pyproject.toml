@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fast-nc-zarr"
-version = "0.1.0"
+version = "0.1.1"
 description = "Adaptive high-throughput NetCDF to Zarr v3 converter"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "dask[array]",
+  "dask",
   "h5netcdf",
   "netCDF4",
   "numcodecs",
@@ -28,6 +28,7 @@ fast-zarr-rechunk = "fast_nc_zarr.rechunking.cli:main"
 fast-zarr-resample = "fast_nc_zarr.resampling.cli:main"
 fast-zarr-pipeline = "fast_nc_zarr.pipeline.cli:main"
 fast-zarr-gui = "fast_nc_zarr.gui.app:main"
+fast-zarr-validate-raw = "fast_nc_zarr.raw_validation:main"
 
 [project.optional-dependencies]
 gui = [
@@ -37,3 +38,7 @@ gui = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-config --strict-markers"

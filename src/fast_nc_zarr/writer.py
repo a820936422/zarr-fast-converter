@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -11,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from .models import ConversionPlan, Inventory, Selection, VariableTransform
+from .runtime import spawn_context
 
 _OUTPUT_GROUP = None
 _SOURCE_CACHE = None
@@ -514,8 +514,6 @@ def direct_write(
     cancel_event=None,
     progress: bool = True,
 ) -> dict[str, float | int]:
-    import multiprocessing as mp
-
     initialize_zarr(inventory, selection, output, plan, variable_transforms, variable_names)
     if plan.strategy == "file":
         tasks: list = file_tasks(inventory, selection, plan, variable_transforms, variable_names)
@@ -536,7 +534,7 @@ def direct_write(
     try:
         executor = ProcessPoolExecutor(
             max_workers=plan.workers,
-            mp_context=mp.get_context("spawn"),
+            mp_context=spawn_context(),
             initializer=_worker_init,
             initargs=(str(output),),
         )
@@ -585,23 +583,6 @@ def direct_write(
         "peak_rss": max((rss for _, rss in samples), default=0),
         "tasks": len(tasks),
     }
-
-
-def remove_output(output: Path) -> None:
-    """Remove only an explicitly resolved Zarr output directory."""
-    output = output.expanduser().resolve()
-    if output == output.parent or len(output.parts) < 3:
-        raise ValueError(f"拒绝删除过于宽泛的路径：{output}")
-    if output.exists():
-        if not output.is_dir():
-            raise ValueError(f"输出路径不是目录：{output}")
-        if any(output.iterdir()) and not any(
-            (output / marker).exists() for marker in ("zarr.json", ".zgroup")
-        ):
-            raise ValueError(
-                f"拒绝删除非 Zarr 的非空目录：{output}。请另选一个输出目录。"
-            )
-        shutil.rmtree(output)
 
 
 def fsync_tree(root: Path) -> None:

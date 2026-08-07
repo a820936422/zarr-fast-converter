@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from .models import FileRecord, Inventory, VariableSpec
+from .runtime import spawn_context
 from .system import physical_cpu_count, storage_profile
 from .time_mapping import FilenameField, TimeRule, resolve_file_times
 
@@ -308,7 +309,10 @@ def inspect_dataset(
             )
     else:
         chunksize = max(1, min(16, len(files) // max(1, worker_count * 8)))
-        executor = ProcessPoolExecutor(max_workers=worker_count)
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=spawn_context(),
+        )
         terminated = False
         try:
             records = []

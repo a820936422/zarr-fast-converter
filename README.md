@@ -15,7 +15,7 @@
 
 ```bash
 /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
-  /media/owen/机械硬盘/代码/快速zarr转换器/convert.py
+  /media/owen/机械硬盘/代码/zarr快速转换器v1/convert.py
 ```
 
 无参数时依次提示输入目录、输出目录、时间范围、经度范围、纬度范围和变量编号。
@@ -59,9 +59,9 @@ GUI 与命令行共用同一套核心检查和写入引擎。
 使用项目当前 Pixi Python 环境启动：
 
 ```bash
-PYTHONPATH=/media/owen/机械硬盘/代码/快速zarr转换器/src \
+PYTHONPATH=/media/owen/机械硬盘/代码/zarr快速转换器v1/src \
 /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
-/media/owen/机械硬盘/代码/快速zarr转换器/gui.py
+/media/owen/机械硬盘/代码/zarr快速转换器v1/gui.py
 ```
 
 也可以在已安装项目入口的环境中运行：
@@ -276,6 +276,13 @@ Zarr v3 Fused codec pipeline，以提高批量压缩和写入的 CPU 利用率�
 受安全上限约束。较小的数据默认使用普通中间 chunk，避免阶段 2 的 sharded 解码
 开销。最终输出不使用 sharding，仍是普通 Zarr v3 chunk，便于后续工具读取。
 
+转换、重采样和重分块都在目标同一文件系统的 UUID 临时目录中写入，通过校验后再
+原子发布。覆盖时旧 Zarr 会在发布期间保留为可恢复备份，不会在计算开始前删除。
+
+所有进程池显式使用 `spawn`，避免 Python 3.13 中多线程父进程 `fork` 的死锁风险。
+每个 worker 默认限制为一个 OpenMP/BLAS 线程；确有需要时可设置
+`FAST_NC_ZARR_THREADS_PER_WORKER`。
+
 只检查输入 Zarr：
 
 ~~~bash
@@ -283,9 +290,21 @@ python rechunk.py --input /path/to/input.zarr --inspect-only
 ~~~
 
 ```bash
-PYTHONPATH=src /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
-  -m unittest discover -s tests -v
+pixi run test
 ```
 
 测试覆盖小文件文件优先写入、跨 NetCDF 文件边界的大文件 chunk 写入、范围裁剪、
 变量筛选、Zarr v3、填充值和逐值校验。测试数据统一位于 `/tmp/codex_test`。
+
+对真实数据根目录中所有数据集执行全文件元数据检查、分层数值抽样和小范围转换：
+
+```bash
+fast-zarr-validate-raw \
+  --input-root /media/owen/机械硬盘/zarr处理/RAW_DATA \
+  --output /media/owen/机械硬盘/codex_test_hdd/p0_hardening/raw-validation.json \
+  --time-field GLASS-PAR=3 \
+  --smoke-output-root /media/owen/机械硬盘/codex_test_hdd/p0_hardening/smoke
+```
+
+项目根目录的 `pixi.toml` 和 `pixi.lock` 锁定 Python、GDAL、ESMF、xESMF、Zarr 及 GUI
+运行时；现有共享 `py313` 环境仍可用于日常开发。
