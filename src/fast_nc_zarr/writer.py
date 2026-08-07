@@ -3,14 +3,20 @@ from __future__ import annotations
 import os
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from .models import ConversionPlan, Inventory, Selection, VariableTransform
-from .runtime import spawn_context
+from .models import (
+    CodecSpec,
+    ConversionPlan,
+    Inventory,
+    OutputLayout,
+    Selection,
+    VariableTransform,
+)
+from .runtime import bounded_process_map
 
 _OUTPUT_GROUP = None
 _SOURCE_CACHE = None
@@ -76,6 +82,16 @@ def make_compressor(name: str, level: int, shuffle: str):
     return BloscCodec(cname=name, clevel=level, shuffle=shuffle)
 
 
+def compressor_from_spec(spec: CodecSpec | None):
+    if spec is None:
+        return None
+    if spec.kind == "zstd":
+        from zarr.codecs import ZstdCodec
+
+        return ZstdCodec(level=spec.level)
+    return make_compressor(spec.cname or "zstd", spec.level, spec.shuffle)
+
+
 def _chunk_for_dims(dims: tuple[str, ...], plan: ConversionPlan, sizes: dict[str, int]) -> tuple[int, ...]:
     chunks = {"time": plan.chunk_time, "lat": plan.chunk_lat, "lon": plan.chunk_lon}
     return tuple(min(sizes[dim], chunks.get(dim, sizes[dim])) for dim in dims)
@@ -88,6 +104,7 @@ def initialize_zarr(
     plan: ConversionPlan,
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
 ) -> None:
     import dask.array as da
     import xarray as xr
@@ -118,7 +135,9 @@ def initialize_zarr(
         variable_names = variable_names or {}
         variables = {}
         encoding = {}
-        compressor = make_compressor(plan.compression, plan.compression_level, plan.shuffle)
+        default_compressor = make_compressor(
+            plan.compression, plan.compression_level, plan.shuffle
+        )
         for name in selection.variables:
             original = source[name]
             output_name = variable_names.get(name, name)
@@ -176,7 +195,19 @@ def initialize_zarr(
                 sizes.get(dim, int(original.sizes[source_dimensions.get(dim, dim)]))
                 for dim in canonical_dims
             )
-            chunks = _chunk_for_dims(canonical_dims, plan, sizes)
+            layout_item = output_layout.for_source(name) if output_layout else None
+            if layout_item is not None:
+                if layout_item.output_name != output_name:
+                    raise ValueError(f"变量 {name} 的输出名称与最终布局不一致。")
+                if layout_item.dims != canonical_dims or layout_item.shape != shape:
+                    raise ValueError(f"变量 {name} 的 shape/dims 与最终布局不一致。")
+                if np.dtype(layout_item.dtype) != output_dtype:
+                    raise ValueError(f"变量 {name} 的 dtype 与最终布局不一致。")
+                chunks = layout_item.chunks
+                compressor = compressor_from_spec(layout_item.codec)
+            else:
+                chunks = _chunk_for_dims(canonical_dims, plan, sizes)
+                compressor = default_compressor
             variables[output_name] = xr.Variable(
                 canonical_dims,
                 da.empty(shape, chunks=chunks, dtype=output_dtype),
@@ -211,7 +242,17 @@ def initialize_zarr(
             ),
         }
         for name, coordinate in coordinates.items():
-            encoding[name] = {"chunks": (min(len(coordinate), 8192),)}
+            coordinate_layout = output_layout.for_output(name) if output_layout else None
+            coordinate_chunks = (
+                coordinate_layout.chunks
+                if coordinate_layout is not None
+                else (min(len(coordinate), 8192),)
+            )
+            encoding[name] = {"chunks": coordinate_chunks}
+            if coordinate_layout is not None:
+                coordinate_compressor = compressor_from_spec(coordinate_layout.codec)
+                if coordinate_compressor is not None:
+                    encoding[name]["compressors"] = [coordinate_compressor]
         template = xr.Dataset(variables, coords=coordinates, attrs=source.attrs.copy())
         delayed = template.to_zarr(
             output,
@@ -511,10 +552,19 @@ def direct_write(
     *,
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
     cancel_event=None,
     progress: bool = True,
 ) -> dict[str, float | int]:
-    initialize_zarr(inventory, selection, output, plan, variable_transforms, variable_names)
+    initialize_zarr(
+        inventory,
+        selection,
+        output,
+        plan,
+        variable_transforms,
+        variable_names,
+        output_layout,
+    )
     if plan.strategy == "file":
         tasks: list = file_tasks(inventory, selection, plan, variable_transforms, variable_names)
     elif plan.strategy == "chunk":
@@ -532,43 +582,32 @@ def direct_write(
     if progress:
         print(progress_line(0, len(tasks), 0, 0.0), end="", flush=True)
     try:
-        executor = ProcessPoolExecutor(
-            max_workers=plan.workers,
-            mp_context=spawn_context(),
+        worker = _write_batch if plan.strategy == "file" else _write_chunk
+        results = bounded_process_map(
+            worker,
+            tasks,
+            workers=min(plan.workers, len(tasks)),
             initializer=_worker_init,
             initargs=(str(output),),
+            cancel_event=cancel_event,
         )
-        try:
-            worker = _write_batch if plan.strategy == "file" else _write_chunk
-            results = executor.map(worker, tasks, chunksize=1)
-            for completed, amount in enumerate(results, 1):
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RuntimeError("任务已取消。")
-                logical_bytes += amount
-                if progress and (completed == len(tasks) or completed % report_every == 0):
-                    elapsed = max(time.perf_counter() - started, 1e-9)
-                    cpu, rss = samples[-1] if samples else (None, None)
-                    print(
-                        progress_line(
-                            completed,
-                            len(tasks),
-                            logical_bytes,
-                            elapsed,
-                            cpu=cpu,
-                            rss=rss,
-                        ),
-                        end="",
-                        flush=True,
-                    )
-        except BaseException:
-            terminate = getattr(executor, "terminate_workers", None)
-            if terminate is not None:
-                terminate()
-            else:
-                executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True)
+        for completed, amount in enumerate(results, 1):
+            logical_bytes += amount
+            if progress and (completed == len(tasks) or completed % report_every == 0):
+                elapsed = max(time.perf_counter() - started, 1e-9)
+                cpu, rss = samples[-1] if samples else (None, None)
+                print(
+                    progress_line(
+                        completed,
+                        len(tasks),
+                        logical_bytes,
+                        elapsed,
+                        cpu=cpu,
+                        rss=rss,
+                    ),
+                    end="",
+                    flush=True,
+                )
     finally:
         stop.set()
         monitor.join(timeout=2)

@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT / "src"))
 
 from fast_nc_zarr.resampling.engine import (  # noqa: E402
     ResampleExecutionError,
+    _mask_missing,
     _resolve_local_source_window,
     _tile_target,
     _time_slices,
@@ -81,6 +82,17 @@ class ResamplingTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         shutil.rmtree(ROOT, ignore_errors=True)
+
+    def test_missing_value_attribute_is_masked_when_fill_encoding_is_nan(self) -> None:
+        variable = xr.DataArray(
+            np.asarray([[1.0, -9999.0]], dtype="float32"),
+            dims=("lat", "lon"),
+            attrs={"missing_value": -9999.0},
+        )
+        variable.encoding["_FillValue"] = np.nan
+        masked = _mask_missing(variable, None)
+        self.assertEqual(float(masked.values[0, 0]), 1.0)
+        self.assertTrue(np.isnan(masked.values[0, 1]))
 
     def test_grid_inspection_and_target_resolution(self) -> None:
         info, grid = inspect_grid(ROOT / "input.zarr")

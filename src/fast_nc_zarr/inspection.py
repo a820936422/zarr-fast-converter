@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
 from hashlib import blake2b
-from itertools import repeat
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from .models import FileRecord, Inventory, VariableSpec
-from .runtime import spawn_context
+from .runtime import bounded_process_map
 from .system import physical_cpu_count, storage_profile
 from .time_mapping import FilenameField, TimeRule, resolve_file_times
 
@@ -194,9 +192,10 @@ def inspect_file(
                     attrs={key: _clean_attr(value) for key, value in variable.attrs.items()},
                 )
             )
+        stat = path.stat()
         return FileRecord(
             path=path,
-            size_bytes=path.stat().st_size,
+            size_bytes=stat.st_size,
             times=times,
             time_keys=tuple(time_key(item) for item in times),
             lat_hash=_hash_axis(lat),
@@ -204,9 +203,14 @@ def inspect_file(
             lat_size=int(lat.size),
             lon_size=int(lon.size),
             variables=tuple(specs),
+            mtime_ns=stat.st_mtime_ns,
         )
     finally:
         ds.close()
+
+
+def _inspect_file_task(task) -> FileRecord:
+    return inspect_file(*task)
 
 
 def choose_inspection_workers(files: list[Path], requested: int | None = None) -> int:
@@ -286,6 +290,7 @@ def inspect_dataset(
     progress: bool = True,
     time_rule: TimeRule | None = None,
     filename_fields: tuple[FilenameField, ...] = (),
+    cached_inventory: Inventory | None = None,
     cancel_event=None,
 ) -> Inventory:
     import xarray as xr
@@ -296,47 +301,49 @@ def inspect_dataset(
         if dimension_names is None
         else tuple(str(item).strip() for item in dimension_names)
     )
-    worker_count = choose_inspection_workers(files, workers)
-    if progress:
-        print(f"发现 {len(files)} 个 NetCDF 文件，使用 {worker_count} 个进程检查元数据……")
-    if worker_count == 1:
-        records = []
-        for path in files:
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("任务已取消。")
-            records.append(
-                inspect_file(path, engine, source_dimensions, time_rule, filename_fields)
-            )
-    else:
-        chunksize = max(1, min(16, len(files) // max(1, worker_count * 8)))
-        executor = ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=spawn_context(),
+    cached_by_path = (
+        {record.path.resolve(): record for record in cached_inventory.files}
+        if (
+            cached_inventory is not None
+            and cached_inventory.source_engine == engine
+            and cached_inventory.source_dimensions == source_dimensions
+            and cached_inventory.source_mode
+            == ("hybrid" if time_rule is not None and time_rule.is_hybrid else "dimension")
         )
-        terminated = False
-        try:
-            records = []
-            for record in executor.map(
-                inspect_file,
-                files,
-                repeat(engine),
-                repeat(source_dimensions),
-                repeat(time_rule),
-                repeat(filename_fields),
-                chunksize=chunksize,
-            ):
-                if cancel_event is not None and cancel_event.is_set():
-                    terminate = getattr(executor, "terminate_workers", None)
-                    if terminate is not None:
-                        terminate()
-                    else:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                    terminated = True
-                    raise RuntimeError("任务已取消。")
-                records.append(record)
-        finally:
-            if not terminated:
-                executor.shutdown(wait=True)
+        else {}
+    )
+    records_by_path: dict[Path, FileRecord] = {}
+    changed_files = []
+    for path in files:
+        cached = cached_by_path.get(path.resolve())
+        stat = path.stat()
+        if (
+            cached is not None
+            and cached.size_bytes == stat.st_size
+            and cached.mtime_ns is not None
+            and cached.mtime_ns == stat.st_mtime_ns
+        ):
+            records_by_path[path] = cached
+        else:
+            changed_files.append(path)
+    worker_count = choose_inspection_workers(changed_files or files, workers)
+    if progress:
+        print(
+            f"发现 {len(files)} 个 NetCDF 文件；复用 {len(records_by_path)} 个，"
+            f"检查 {len(changed_files)} 个（{worker_count} 个进程）……"
+        )
+    tasks = (
+        (path, engine, source_dimensions, time_rule, filename_fields)
+        for path in changed_files
+    )
+    for record in bounded_process_map(
+        _inspect_file_task,
+        tasks,
+        workers=min(worker_count, max(1, len(changed_files))),
+        cancel_event=cancel_event,
+    ):
+        records_by_path[record.path] = record
+    records = [records_by_path[path] for path in files]
 
     reference = records[0]
     reference_variables = _variable_signatures(reference.variables)

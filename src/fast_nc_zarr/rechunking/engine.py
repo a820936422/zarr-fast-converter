@@ -6,7 +6,6 @@ import itertools
 import os
 import shutil
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
@@ -21,7 +20,7 @@ from .compression import codec_for, make_compression_plan
 from .inspection import inspect_store
 from .models import ChunkPlan, CompressionPlan, DatasetInfo
 from ..publication import publish_staging
-from ..runtime import spawn_context
+from ..runtime import bounded_process_map
 
 
 class RechunkExecutionError(RuntimeError):
@@ -732,9 +731,6 @@ def _run_process_tasks(
 ) -> None:
     """Run bounded process tasks and report aggregate throughput."""
 
-    if workers <= 1:
-        raise ValueError("并行任务至少需要 2 个 worker。")
-    context = spawn_context()
     started = time.perf_counter()
     processed_bytes = 0
     processed_chunks = 0
@@ -742,21 +738,16 @@ def _run_process_tasks(
     # Keep progress output useful without turning hundreds of process
     # completions into another serialization bottleneck.
     progress_interval = max(1, min(32, total // 20))
-    executor = ProcessPoolExecutor(
-        max_workers=workers,
-        mp_context=context,
+    results = bounded_process_map(
+        task_function,  # type: ignore[arg-type]
+        tasks,
+        workers=workers,
         initializer=initializer,  # type: ignore[arg-type]
         initargs=initargs,
+        cancel_event=cancel_event,
     )
-    terminated = False
     try:
-        futures = [executor.submit(task_function, task) for task in tasks]  # type: ignore[arg-type]
-        for index, future in enumerate(as_completed(futures), start=1):
-            if cancel_event is not None and cancel_event.is_set():
-                raise RechunkExecutionError("任务已取消。")
-            result = future.result()
-            if cancel_event is not None and cancel_event.is_set():
-                raise RechunkExecutionError("任务已取消。")
+        for index, result in enumerate(results, start=1):
             processed_bytes += int(result.get("bytes", 0))
             processed_chunks += int(result.get("source_chunks", 1))
             if progress and (
@@ -769,17 +760,10 @@ def _run_process_tasks(
                     f"处理源 chunk {processed_chunks}；吞吐 {rate:.1f} MiB/s",
                     flush=True,
                 )
-    except BaseException:
-        terminate = getattr(executor, "terminate_workers", None)
-        if terminate is not None:
-            terminate()
-        else:
-            executor.shutdown(wait=False, cancel_futures=True)
-        terminated = True
+    except RuntimeError as exc:
+        if str(exc) == "任务已取消。":
+            raise RechunkExecutionError(str(exc)) from exc
         raise
-    finally:
-        if not terminated:
-            executor.shutdown(wait=True)
 
 
 def _stage1_time_tasks(info: DatasetInfo) -> list[tuple[str, int]]:

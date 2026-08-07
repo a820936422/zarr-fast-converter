@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from ..models import Selection, VariableTransform
+from ..models import OutputLayout, Selection, VariableTransform
 from ..rechunking.models import ChunkPlan, CompressionPlan
 from ..resampling.models import TargetGrid
 
@@ -101,6 +101,8 @@ class PipelinePlan:
     final_chunks: tuple[int, int, int] | None = None
     final_chunk_plan: ChunkPlan | None = None
     final_compression: CompressionPlan | None = None
+    output_layout: OutputLayout | None = None
+    direct_finalization: bool = False
 
 
 @dataclass(frozen=True)

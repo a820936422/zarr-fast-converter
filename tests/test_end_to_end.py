@@ -3,6 +3,8 @@ from __future__ import annotations
 import shutil
 import sys
 import unittest
+import os
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -185,6 +187,34 @@ class EndToEndTests(unittest.TestCase):
         second.close()
         inventory = inspect_dataset(folder, engine="h5netcdf", workers=1, progress=False)
         self.assertEqual(set(inventory.variables), {"temperature", "quality", "permuted"})
+
+    def test_inspection_cache_reopens_only_changed_files(self) -> None:
+        first = inspect_dataset(ROOT / "small", workers=1, progress=False)
+        changed = ROOT / "small" / "day-003.nc"
+        original_mtime = changed.stat().st_mtime_ns
+        changed.touch()
+        if changed.stat().st_mtime_ns == original_mtime:
+            os.utime(changed, ns=(original_mtime + 1_000_000, original_mtime + 1_000_000))
+
+        from fast_nc_zarr import inspection as inspection_module
+
+        inspected = []
+        original = inspection_module.inspect_file
+
+        def record_call(path, *args, **kwargs):
+            inspected.append(path)
+            return original(path, *args, **kwargs)
+
+        with patch.object(inspection_module, "inspect_file", side_effect=record_call):
+            second = inspect_dataset(
+                ROOT / "small",
+                workers=1,
+                progress=False,
+                cached_inventory=first,
+            )
+
+        self.assertEqual(inspected, [changed])
+        self.assertEqual(len(second.files), len(first.files))
 
     def test_nonstandard_dimensions_require_mapping_and_write_canonical_zarr(self) -> None:
         with self.assertRaises(DimensionMappingRequired):

@@ -105,6 +105,21 @@ class GuiServiceTests(unittest.TestCase):
         self.assertEqual(restored.source_inventory.source_mode, "dimension")
         self.assertEqual(preview.selection.shape, (2, 3, 4))
 
+    def test_source_snapshot_rejects_modified_file(self) -> None:
+        result = inspect_source(
+            SourceInspectionConfig(ROOT / "source", engine="h5netcdf", workers=1)
+        )
+        snapshot = ROOT / "stale-source-snapshot.json"
+        save_inspection_snapshot(result, snapshot)
+        source = ROOT / "source" / "day-0.nc"
+        original = source.stat().st_mtime_ns
+        os.utime(source, ns=(original + 1_000_000, original + 1_000_000))
+        try:
+            with self.assertRaisesRegex(ValueError, "快照已过期"):
+                load_inspection_snapshot(snapshot)
+        finally:
+            os.utime(source, ns=(original, original))
+
     def test_conversion_supports_variable_rename_and_transform(self) -> None:
         result = inspect_source(
             SourceInspectionConfig(ROOT / "source", engine="h5netcdf", workers=1)

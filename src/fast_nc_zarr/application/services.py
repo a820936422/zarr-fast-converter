@@ -29,8 +29,15 @@ from ..inspection import (
     inspect_dataset,
     inventory_summary,
 )
-from ..models import FileRecord, Inventory, Selection, VariableSpec, VariableTransform
-from ..planner import initial_plan
+from ..models import (
+    FileRecord,
+    Inventory,
+    OutputLayout,
+    Selection,
+    VariableSpec,
+    VariableTransform,
+)
+from ..planner import resolve_conversion_plan
 from ..selection import make_selection, selected_logical_bytes
 from ..rechunking.compression import make_compression_plan
 from ..rechunking.engine import run_rechunk as core_run_rechunk
@@ -73,6 +80,7 @@ class SourceInspectionConfig:
     workers: int | None = None
     time_rule: TimeRule | None = None
     time_inspection: TimeInspectionResult | None = None
+    cache_path: Path | None = None
 
 
 @dataclass
@@ -125,7 +133,7 @@ class InspectionResult:
                     }
                 )
             return {
-                "schema_version": 2,
+                "schema_version": 3,
                 "kind": self.kind,
                 "report": self.report,
                 "source": {
@@ -171,6 +179,7 @@ class InspectionResult:
                         {
                             "path": str(record.path),
                             "size_bytes": record.size_bytes,
+                            "mtime_ns": record.mtime_ns,
                             "times": [_date_label(value) for value in record.times],
                             "time_keys": list(record.time_keys),
                             "lat_hash": record.lat_hash,
@@ -227,6 +236,7 @@ class ConversionConfig:
     max_workers: int | None = None
     reserve_memory_gib: float = 2.0
     chunks: tuple[int, int, int] | None = None
+    output_layout: OutputLayout | None = None
     overwrite: bool = False
     validate: bool = True
 
@@ -276,6 +286,24 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
     """Inspect a source directory and resolve its time ingestion mode."""
 
     source = Path(config.input_dir).expanduser().resolve()
+    cached_inventory = None
+    if config.cache_path is not None:
+        cache_path = Path(config.cache_path).expanduser().resolve()
+        if cache_path.is_file():
+            try:
+                cached = load_inspection_snapshot(cache_path, validate_files=False)
+            except (OSError, ValueError, FileNotFoundError):
+                cached = None
+            if (
+                cached is not None
+                and cached.path == source
+                and _rule_snapshot(cached.time_rule) == _rule_snapshot(config.time_rule)
+                and (
+                    config.source_dimensions is None
+                    or cached.source_inventory.source_dimensions == config.source_dimensions
+                )
+            ):
+                cached_inventory = cached.source_inventory
     files = discover_filename_files(source, recursive=config.recursive)
     requested_engine = config.engine or "auto"
     mode = config.mode
@@ -304,12 +332,13 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
                 resolved_engine,
                 workers=config.workers,
                 progress=True,
+                cached_inventory=cached_inventory,
                 cancel_event=cancel_event,
             )
             warnings = []
             if scan.missing_times:
                 warnings.append(f"理论时间轴缺少 {len(scan.missing_times)} 个日期，转换时将写入空值切片。")
-            return InspectionResult(
+            return _cache_inspection_result(InspectionResult(
                 kind="source",
                 path=source,
                 report=format_source_inventory(inventory, scan),
@@ -319,7 +348,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
                 warnings=warnings,
                 time_inspection=time_result,
                 time_rule=config.time_rule,
-            )
+            ), config.cache_path)
         mode = "complete"
         inventory = inspect_dataset(
             source,
@@ -330,6 +359,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
             progress=True,
             time_rule=config.time_rule,
             filename_fields=time_result.filename_fields,
+            cached_inventory=cached_inventory,
             cancel_event=cancel_event,
         )
         warnings = [
@@ -337,7 +367,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
             for _ in [0]
             if inventory.gaps
         ]
-        return InspectionResult(
+        return _cache_inspection_result(InspectionResult(
             kind="source",
             path=source,
             report=format_source_inventory(inventory, time_result=time_result, time_rule=config.time_rule),
@@ -346,7 +376,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
             warnings=warnings,
             time_inspection=time_result,
             time_rule=config.time_rule,
-        )
+        ), config.cache_path)
     if mode == "auto":
         resolved_engine, dims, _coords, has_time, has_space = probe_dataset_structure(
             files[0], requested_engine
@@ -374,20 +404,22 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
             dimension_names=config.source_dimensions,
             workers=config.workers,
             progress=True,
+            cached_inventory=cached_inventory,
+            cancel_event=cancel_event,
         )
         warnings = [
             f"检测到 {len(inventory.gaps)} 个源时间间隔缺口。"
             for _ in [0]
             if inventory.gaps
         ]
-        return InspectionResult(
+        return _cache_inspection_result(InspectionResult(
             kind="source",
             path=source,
             report=format_source_inventory(inventory),
             inventory=inventory,
             mode="complete",
             warnings=warnings,
-        )
+        ), config.cache_path)
 
     if mode != "filename":
         raise ValueError(f"不支持的数据检查模式：{mode}")
@@ -403,13 +435,15 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
         resolved_engine,
         workers=config.workers,
         progress=True,
+        cached_inventory=cached_inventory,
+        cancel_event=cancel_event,
     )
     warnings = []
     if scan.missing_times:
         warnings.append(f"理论时间轴缺少 {len(scan.missing_times)} 个日期，转换时将写入空值切片。")
     if not scan.step_days:
         warnings.append("不同年份的文件名时间间隔不一致，需要用户确认年度时间规则。")
-    return InspectionResult(
+    return _cache_inspection_result(InspectionResult(
         kind="source",
         path=source,
         report=format_source_inventory(inventory, scan),
@@ -417,7 +451,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
         scan=scan,
         mode="filename",
         warnings=warnings,
-    )
+    ), config.cache_path)
 
 
 def inspect_zarr(path: Path) -> InspectionResult:
@@ -437,7 +471,9 @@ def inspect_resample(path: Path) -> ResampleInspection:
     return core_inspect_resample(path)
 
 
-def load_inspection_snapshot(path: Path) -> InspectionResult:
+def load_inspection_snapshot(
+    path: Path, *, validate_files: bool = True
+) -> InspectionResult:
     """Load a complete source inspection snapshot for later conversion."""
 
     snapshot_path = Path(path).expanduser().resolve()
@@ -447,10 +483,16 @@ def load_inspection_snapshot(path: Path) -> InspectionResult:
         raise ValueError(f"无法读取检查快照：{snapshot_path}") from exc
     if payload.get("kind") != "source":
         raise ValueError("当前只支持导入源数据检查快照。")
-    if int(payload.get("schema_version", 0)) < 2 or "inventory" not in payload:
+    schema_version = int(payload.get("schema_version", 0))
+    if schema_version < 2 or "inventory" not in payload:
         raise ValueError(
             "该快照是旧版摘要格式，缺少逐文件索引，不能直接用于转换；"
             "请重新检查源数据并保存新快照。"
+        )
+    if validate_files and schema_version < 3:
+        raise ValueError(
+            "该快照缺少文件修改时间，不能安全地直接用于转换；"
+            "请重新检查源数据并保存新版快照。"
         )
 
     source_data = payload.get("source") or {}
@@ -488,13 +530,21 @@ def load_inspection_snapshot(path: Path) -> InspectionResult:
     shared_variables = tuple(variable_specs.values())
     for item in inventory_data.get("files") or []:
         file_path = Path(str(item.get("path", ""))).expanduser().resolve()
-        if not file_path.is_file():
+        if validate_files and not file_path.is_file():
             raise FileNotFoundError(f"快照中的源文件不存在：{file_path}")
+        stored_size = int(item.get("size_bytes", 0))
+        stored_mtime = item.get("mtime_ns")
+        if validate_files:
+            stat = file_path.stat()
+            if stored_size != stat.st_size:
+                raise ValueError(f"检查快照已过期，文件大小发生变化：{file_path}")
+            if stored_mtime is not None and int(stored_mtime) != stat.st_mtime_ns:
+                raise ValueError(f"检查快照已过期，文件修改时间发生变化：{file_path}")
         times = tuple(np.datetime64(value, "ns") for value in item.get("times") or ())
         files.append(
             FileRecord(
                 path=file_path,
-                size_bytes=int(item.get("size_bytes", file_path.stat().st_size)),
+                size_bytes=stored_size,
                 times=times,
                 time_keys=tuple(str(value) for value in item.get("time_keys") or ()),
                 lat_hash=str(item.get("lat_hash", "")),
@@ -502,6 +552,7 @@ def load_inspection_snapshot(path: Path) -> InspectionResult:
                 lat_size=int(item.get("lat_size", len(coordinates["lat_values"]))),
                 lon_size=int(item.get("lon_size", len(coordinates["lon_values"]))),
                 variables=shared_variables,
+                mtime_ns=int(stored_mtime) if stored_mtime is not None else None,
             )
         )
     if not files:
@@ -574,43 +625,14 @@ def preview_conversion(
         lon_bounds=_numeric_bounds(config.lon_min, config.lon_max),
         variables=list(config.variables) or None,
     )
-    plan = initial_plan(
+    plan = resolve_conversion_plan(
         inventory,
         selection,
         Path(config.output).expanduser().resolve(),
         reserve_gib=config.reserve_memory_gib,
+        chunks=config.chunks,
+        max_workers=config.max_workers,
     )
-    if config.chunks is not None:
-        if len(config.chunks) != 3 or any(int(value) <= 0 for value in config.chunks):
-            raise ValueError("转换 chunks 必须是三个正整数。")
-        from dataclasses import replace
-
-        plan = replace(
-            plan,
-            # The generic file strategy owns a single time slice per task.
-            # A pipeline-selected multi-time chunk instead needs the chunk
-            # writer, which owns the complete time/lat/lon Zarr region.
-            strategy=(
-                "chunk"
-                if inventory.source_mode != "filename"
-                and plan.strategy == "file"
-                and min(int(config.chunks[0]), selection.shape[0]) > 1
-                else plan.strategy
-            ),
-            chunk_time=min(int(config.chunks[0]), selection.shape[0]),
-            chunk_lat=min(int(config.chunks[1]), selection.shape[1]),
-            chunk_lon=min(int(config.chunks[2]), selection.shape[2]),
-            # Filename-mode workers own complete time chunks.  This prevents
-            # separate processes from read-modify-writing the same Zarr chunk
-            # when the pipeline deliberately chooses time chunks larger than
-            # one for downstream resampling.
-            task_batch=(
-                min(int(config.chunks[0]), selection.shape[0])
-                if inventory.source_mode == "filename"
-                else plan.task_batch
-            ),
-            rationale=plan.rationale + ("使用一条龙重采样联动的源临时 chunks。",),
-        )
     logical = (
         filename_logical_bytes(inventory, selection, config.variable_transforms)
         if inventory.source_mode == "filename"
@@ -635,6 +657,7 @@ def run_conversion(
             transforms=config.variable_transforms,
             variable_names=config.variable_names,
             chunks=config.chunks,
+            output_layout=config.output_layout,
             plan=preview.plan,
             auto_tune=config.auto_tune,
             tune_budget=config.tune_budget,
@@ -659,6 +682,7 @@ def run_conversion(
         variable_transforms=config.variable_transforms,
         variable_names=config.variable_names,
         chunks=config.chunks,
+        output_layout=config.output_layout,
         cancel_event=cancel_event,
     )
 
@@ -782,11 +806,21 @@ def format_resample_preview(preview: ResamplePreview) -> str:
 def save_inspection_snapshot(result: InspectionResult, destination: Path) -> Path:
     destination = Path(destination).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.write_text(
         json.dumps(result.snapshot(), ensure_ascii=False, indent=2, default=_json_safe),
         encoding="utf-8",
     )
+    temporary.replace(destination)
     return destination
+
+
+def _cache_inspection_result(
+    result: InspectionResult, cache_path: Path | None
+) -> InspectionResult:
+    if cache_path is not None:
+        save_inspection_snapshot(result, cache_path)
+    return result
 
 
 def format_source_inventory(

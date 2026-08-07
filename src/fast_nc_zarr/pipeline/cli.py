@@ -45,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--engine", default="auto")
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--inspect-workers", type=int)
+    parser.add_argument(
+        "--inspection-cache",
+        type=Path,
+        help="增量检查快照；再次运行时只重新检查新增或发生变化的源文件。",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-validate", action="store_true")
@@ -76,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
             recursive=args.recursive,
             engine=args.engine,
             workers=args.inspect_workers,
+            cache_path=args.inspection_cache,
         )
     )
     print(inspection.report)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..models import Inventory
+from ..models import CodecSpec, Inventory, OutputLayout, VariableOutputLayout
 from ..rechunking.compression import make_compression_plan
 from ..resampling.grid import GridInfo, _axis_bounds, build_target_grid
 from ..resampling.autotune import resolve_auto_time_block
@@ -128,6 +128,7 @@ def _inventory_id(inventory: Inventory) -> str:
     for record in inventory.files:
         digest.update(str(record.path.resolve()).encode())
         digest.update(str(record.size_bytes).encode())
+        digest.update(str(record.mtime_ns).encode())
     digest.update(np.asarray(inventory.times).tobytes())
     return digest.hexdigest()
 
@@ -210,6 +211,81 @@ def _converted_dtype(inventory, name: str, config: PipelineConfig) -> np.dtype:
     ):
         return np.dtype("float32" if dtype.itemsize <= 4 else "float64")
     return dtype
+
+
+def _codec_spec(dtype: np.dtype, compression) -> CodecSpec | None:
+    if not compression.enabled:
+        # The existing conversion engine writes this codec before a
+        # compression-preserving final rechunk.
+        return CodecSpec("blosc", level=1, cname="zstd", shuffle="noshuffle")
+    if np.issubdtype(dtype, np.integer):
+        shuffle = "bitshuffle"
+    elif np.issubdtype(dtype, np.floating):
+        shuffle = "shuffle"
+    else:
+        shuffle = "noshuffle"
+    return CodecSpec(
+        "blosc",
+        level=int(compression.level or 1),
+        cname="zstd",
+        shuffle=shuffle,
+    )
+
+
+def _output_layout(
+    inventory: Inventory,
+    selection,
+    target,
+    config: PipelineConfig,
+    chunk_plan,
+    compression,
+    *,
+    needs_resample: bool,
+) -> OutputLayout:
+    shape = (selection.shape[0], int(target.lat.size), int(target.lon.size))
+    layouts = []
+    for name in selection.variables:
+        dtype = _converted_dtype(inventory, name, config)
+        if needs_resample:
+            if not np.issubdtype(dtype, np.floating):
+                dtype = np.dtype("float64")
+            elif config.resampling.compute_dtype == "float32":
+                dtype = np.dtype("float32")
+        output_name = config.conversion.variable_names.get(name, name)
+        layouts.append(
+            VariableOutputLayout(
+                source_name=name,
+                output_name=output_name,
+                dims=("time", "lat", "lon"),
+                shape=shape,
+                dtype=str(dtype),
+                chunks=tuple(min(size, chunk) for size, chunk in zip(shape, chunk_plan.chunks)),
+                codec=_codec_spec(dtype, compression),
+            )
+        )
+    coordinate_codec = (
+        CodecSpec("zstd", level=1) if compression.enabled else None
+    )
+    coordinate_values = {
+        "time": inventory.times[selection.time_start : selection.time_stop],
+        "lat": target.lat,
+        "lon": target.lon,
+    }
+    dim_chunks = dict(zip(("time", "lat", "lon"), chunk_plan.chunks))
+    for name, values in coordinate_values.items():
+        layouts.append(
+            VariableOutputLayout(
+                source_name=name,
+                output_name=name,
+                dims=(name,),
+                shape=(len(values),),
+                dtype=str(np.asarray(values).dtype),
+                chunks=(min(len(values), dim_chunks[name]),),
+                codec=coordinate_codec,
+                is_coord=True,
+            )
+        )
+    return OutputLayout(tuple(layouts))
 
 
 def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan:
@@ -451,6 +527,20 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan:
         config,
         needs_resample=not same_grid,
     )
+    output_layout = _output_layout(
+        inventory,
+        source_selection,
+        target,
+        config,
+        final_chunk_plan,
+        final_compression,
+        needs_resample=not same_grid,
+    )
+    direct_finalization = all(
+        inventory.variables[name].direct_compatible for name in selected_names
+    )
+    if direct_finalization and same_grid:
+        conversion_chunks = final_chunk_plan.chunks
     return PipelinePlan(
         inspection_id=_inventory_id(inventory),
         target_grid=target,
@@ -462,4 +552,6 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan:
         final_chunks=final_chunk_plan.chunks,
         final_chunk_plan=final_chunk_plan,
         final_compression=final_compression,
+        output_layout=output_layout,
+        direct_finalization=direct_finalization,
     )

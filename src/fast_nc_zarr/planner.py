@@ -152,6 +152,63 @@ def initial_plan(
     )
 
 
+def resolve_conversion_plan(
+    inventory: Inventory,
+    selection: Selection,
+    output: Path,
+    *,
+    plan: ConversionPlan | None = None,
+    chunks: tuple[int, int, int] | None = None,
+    max_workers: int | None = None,
+    reserve_gib: float = 2.0,
+) -> ConversionPlan:
+    """Resolve all non-benchmark conversion overrides in one place.
+
+    Preview and execution must agree on task ownership.  In particular, a
+    multi-time external chunk cannot retain the generic one-time-per-task
+    file strategy, while filename-time workers must own the whole time chunk
+    to prevent concurrent partial writes.
+    """
+
+    resolved = plan or initial_plan(
+        inventory,
+        selection,
+        output,
+        reserve_gib=reserve_gib,
+    )
+    if chunks is not None:
+        if len(chunks) != 3 or any(int(value) <= 0 for value in chunks):
+            raise ValueError("转换 chunks 必须是三个正整数。")
+        chunk_time = min(int(chunks[0]), selection.shape[0])
+        chunk_lat = min(int(chunks[1]), selection.shape[1])
+        chunk_lon = min(int(chunks[2]), selection.shape[2])
+        strategy = resolved.strategy
+        task_batch = resolved.task_batch
+        if inventory.source_mode == "filename":
+            task_batch = chunk_time
+        elif strategy == "file" and chunk_time > 1:
+            strategy = "chunk"
+            task_batch = 1
+        rationale = resolved.rationale
+        marker = "使用外部编排器提供的输出 chunks。"
+        if marker not in rationale:
+            rationale += (marker,)
+        resolved = replace(
+            resolved,
+            strategy=strategy,
+            chunk_time=chunk_time,
+            chunk_lat=chunk_lat,
+            chunk_lon=chunk_lon,
+            task_batch=task_batch,
+            rationale=rationale,
+        )
+    if max_workers is not None:
+        if int(max_workers) <= 0:
+            raise ValueError("max_workers 必须是正整数。")
+        resolved = replace(resolved, workers=min(resolved.workers, int(max_workers)))
+    return resolved
+
+
 def candidate_plans(
     inventory: Inventory,
     selection: Selection,

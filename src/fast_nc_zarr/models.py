@@ -46,6 +46,54 @@ class VariableTransform:
 
 
 @dataclass(frozen=True)
+class CodecSpec:
+    """Serializable Zarr v3 compressor description used across stages."""
+
+    kind: Literal["blosc", "zstd"]
+    level: int
+    cname: str | None = None
+    shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] = "noshuffle"
+
+
+@dataclass(frozen=True)
+class VariableOutputLayout:
+    source_name: str
+    output_name: str
+    dims: tuple[str, ...]
+    shape: tuple[int, ...]
+    dtype: str
+    chunks: tuple[int, ...]
+    codec: CodecSpec | None = None
+    is_coord: bool = False
+
+
+@dataclass(frozen=True)
+class OutputLayout:
+    """Complete final storage contract shared by planning and execution."""
+
+    variables: tuple[VariableOutputLayout, ...]
+
+    def for_source(self, name: str) -> VariableOutputLayout:
+        try:
+            return next(item for item in self.variables if item.source_name == name)
+        except StopIteration as exc:
+            raise KeyError(f"输出布局缺少源变量：{name}") from exc
+
+    def for_output(self, name: str) -> VariableOutputLayout:
+        try:
+            return next(item for item in self.variables if item.output_name == name)
+        except StopIteration as exc:
+            raise KeyError(f"输出布局缺少变量：{name}") from exc
+
+    @property
+    def coordinate_codec(self) -> CodecSpec | None:
+        return next(
+            (item.codec for item in self.variables if item.is_coord),
+            None,
+        )
+
+
+@dataclass(frozen=True)
 class FileRecord:
     path: Path
     size_bytes: int
@@ -56,6 +104,7 @@ class FileRecord:
     lat_size: int
     lon_size: int
     variables: tuple[VariableSpec, ...]
+    mtime_ns: int | None = None
 
     @property
     def time_count(self) -> int:

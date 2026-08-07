@@ -6,6 +6,7 @@ from typing import Literal
 
 import numpy as np
 
+from ..models import OutputLayout
 from ..rechunking.models import DatasetInfo
 
 
@@ -101,6 +102,7 @@ class ResampleConfig:
     compute_workers: int = 2
     space_workers: SpaceWorkers = "auto"
     temporary_dir: Path | None = None
+    output_layout: OutputLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,7 @@ class ResamplePlan:
     tile_size_requested: TileSize = "auto"
     space_workers_requested: SpaceWorkers = "auto"
     auto_tile: AutoTileDecision | None = None
+    output_layout: OutputLayout | None = None
 
     @property
     def output_dimensions(self) -> dict[str, int]:

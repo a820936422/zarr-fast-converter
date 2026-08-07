@@ -31,11 +31,19 @@ from .inspection import (
     time_key,
 )
 from .benchmark import COMPRESSION_SAFETY, tune
-from .models import ConversionPlan, FileRecord, Inventory, Selection, VariableSpec, VariableTransform
-from .planner import candidate_plans, initial_plan
+from .models import (
+    ConversionPlan,
+    FileRecord,
+    Inventory,
+    OutputLayout,
+    Selection,
+    VariableSpec,
+    VariableTransform,
+)
+from .planner import candidate_plans, resolve_conversion_plan
 from .publication import make_staging_path, publish_staging, validate_publish_target
-from .runtime import spawn_context
-from .writer import _monitor, make_compressor, progress_line
+from .runtime import bounded_process_map, spawn_context
+from .writer import _monitor, compressor_from_spec, make_compressor, progress_line
 
 
 FILENAME_SUFFIXES = {".nc", ".nc4", ".nc3", ".cdf", ".hdf", ".tif", ".tiff"}
@@ -678,7 +686,7 @@ def _inspect_filename_file_low_level(task) -> FileRecord:
         raise FilenameTimeError(f"{path.name} 的经纬度网格与首文件不一致。")
     return FileRecord(
         path=path,
-        size_bytes=path.stat().st_size,
+        size_bytes=(stat := path.stat()).st_size,
         times=(np.datetime64(time_value, "ns"),),
         time_keys=(time_key(np.datetime64(time_value, "ns")),),
         lat_hash=expected_lat_hash,
@@ -686,6 +694,7 @@ def _inspect_filename_file_low_level(task) -> FileRecord:
         lat_size=expected_lat_size,
         lon_size=expected_lon_size,
         variables=reference_specs,
+        mtime_ns=stat.st_mtime_ns,
     )
 
 
@@ -898,9 +907,10 @@ def _inspect_filename_file_xarray(task) -> FileRecord:
             or _hash_axis(np.asarray(ds.lon.values)) != expected_lon_hash
         ):
             raise FilenameTimeError(f"{path.name} 的经纬度网格与首文件不一致。")
+        stat = path.stat()
         record = FileRecord(
             path=path,
-            size_bytes=path.stat().st_size,
+            size_bytes=stat.st_size,
             times=(np.datetime64(time_value, "ns"),),
             time_keys=(time_key(np.datetime64(time_value, "ns")),),
             lat_hash=expected_lat_hash,
@@ -908,6 +918,7 @@ def _inspect_filename_file_xarray(task) -> FileRecord:
             lat_size=expected_lat_size,
             lon_size=expected_lon_size,
             variables=reference_specs,
+            mtime_ns=stat.st_mtime_ns,
         )
         del ds
         return record
@@ -927,6 +938,7 @@ def inspect_filename_inventory(
     *,
     workers: int | None = None,
     progress: bool = True,
+    cached_inventory: Inventory | None = None,
     cancel_event=None,
 ) -> Inventory:
     if progress:
@@ -985,7 +997,35 @@ def inspect_filename_inventory(
         )
         for path, value in zip(scan.files, scan.actual_times)
     )
-    worker_count = choose_inspection_workers(list(scan.files), workers)
+    cached_by_path = (
+        {record.path.resolve(): record for record in cached_inventory.files}
+        if (
+            cached_inventory is not None
+            and cached_inventory.source_engine == engine
+            and cached_inventory.source_mode == "filename"
+        )
+        else {}
+    )
+    records_by_path: dict[Path, FileRecord] = {}
+    changed_tasks = []
+    for task in tasks:
+        path = task[0]
+        expected_time = np.datetime64(task[-1], "ns")
+        cached = cached_by_path.get(path.resolve())
+        stat = path.stat()
+        if (
+            cached is not None
+            and cached.size_bytes == stat.st_size
+            and cached.mtime_ns is not None
+            and cached.mtime_ns == stat.st_mtime_ns
+            and cached.time_keys == (time_key(expected_time),)
+        ):
+            records_by_path[path] = cached
+        else:
+            changed_tasks.append(task)
+    worker_count = choose_inspection_workers(
+        [task[0] for task in changed_tasks] or list(scan.files), workers
+    )
     if progress:
         method = (
             "NetCDF4 低层元数据优先，失败时回退 xarray"
@@ -993,36 +1033,17 @@ def inspect_filename_inventory(
             else "xarray"
         )
         print(
-            f"并行检查 {len(tasks)} 个文件的变量、网格和属性（{worker_count} 个进程，{method}）……"
+            f"复用 {len(records_by_path)} 个文件；检查 {len(changed_tasks)} 个文件的"
+            f"变量、网格和属性（{worker_count} 个进程，{method}）……"
         )
-    if worker_count == 1:
-        records = []
-        for task in tasks:
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("任务已取消。")
-            records.append(_inspect_filename_file(task))
-    else:
-        chunksize = max(1, min(16, len(tasks) // max(1, worker_count * 8)))
-        executor = ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=spawn_context(),
-        )
-        terminated = False
-        try:
-            records = []
-            for record in executor.map(_inspect_filename_file, tasks, chunksize=chunksize):
-                if cancel_event is not None and cancel_event.is_set():
-                    terminate = getattr(executor, "terminate_workers", None)
-                    if terminate is not None:
-                        terminate()
-                    else:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                    terminated = True
-                    raise RuntimeError("任务已取消。")
-                records.append(record)
-        finally:
-            if not terminated:
-                executor.shutdown(wait=True)
+    for record in bounded_process_map(
+        _inspect_filename_file,
+        changed_tasks,
+        workers=min(worker_count, max(1, len(changed_tasks))),
+        cancel_event=cancel_event,
+    ):
+        records_by_path[record.path] = record
+    records = [records_by_path[path] for path in scan.files]
 
     full_times = np.asarray(scan.expected_times, dtype="datetime64[ns]")
     if scan.template == "doy":
@@ -1205,6 +1226,7 @@ def _initialize_filename_zarr(
     plan: ConversionPlan,
     transforms: dict[str, VariableTransform],
     variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
 ) -> dict[str, tuple[np.dtype, float | int]]:
     import dask.array as da
     import xarray as xr
@@ -1217,7 +1239,9 @@ def _initialize_filename_zarr(
         encoding = {}
         effective: dict[str, tuple[np.dtype, float | int]] = {}
         variable_names = variable_names or {}
-        compressor = make_compressor(plan.compression, plan.compression_level, plan.shuffle)
+        default_compressor = make_compressor(
+            plan.compression, plan.compression_level, plan.shuffle
+        )
         for name in selection.variables:
             spec = inventory.variables[name]
             output_name = variable_names.get(name, name)
@@ -1232,11 +1256,23 @@ def _initialize_filename_zarr(
             effective[name] = (dtype, fill)
             attrs = _transformed_attrs(spec, transform, fill)
             shape = (nt, ny, nx)
-            chunks = (
-                min(nt, max(1, plan.chunk_time)),
-                min(ny, max(1, plan.chunk_lat)),
-                min(nx, max(1, plan.chunk_lon)),
-            )
+            layout_item = output_layout.for_source(name) if output_layout else None
+            if layout_item is not None:
+                if layout_item.output_name != output_name:
+                    raise ValueError(f"变量 {name} 的输出名称与最终布局不一致。")
+                if layout_item.shape != shape or layout_item.dims != ("time", "lat", "lon"):
+                    raise ValueError(f"变量 {name} 的 shape/dims 与最终布局不一致。")
+                if np.dtype(layout_item.dtype) != dtype:
+                    raise ValueError(f"变量 {name} 的 dtype 与最终布局不一致。")
+                chunks = layout_item.chunks
+                compressor = compressor_from_spec(layout_item.codec)
+            else:
+                chunks = (
+                    min(nt, max(1, plan.chunk_time)),
+                    min(ny, max(1, plan.chunk_lat)),
+                    min(nx, max(1, plan.chunk_lon)),
+                )
+                compressor = default_compressor
             variables[output_name] = xr.Variable(
                 ("time", "lat", "lon"), da.empty(shape, chunks=chunks, dtype=dtype), attrs=attrs
             )
@@ -1270,9 +1306,25 @@ def _initialize_filename_zarr(
             coords[name] = xr.Variable(
                 (), coordinate.values, attrs=coordinate.attrs.copy()
             )
+            if output_layout is not None:
+                coordinate_compressor = compressor_from_spec(
+                    output_layout.coordinate_codec
+                )
+                if coordinate_compressor is not None:
+                    encoding[name] = {"compressors": [coordinate_compressor]}
         for name, coordinate in coords.items():
             if coordinate.ndim:
-                encoding[name] = {"chunks": (min(len(coordinate), 8192),)}
+                coordinate_layout = output_layout.for_output(name) if output_layout else None
+                coordinate_chunks = (
+                    coordinate_layout.chunks
+                    if coordinate_layout is not None
+                    else (min(len(coordinate), 8192),)
+                )
+                encoding[name] = {"chunks": coordinate_chunks}
+                if coordinate_layout is not None:
+                    coordinate_compressor = compressor_from_spec(coordinate_layout.codec)
+                    if coordinate_compressor is not None:
+                        encoding[name]["compressors"] = [coordinate_compressor]
         attrs = dict(ref.attrs)
         attrs.update({
             "source_mode": "filename",
@@ -1449,6 +1501,7 @@ def filename_direct_write(
     *,
     transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
     cancel_event=None,
     validate: bool = False,
     progress: bool = True,
@@ -1457,7 +1510,13 @@ def filename_direct_write(
     transforms = transforms or {}
     variable_names = variable_names or {}
     effective = _initialize_filename_zarr(
-        inventory, selection, output, plan, transforms, variable_names
+        inventory,
+        selection,
+        output,
+        plan,
+        transforms,
+        variable_names,
+        output_layout,
     )
     effective_for_workers = {
         name: (str(dtype), fill) for name, (dtype, fill) in effective.items()
@@ -1501,9 +1560,10 @@ def filename_direct_write(
             flush=True,
         )
     try:
-        executor = ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=spawn_context(),
+        results = bounded_process_map(
+            _filename_write_task,
+            tasks,
+            workers=worker_count,
             initializer=_filename_worker_init,
             initargs=(
                 str(output),
@@ -1515,38 +1575,26 @@ def filename_direct_write(
                 selection.lon_start,
                 variable_names,
             ),
+            cancel_event=cancel_event,
         )
-        try:
-            results = executor.map(_filename_write_task, tasks, chunksize=1)
-            for completed, amount in enumerate(results, 1):
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RuntimeError("任务已取消。")
-                logical_bytes += amount
-                if progress and (completed == len(tasks) or completed % report_every == 0):
-                    elapsed = max(time.perf_counter() - started, 1e-9)
-                    cpu, rss = samples[-1] if samples else (None, None)
-                    print(
-                        progress_line(
-                            completed,
-                            len(tasks),
-                            logical_bytes,
-                            elapsed,
-                            prefix="文件名时间写入",
-                            cpu=cpu,
-                            rss=rss,
-                        ),
-                        end="",
-                        flush=True,
-                    )
-        except BaseException:
-            terminate = getattr(executor, "terminate_workers", None)
-            if terminate is not None:
-                terminate()
-            else:
-                executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True)
+        for completed, amount in enumerate(results, 1):
+            logical_bytes += amount
+            if progress and (completed == len(tasks) or completed % report_every == 0):
+                elapsed = max(time.perf_counter() - started, 1e-9)
+                cpu, rss = samples[-1] if samples else (None, None)
+                print(
+                    progress_line(
+                        completed,
+                        len(tasks),
+                        logical_bytes,
+                        elapsed,
+                        prefix="文件名时间写入",
+                        cpu=cpu,
+                        rss=rss,
+                    ),
+                    end="",
+                    flush=True,
+                )
     finally:
         stop.set()
         monitor.join(timeout=2)
@@ -1580,6 +1628,7 @@ def convert_filename(
     transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
     chunks: tuple[int, int, int] | None = None,
+    output_layout: OutputLayout | None = None,
     cancel_event=None,
     plan: ConversionPlan | None = None,
     auto_tune: bool = False,
@@ -1599,21 +1648,15 @@ def convert_filename(
     if output == inventory.input_dir:
         raise ValueError("输入目录和输出目录不能相同。")
     transforms = transforms or {}
-    plan = plan or initial_plan(inventory, selection, output)
-    if chunks is not None:
-        if len(chunks) != 3 or any(int(value) <= 0 for value in chunks):
-            raise ValueError("转换 chunks 必须是三个正整数。")
-        plan = replace(
-            plan,
-            chunk_time=min(int(chunks[0]), selection.shape[0]),
-            chunk_lat=min(int(chunks[1]), selection.shape[1]),
-            chunk_lon=min(int(chunks[2]), selection.shape[2]),
-            # A filename worker writes one reconstructed time at a time.  If
-            # an external pipeline requests a larger time chunk, one task must
-            # own that complete chunk to avoid concurrent partial writes.
-            task_batch=min(int(chunks[0]), selection.shape[0]),
-            rationale=plan.rationale + ("使用外部编排器提供的源临时 chunks。",),
-        )
+    plan = resolve_conversion_plan(
+        inventory,
+        selection,
+        output,
+        plan=plan,
+        chunks=chunks,
+        max_workers=max_workers if not auto_tune or chunks is not None else None,
+        reserve_gib=reserve_gib,
+    )
     tuning_results = []
     if auto_tune and chunks is None:
         candidates = candidate_plans(
@@ -1641,8 +1684,6 @@ def convert_filename(
                 info, chosen, transforms
             ),
         )
-    elif max_workers is not None:
-        plan = replace(plan, workers=min(plan.workers, max_workers))
 
     if tuning_results:
         selected_result = max(
@@ -1683,6 +1724,7 @@ def convert_filename(
             plan,
             transforms=transforms,
             variable_names=variable_names,
+            output_layout=output_layout,
             cancel_event=cancel_event,
             validate=validate,
             progress=progress,

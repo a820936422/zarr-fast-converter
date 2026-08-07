@@ -137,13 +137,13 @@ PipelinePlanner：目标网格、转换选择、资源、布局、空间预检
         |
         +-- 网格等价 --> 转换器以最终 chunks/codec 写最终 staging --> 校验/发布
         |
-        +-- 需要重采样 --> 转换器写 source-crop.zarr（临时布局/低压缩）
+        +-- 需要重采样 --> 转换器写 source-crop.zarr（计算友好布局）
                                   |
                                   v
-                             重采样写 resampled.zarr（临时布局/低压缩）
+                             重采样以最终 chunks/codec 写最终 staging
                                   |
                                   v
-                             重分块+最终压缩写最终 staging --> 校验/发布
+                             数学验证/结构校验 --> 原子发布
 ~~~
 
 仅在以下条件全部成立时跳过重采样：源、目标分辨率一致；目标像元中心与源坐标对齐；目标范围能由源像元精确裁剪；且没有用户请求的其他网格变换。此时转换器直接采用最终输出的 chunks 与 codec，避免临时层和二次读写。
@@ -257,7 +257,7 @@ V1 新增 `PipelineLayoutPlan`，在写入前一次性确定：
 <temporary-root>/fast-nc-zarr-pipeline/<job-id>/
   manifest.json
   source-crop.zarr/       # 仅需要重采样时创建
-  resampled.zarr/         # 仅需要重采样时创建
+  resampled.zarr/         # 仅布局不兼容并回退最终化时创建
   weights/                 # xESMF 权重和任务日志
 ~~~
 
@@ -270,9 +270,9 @@ V1 新增 `PipelineLayoutPlan`，在写入前一次性确定：
 通用参数的“随时清理中间产物”默认关闭，关闭时保留所有成功阶段的临时层到整条任务
 成功，便于排查。用户开启后采用严格的“**先验证，后删除**”策略：
 
-1. `source-crop.zarr` 只能在 `resampled.zarr` 的结构、坐标、覆盖掩膜和数学验证全部
+1. `source-crop.zarr` 只能在最终重采样 staging 的结构、坐标、覆盖掩膜和数学验证全部
    通过后删除；
-2. `resampled.zarr` 只能在最终 Zarr 已完成重分块/压缩、最终校验通过且已成功发布后删除；
+2. 回退路径中的 `resampled.zarr` 只能在最终 Zarr 已完成重分块/压缩、最终校验通过且已成功发布后删除；
 3. 任务取消、异常或任一验证失败时，当前仍存在的临时层必须保留，不能因节省空间而
    删除唯一的排查证据；
 4. 每次删除前后都更新 `manifest.json` 和任务日志，记录已释放的字节数、路径及下游

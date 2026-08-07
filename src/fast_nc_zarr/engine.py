@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 
 from .benchmark import COMPRESSION_SAFETY, tune
-from .models import ConversionPlan, Inventory, Selection, VariableTransform
-from .planner import candidate_plans, initial_plan
+from .models import ConversionPlan, Inventory, OutputLayout, Selection, VariableTransform
+from .planner import candidate_plans, resolve_conversion_plan
 from .publication import make_staging_path, publish_staging, validate_publish_target
 from .selection import selected_logical_bytes
 from .validation import validate_output
@@ -214,6 +214,7 @@ def convert(
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
     chunks: tuple[int, int, int] | None = None,
+    output_layout: OutputLayout | None = None,
     cancel_event=None,
 ) -> tuple[ConversionPlan, dict]:
     output = validate_publish_target(
@@ -224,35 +225,14 @@ def convert(
     if output == inventory.input_dir:
         raise ValueError("输入目录和输出目录不能相同。")
 
-    plan = initial_plan(inventory, selection, output, reserve_gib=reserve_gib)
-    if chunks is not None:
-        from dataclasses import replace
-
-        if len(chunks) != 3 or any(int(value) <= 0 for value in chunks):
-            raise ValueError("转换 chunks 必须是三个正整数。")
-        plan = replace(
-            plan,
-            # ``file`` tasks deliberately own one time slice.  The pipeline
-            # may request a larger time chunk for vectorized resampling, in
-            # which case switch to chunk-owned writes instead of allowing
-            # several workers to update one Zarr time chunk independently.
-            strategy=(
-                "chunk"
-                if plan.strategy == "file"
-                and min(int(chunks[0]), selection.shape[0]) > 1
-                else plan.strategy
-            ),
-            task_batch=(
-                1
-                if plan.strategy == "file"
-                and min(int(chunks[0]), selection.shape[0]) > 1
-                else plan.task_batch
-            ),
-            chunk_time=min(int(chunks[0]), selection.shape[0]),
-            chunk_lat=min(int(chunks[1]), selection.shape[1]),
-            chunk_lon=min(int(chunks[2]), selection.shape[2]),
-            rationale=plan.rationale + ("使用外部编排器提供的源临时 chunks。",),
-        )
+    plan = resolve_conversion_plan(
+        inventory,
+        selection,
+        output,
+        chunks=chunks,
+        max_workers=max_workers if not auto_tune or chunks is not None else None,
+        reserve_gib=reserve_gib,
+    )
     tuning_results = []
     if auto_tune and chunks is None and plan.strategy != "dask":
         candidates = candidate_plans(
@@ -270,10 +250,6 @@ def convert(
             budget_seconds=tune_budget,
             progress=progress,
         )
-    elif max_workers is not None:
-        from dataclasses import replace
-
-        plan = replace(plan, workers=min(plan.workers, max_workers))
 
     if tuning_results:
         selected_result = max(
@@ -308,6 +284,8 @@ def convert(
     staging = make_staging_path(output, "convert")
     try:
         if plan.strategy == "dask":
+            if output_layout is not None:
+                raise ValueError("Dask 回退路径暂不能直接消费最终输出布局。")
             metrics = _dask_write(
                 inventory,
                 selection,
@@ -327,6 +305,7 @@ def convert(
                 plan,
                 variable_transforms=variable_transforms,
                 variable_names=variable_names,
+                output_layout=output_layout,
                 cancel_event=cancel_event,
                 progress=progress,
             )

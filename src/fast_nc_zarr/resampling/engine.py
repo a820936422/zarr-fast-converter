@@ -18,6 +18,7 @@ import zarr
 from ..rechunking.models import DatasetInfo, VariableInfo
 from ..publication import publish_staging
 from ..runtime import configure_process_runtime, spawn_context
+from ..writer import compressor_from_spec
 from .autotune import (
     resolve_auto_space_workers,
     resolve_auto_tile_size,
@@ -214,6 +215,8 @@ def _missing_values(item: VariableInfo | None, variable: xr.DataArray) -> tuple[
     values: list[object] = []
     for marker in ("_FillValue", "missing_value"):
         value = variable.encoding.get(marker)
+        if value is None:
+            value = variable.attrs.get(marker)
         if value is None and item is not None:
             value = item.attrs.get(marker)
         if value is None:
@@ -278,6 +281,7 @@ def _build_output_encoding(
     info: DatasetInfo,
     chunks: dict[str, tuple[int, ...]],
     output: xr.Dataset,
+    output_layout=None,
 ) -> dict[str, dict[str, object]]:
     by_name = {item.name: item for item in info.variables}
     encoding: dict[str, dict[str, object]] = {}
@@ -286,8 +290,30 @@ def _build_output_encoding(
         if item is None:
             continue
         entry = _source_encoding(source[name], item)
+        if (
+            {"lat", "lon"}.issubset(item.dims)
+            and np.issubdtype(variable.dtype, np.floating)
+        ):
+            # Interpolation represents every missing result as NaN, including
+            # integer sources promoted to floating output.  Retaining a
+            # source ``missing_value=-9999`` beside Zarr's NaN fill marker is
+            # both semantically wrong and rejected by xarray's CF encoder.
+            entry["_FillValue"] = np.asarray(np.nan, dtype=variable.dtype).item()
+            entry.pop("missing_value", None)
         if variable.ndim:
             entry["chunks"] = chunks[name]
+        if output_layout is not None:
+            try:
+                layout_item = output_layout.for_output(name)
+            except KeyError:
+                codec = output_layout.coordinate_codec if item.is_coord else None
+            else:
+                codec = layout_item.codec
+            compressor = compressor_from_spec(codec)
+            if compressor is None:
+                entry.pop("compressors", None)
+            else:
+                entry["compressors"] = [compressor]
         encoding[name] = entry
     return encoding
 
@@ -663,6 +689,7 @@ def _build_output_skeleton(
         info,
         plan.output_chunks,
         output,
+        plan.output_layout,
     )
     return output, encoding, spatial_names
 
@@ -1418,13 +1445,36 @@ def plan_resample(
     else:
         assert manual_tile_size is not None
         selected_tile_size = manual_tile_size
+    planned_output_chunks = output_chunks(inspection.info, target)
+    if config.output_layout is not None:
+        for item in inspection.info.variables:
+            try:
+                layout_item = config.output_layout.for_output(item.name)
+            except KeyError:
+                continue
+            expected_shape = tuple(
+                target.dimensions.get(dim, int(size))
+                for dim, size in zip(item.dims, item.shape)
+            )
+            if layout_item.shape != expected_shape or layout_item.dims != item.dims:
+                raise ValueError(f"变量 {item.name} 与最终输出布局的 shape/dims 不一致。")
+            if not item.is_coord:
+                expected_dtype = np.dtype(item.dtype)
+                if {"lat", "lon"}.issubset(item.dims):
+                    if not np.issubdtype(expected_dtype, np.floating):
+                        expected_dtype = np.dtype("float64")
+                    elif config.compute_dtype == "float32":
+                        expected_dtype = np.dtype("float32")
+                if np.dtype(layout_item.dtype) != expected_dtype:
+                    raise ValueError(f"变量 {item.name} 与最终输出布局的 dtype 不一致。")
+            planned_output_chunks[item.name] = layout_item.chunks
     return ResamplePlan(
         inspection=inspection,
         target=target,
         method=config.method,
         skipna=config.skipna,
         na_thres=float(config.na_thres),
-        output_chunks=output_chunks(inspection.info, target),
+        output_chunks=planned_output_chunks,
         compute_dtype=config.compute_dtype,
         tile_size=selected_tile_size,
         time_block=selected_time_block,
@@ -1434,6 +1484,7 @@ def plan_resample(
         tile_size_requested=config.tile_size,
         space_workers_requested=config.space_workers,
         auto_tile=auto_tile,
+        output_layout=config.output_layout,
     )
 
 
@@ -1783,6 +1834,8 @@ def run_resample(
             "output": str(target_path),
             "physical_bytes": physical_bytes,
             "logical_bytes": logical_bytes,
+            "used_intermediate": intermediate is not None,
+            "intermediate_logical_bytes": logical_bytes if use_intermediate else 0,
             "throughput_mib_s": physical_bytes / 1024**2 / max(elapsed, 1e-9),
             "temporary_dir": str(temporary_root),
             "tile_timing": tile_timing,

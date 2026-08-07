@@ -6,9 +6,11 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import xarray as xr
+import zarr
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
@@ -52,7 +54,11 @@ class PipelineTests(unittest.TestCase):
                 "value": (
                     ("time", "lat", "lon"),
                     np.arange(2 * 3 * 4, dtype="float32").reshape(2, 3, 4),
-                )
+                ),
+                "quality": (
+                    ("time", "lat", "lon"),
+                    np.arange(2 * 3 * 4, dtype="int16").reshape(2, 3, 4),
+                ),
             },
             coords={
                 "time": times,
@@ -129,6 +135,7 @@ class PipelineTests(unittest.TestCase):
         output = ROOT / "result.zarr"
         plan = preview_pipeline(inspection, self._config(output))
         self.assertEqual(plan.conversion_chunks, (1, 6, 6))
+        self.assertTrue(plan.direct_finalization)
         result = run_pipeline(inspection, self._config(output), progress=False)
         self.assertTrue(result["needs_resample"])
         with xr.open_zarr(output, consolidated=False, chunks=None, decode_times=False) as dataset:
@@ -145,8 +152,17 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(math_validation["weights_built"], 0)
         self.assertLessEqual(math_validation["sample_windows"], 6)
         converted = Path(manifest["temporary_root"]) / "source-crop.zarr"
+        self.assertEqual(
+            manifest["stages"]["finalization"]["status"],
+            "skipped_direct_layout",
+        )
+        self.assertFalse((Path(manifest["temporary_root"]) / "resampled.zarr").exists())
         with xr.open_zarr(converted, consolidated=False, chunks=None, decode_times=False) as dataset:
             self.assertEqual(dataset["value"].encoding["chunks"], (1, 6, 6))
+        group = zarr.open_group(output, mode="r")
+        value_layout = plan.output_layout.for_source("value")
+        self.assertEqual(group["value"].chunks, value_layout.chunks)
+        self.assertIn("shuffle", repr(group["value"].compressors).lower())
 
     def test_auto_pipeline_conversion_time_chunk_uses_resampling_batch(self) -> None:
         inspection = inspect_source(
@@ -199,12 +215,29 @@ class PipelineTests(unittest.TestCase):
         )
         plan = preview_pipeline(inspection, config)
         self.assertFalse(plan.needs_resample)
+        self.assertTrue(plan.direct_finalization)
+        self.assertEqual(plan.conversion_chunks, plan.final_chunks)
         result = run_pipeline(inspection, config, progress=False)
         self.assertFalse(result["needs_resample"])
         with xr.open_zarr(config.general.output, consolidated=False, chunks=None, decode_times=False) as dataset:
             self.assertEqual(dataset["value"].dims, ("time", "lat", "lon"))
             np.testing.assert_allclose(dataset.lat.values, [0.25, 0.15])
             np.testing.assert_allclose(dataset.lon.values, [-0.05, 0.05])
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["stages"]["finalization"]["status"],
+            "skipped_direct_layout",
+        )
+        self.assertFalse((Path(manifest["temporary_root"]) / "source-crop.zarr").exists())
+        group = zarr.open_group(config.general.output, mode="r")
+        value_layout = plan.output_layout.for_source("value")
+        self.assertEqual(group["value"].chunks, value_layout.chunks)
+        self.assertIn("shuffle", repr(group["value"].compressors).lower())
+        self.assertIn("bitshuffle", repr(group["quality"].compressors).lower())
+        self.assertIn("zstd", repr(group["lat"].compressors).lower())
+        self.assertEqual(result["logical_io"]["temporary_write_bytes"], 0)
+        self.assertEqual(result["logical_io"]["write_amplification"], 1.0)
+        self.assertGreater(result["logical_io"]["avoided_finalization_read_bytes"], 0)
 
     def test_cleanup_removes_only_validated_intermediate_stores(self) -> None:
         inspection = inspect_source(
@@ -225,6 +258,27 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse((root / "source-crop.zarr").exists())
         self.assertFalse((root / "resampled.zarr").exists())
         self.assertTrue(config.general.output.exists())
+
+    def test_resample_math_failure_does_not_replace_existing_output(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        output = ROOT / "protected-result.zarr"
+        sentinel = xr.Dataset({"sentinel": (("x",), np.asarray([7], dtype="int16"))})
+        sentinel.to_zarr(output, mode="w", zarr_format=3, consolidated=False)
+        sentinel.close()
+        base = self._config(output)
+        config = replace(base, general=replace(base.general, overwrite=True))
+
+        with patch(
+            "fast_nc_zarr.pipeline.engine.validate_resample_samples",
+            side_effect=RuntimeError("simulated math validation failure"),
+        ):
+            with self.assertRaisesRegex(Exception, "simulated math validation failure"):
+                run_pipeline(inspection, config, progress=False)
+
+        with xr.open_zarr(output, consolidated=False, chunks=None) as preserved:
+            self.assertEqual(int(preserved["sentinel"].values[0]), 7)
 
     def test_uncovered_target_tiles_are_nan_without_extrapolation(self) -> None:
         inspection = inspect_source(

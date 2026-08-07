@@ -1,6 +1,6 @@
 [workspace]
 name = "fast-nc-zarr"
-version = "0.1.1"
+version = "0.1.2"
 description = "Reproducible development environment for the fast Zarr converter"
 channels = ["conda-forge"]
 platforms = ["linux-64"]

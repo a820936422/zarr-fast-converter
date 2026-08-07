@@ -15,7 +15,11 @@ from fast_nc_zarr.publication import (
     publish_staging,
     validate_publish_target,
 )
-from fast_nc_zarr.runtime import configure_process_runtime, spawn_context
+from fast_nc_zarr.runtime import (
+    bounded_process_map,
+    configure_process_runtime,
+    spawn_context,
+)
 
 
 ROOT = Path("/tmp/codex_test/fast_nc_zarr_runtime_publication_tests")
@@ -48,6 +52,25 @@ class RuntimePublicationTests(unittest.TestCase):
                 "NUMEXPR_NUM_THREADS",
             ):
                 self.assertEqual(os.environ[name], "2")
+
+    def test_bounded_process_map_uses_direct_serial_path(self) -> None:
+        state = []
+
+        def initialize(prefix):
+            state.append(prefix)
+
+        results = list(
+            bounded_process_map(
+                lambda value: value * 2,
+                range(4),
+                workers=1,
+                initializer=initialize,
+                initargs=("ready",),
+            )
+        )
+
+        self.assertEqual(state, ["ready"])
+        self.assertEqual(results, [0, 2, 4, 6])
 
     def test_publish_replaces_validated_target_and_removes_backup(self) -> None:
         target = ROOT / "output.zarr"
