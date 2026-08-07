@@ -23,6 +23,104 @@ from .runtime import bounded_process_map
 _OUTPUT_GROUP = None
 _SOURCE_CACHE = None
 _SOURCE_CACHE_LIMIT = 4
+_SOURCE_ENGINE = "netcdf4"
+
+def _worker_init(output: str, source_engine: str = "netcdf4") -> None:
+    global _OUTPUT_GROUP, _SOURCE_CACHE, _SOURCE_ENGINE
+    from collections import OrderedDict
+
+    import zarr
+
+    _OUTPUT_GROUP = zarr.open_group(output, mode="r+")
+    _SOURCE_CACHE = OrderedDict()
+    _SOURCE_ENGINE = source_engine
+
+
+def _close_source(source) -> None:
+    close = getattr(source, "close", None)
+    if close is not None:
+        close()
+
+
+def _source(path: str):
+    global _SOURCE_CACHE
+    existing = _SOURCE_CACHE.get(path)
+    if existing is not None:
+        _SOURCE_CACHE.move_to_end(path)
+        return existing
+    if _SOURCE_ENGINE == "netcdf4":
+        import netCDF4
+
+        source = netCDF4.Dataset(path, mode="r")
+        source.set_auto_mask(False)
+        source.set_auto_scale(False)
+    else:
+        import xarray as xr
+
+        source = xr.open_dataset(
+            path,
+            engine=_SOURCE_ENGINE,
+            chunks=None,
+            decode_times=False,
+            mask_and_scale=False,
+        )
+    _SOURCE_CACHE[path] = source
+    while len(_SOURCE_CACHE) > _SOURCE_CACHE_LIMIT:
+        _, stale = _SOURCE_CACHE.popitem(last=False)
+        _close_source(stale)
+    return source
+
+
+def _read_segment(task: ChunkTask, segment: SourceSegment) -> np.ndarray:
+    source = _source(segment.path)
+    selectors = []
+    for dim in task.dims:
+        if dim == "time":
+            selectors.append(slice(segment.local_start, segment.local_stop))
+        elif dim == "lat":
+            selectors.append(slice(*task.source_lat))
+        elif dim == "lon":
+            selectors.append(slice(*task.source_lon))
+        else:
+            raise RuntimeError(f"直接写入不支持维度 {dim}")
+    return np.asarray(source.variables[task.variable][tuple(selectors)])
+
+def _apply_transform(
+    data: np.ndarray,
+    fill_values: tuple[float, ...] | None,
+    scale_factor: float | None,
+    output_fill: float | int | None,
+    output_dtype: str,
+) -> np.ndarray:
+    raw = np.asarray(data)
+    target_dtype = np.dtype(output_dtype)
+    needs_mask = bool(fill_values)
+    needs_cast = raw.dtype != target_dtype
+    needs_scale = scale_factor is not None
+    if not needs_mask and not needs_cast and not needs_scale:
+        return raw if raw.flags.c_contiguous else np.ascontiguousarray(raw)
+
+    mask = np.zeros(raw.shape, dtype=bool) if needs_mask else None
+    if mask is not None:
+        for value in fill_values:
+            try:
+                if np.isnan(value) and np.issubdtype(raw.dtype, np.floating):
+                    mask |= np.isnan(raw)
+                    continue
+            except TypeError:
+                pass
+            mask |= raw == value
+    result = raw.astype(target_dtype, copy=needs_cast or needs_scale or mask is not None)
+    if needs_scale:
+        if mask is not None and mask.any():
+            result[~mask] *= scale_factor
+        else:
+            result *= scale_factor
+    if mask is not None and mask.any():
+        if output_fill is None:
+            raise ValueError("缺少整型变量的输出缺失值。")
+        result[mask] = output_fill
+    return result if result.flags.c_contiguous else np.ascontiguousarray(result)
 
 
 def progress_line(
@@ -281,78 +379,6 @@ def initialize_zarr(
         template.close()
 
 
-def _worker_init(output: str) -> None:
-    global _OUTPUT_GROUP, _SOURCE_CACHE
-    from collections import OrderedDict
-
-    import zarr
-
-    _OUTPUT_GROUP = zarr.open_group(output, mode="r+")
-    _SOURCE_CACHE = OrderedDict()
-
-
-def _source(path: str):
-    global _SOURCE_CACHE
-    import netCDF4
-
-    existing = _SOURCE_CACHE.get(path)
-    if existing is not None:
-        _SOURCE_CACHE.move_to_end(path)
-        return existing
-    ds = netCDF4.Dataset(path, mode="r")
-    ds.set_auto_mask(False)
-    ds.set_auto_scale(False)
-    _SOURCE_CACHE[path] = ds
-    while len(_SOURCE_CACHE) > _SOURCE_CACHE_LIMIT:
-        _, stale = _SOURCE_CACHE.popitem(last=False)
-        stale.close()
-    return ds
-
-
-def _read_segment(task: ChunkTask, segment: SourceSegment) -> np.ndarray:
-    source = _source(segment.path)
-    selectors = []
-    for dim in task.dims:
-        if dim == "time":
-            selectors.append(slice(segment.local_start, segment.local_stop))
-        elif dim == "lat":
-            selectors.append(slice(*task.source_lat))
-        elif dim == "lon":
-            selectors.append(slice(*task.source_lon))
-        else:
-            raise RuntimeError(f"直接写入不支持维度 {dim}")
-    return np.asarray(source.variables[task.variable][tuple(selectors)])
-
-
-def _apply_transform(
-    data: np.ndarray,
-    fill_values: tuple[float, ...] | None,
-    scale_factor: float | None,
-    output_fill: float | int | None,
-    output_dtype: str,
-) -> np.ndarray:
-    raw = np.asarray(data)
-    mask = np.zeros(raw.shape, dtype=bool)
-    if fill_values:
-        for value in fill_values:
-            try:
-                if np.isnan(value) and np.issubdtype(raw.dtype, np.floating):
-                    mask |= np.isnan(raw)
-                    continue
-            except TypeError:
-                pass
-            mask |= raw == value
-    result = raw.astype(np.dtype(output_dtype), copy=True)
-    if scale_factor is not None:
-        if mask.any():
-            result[~mask] *= scale_factor
-        else:
-            result *= scale_factor
-    if mask.any():
-        if output_fill is None:
-            raise ValueError("缺少整型变量的输出缺失值。")
-        result[mask] = output_fill
-    return np.ascontiguousarray(result)
 
 
 def _write_chunk(task: ChunkTask) -> int:
@@ -640,7 +666,7 @@ def direct_write(
             tasks,
             workers=min(plan.workers, total_tasks),
             initializer=_worker_init,
-            initargs=(str(output),),
+            initargs=(str(output), inventory.source_engine),
             cancel_event=cancel_event,
         )
         for completed, amount in enumerate(results, 1):
