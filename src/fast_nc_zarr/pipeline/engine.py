@@ -32,6 +32,7 @@ from .models import (
     PipelineConfig,
     PipelinePaths,
     PipelinePlan,
+    ZarrPipelinePlan,
 )
 from .planner import build_pipeline_plan
 
@@ -355,10 +356,188 @@ def validate_resample_samples(
     }
 
 
-def preview_pipeline(inspection, config: PipelineConfig) -> PipelinePlan:
+def preview_pipeline(inspection, config: PipelineConfig) -> PipelinePlan | ZarrPipelinePlan:
     """Build a no-write pipeline plan from an already completed inspection."""
 
     return build_pipeline_plan(inspection, config)
+
+
+def _run_zarr_pipeline(
+    inspection,
+    config: PipelineConfig,
+    plan: ZarrPipelinePlan,
+    *,
+    cancel_event=None,
+    progress: bool = True,
+) -> dict[str, object]:
+    paths = _paths(config)
+    paths.root.mkdir(parents=True, exist_ok=False)
+    output = Path(config.general.output).expanduser().resolve()
+    requested_operations = {
+        "conversion": False,
+        "resampling": bool(config.operations.resample),
+        "rechunking": bool(config.operations.rechunk),
+        "recompression": bool(config.operations.recompress),
+    }
+    operation_decisions = {
+        item.operation: asdict(item) for item in plan.operation_decisions
+    }
+    physical_stages = []
+    if plan.needs_resample:
+        physical_stages.append("resampling")
+    if plan.finalization_required:
+        physical_stages.append("finalization")
+    manifest = {
+        "schema_version": 3,
+        "job_id": paths.root.name,
+        "status": "running",
+        "source": str(inspection.path),
+        "input_kind": "zarr",
+        "output": str(output),
+        "temporary_root": str(paths.root),
+        "cleanup_intermediate": bool(config.general.cleanup_intermediate),
+        "needs_resample": bool(plan.needs_resample),
+        "direct_finalization": bool(plan.direct_finalization),
+        "requested_operations": requested_operations,
+        "requested_operation_order": [
+            name for name in config.requested_operations if name != "conversion"
+        ],
+        "operation_decisions": operation_decisions,
+        "physical_stages": physical_stages,
+        "target_shape": (
+            plan.resample_plan.output_dimensions if plan.resample_plan else plan.input_info.dimensions
+        ),
+        "target_extent": (
+            plan.resample_plan.target.spatial_extent if plan.resample_plan else None
+        ),
+        "config": asdict(config),
+        "stages": {},
+    }
+    _write_manifest(paths.manifest, manifest)
+    started = time.perf_counter()
+    current = Path(inspection.path).expanduser().resolve()
+    resample_metrics = None
+    finalization_metrics = None
+    try:
+        if plan.needs_resample:
+            options = config.resampling
+            resample_output = paths.resampled if plan.finalization_required else output
+            if progress:
+                print(f"统一流程阶段 1/{len(physical_stages)}：重采样现有 Zarr")
+            resample_metrics = run_resample(
+                ResampleConfig(
+                    input=current,
+                    output=resample_output,
+                    resolution=options.resolution,
+                    method=options.method,
+                    skipna=options.skipna,
+                    na_thres=options.na_thres,
+                    compute_dtype=options.compute_dtype,
+                    extent="custom",
+                    target_lat_bounds=(config.general.lat_min, config.general.lat_max),
+                    target_lon_bounds=(config.general.lon_min, config.general.lon_max),
+                    target_lat_descending=True,
+                    target_lon_descending=False,
+                    overwrite=config.general.overwrite if not plan.finalization_required else False,
+                    validate=config.validate,
+                    tile_size=options.tile_size,
+                    time_block=options.time_block,
+                    compute_workers=options.compute_workers,
+                    space_workers=options.space_workers,
+                    temporary_dir=paths.root,
+                ),
+                plan.resample_plan.inspection if plan.resample_plan else None,
+                cancel_event=cancel_event,
+            )
+            current = resample_output
+            manifest["stages"]["resampling"] = {
+                "status": "validated" if plan.finalization_required else "published_as_final",
+                "metrics": resample_metrics,
+            }
+            _write_manifest(paths.manifest, manifest)
+        if cancel_event is not None and cancel_event.is_set():
+            raise PipelineExecutionError("任务已取消。")
+        if plan.finalization_required:
+            chunking = config.chunking
+            if progress:
+                print(
+                    f"统一流程阶段 {len(physical_stages)}/{len(physical_stages)}："
+                    "应用最终 chunks/codec"
+                )
+            finalization_metrics = run_rechunk(
+                RechunkConfig(
+                    input=current,
+                    output=output,
+                    strategy=chunking.strategy,
+                    target_mib=chunking.target_mib,
+                    custom_chunks=chunking.custom_chunks,
+                    compression=(
+                        config.compression.profile
+                        if config.operations.recompress
+                        else "none"
+                    ),
+                    workers=chunking.workers,
+                    overwrite=config.general.overwrite,
+                    validate=config.validate,
+                    rechunk=config.operations.rechunk,
+                    recompress=config.operations.recompress,
+                    temporary_dir=paths.root,
+                ),
+                cancel_event=cancel_event,
+            )
+            manifest["stages"]["finalization"] = {
+                "status": "published_and_validated",
+                "metrics": finalization_metrics,
+            }
+            if plan.needs_resample and config.general.cleanup_intermediate:
+                shutil.rmtree(current)
+                manifest["stages"]["resampling"]["status"] = "validated_and_cleaned"
+        final_output_bytes = int(
+            (finalization_metrics or resample_metrics or {}).get(
+                "logical_bytes", plan.input_info.logical_bytes
+            )
+        )
+        temporary_write_bytes = (
+            int((resample_metrics or {}).get("logical_bytes", final_output_bytes))
+            if plan.needs_resample and plan.finalization_required
+            else 0
+        )
+        logical_io = {
+            "final_output_bytes": final_output_bytes,
+            "temporary_write_bytes": temporary_write_bytes,
+            "total_write_bytes": final_output_bytes + temporary_write_bytes,
+            "write_amplification": (
+                (final_output_bytes + temporary_write_bytes)
+                / max(1, final_output_bytes)
+            ),
+        }
+        manifest["logical_io"] = logical_io
+        manifest["status"] = "succeeded"
+        manifest["elapsed"] = time.perf_counter() - started
+        _write_manifest(paths.manifest, manifest)
+        return {
+            "output": str(output),
+            "elapsed": manifest["elapsed"],
+            "needs_resample": plan.needs_resample,
+            "requested_operations": requested_operations,
+            "operation_decisions": operation_decisions,
+            "physical_stages": physical_stages,
+            "manifest": str(paths.manifest),
+            "conversion": None,
+            "resampling": resample_metrics,
+            "finalization": finalization_metrics,
+            "logical_io": logical_io,
+        }
+    except Exception as exc:
+        manifest["status"] = "failed"
+        manifest["elapsed"] = time.perf_counter() - started
+        manifest["error"] = str(exc)
+        _write_manifest(paths.manifest, manifest)
+        if isinstance(exc, PipelineExecutionError):
+            raise
+        raise PipelineExecutionError(
+            f"现有 Zarr 统一流程失败；任务临时目录保留用于排查：{paths.root}\n{exc}"
+        ) from exc
 
 
 def run_pipeline(
@@ -371,6 +550,14 @@ def run_pipeline(
     """Execute the selected product operations and publish one final Zarr."""
 
     plan = build_pipeline_plan(inspection, config)
+    if isinstance(plan, ZarrPipelinePlan):
+        return _run_zarr_pipeline(
+            inspection,
+            config,
+            plan,
+            cancel_event=cancel_event,
+            progress=progress,
+        )
     paths = _paths(config)
     paths.root.mkdir(parents=True, exist_ok=False)
     requested_operations = {
@@ -388,16 +575,18 @@ def run_pipeline(
     if plan.finalization_required:
         physical_stages.append("finalization")
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "job_id": paths.root.name,
         "status": "running",
         "source": str(inspection.path),
+        "input_kind": "raw" if getattr(inspection, "kind", None) == "source" else getattr(inspection, "kind", "unknown"),
         "output": str(Path(config.general.output).expanduser().resolve()),
         "temporary_root": str(paths.root),
         "cleanup_intermediate": bool(config.general.cleanup_intermediate),
         "needs_resample": bool(plan.needs_resample),
         "direct_finalization": bool(plan.direct_finalization),
         "requested_operations": requested_operations,
+        "requested_operation_order": list(config.requested_operations),
         "operation_decisions": operation_decisions,
         "physical_stages": physical_stages,
         "output_layout": asdict(plan.output_layout) if plan.output_layout else None,

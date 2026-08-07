@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -71,8 +72,10 @@ from ..pipeline.models import (
     PipelineConfig,
     PipelineConversionOptions,
     PipelineGeneralConfig,
+    PipelineInput,
     PipelineOperations,
     PipelineResamplingOptions,
+    ZarrPipelinePlan,
 )
 from ..selection import parse_list
 from ..time_mapping import TimeInspectionResult, TimeRule, TimeFieldOption, inspect_time_metadata
@@ -378,6 +381,7 @@ class TimeRulePanel(QGroupBox):
 class InspectionPage(QWidget):
     task_requested = Signal(str, object, object)
     result_ready = Signal(object)
+    zarr_result_ready = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -391,8 +395,12 @@ class InspectionPage(QWidget):
 
         inputs = QGroupBox("检查输入")
         form = QFormLayout(inputs)
+        self.input_kind = QComboBox()
+        self.input_kind.addItem("原始 NC / HDF / TIFF", "raw")
+        self.input_kind.addItem("现有 Zarr v3", "zarr")
+        form.addRow("输入类型", self.input_kind)
         path_row, self.path = self._path_row("选择源目录", directory=True)
-        form.addRow("源数据目录", path_row)
+        form.addRow("输入目录", path_row)
         self.engine = QComboBox()
         for label, value in (
             ("自动", "auto"),
@@ -452,6 +460,17 @@ class InspectionPage(QWidget):
         self.report.setOpenExternalLinks(False)
         root.addWidget(self.report, 1)
         self.path.textChanged.connect(self._invalidate_time_check)
+        self.input_kind.currentIndexChanged.connect(self._input_kind_changed)
+
+    def _input_kind_changed(self, *_args) -> None:
+        is_zarr = self.input_kind.currentData() == "zarr"
+        self.time_check_button.setText("检查现有 Zarr" if is_zarr else "检查文件时间维度信息")
+        self.engine.setEnabled(not is_zarr)
+        self.recursive.setEnabled(not is_zarr)
+        self.inspect_workers.setEnabled(not is_zarr)
+        self.time_panel.setVisible(not is_zarr)
+        self.mapping_group.setVisible(not is_zarr)
+        self.confirm_time_button.setVisible(not is_zarr)
 
     def _path_row(self, dialog_title: str, *, directory: bool) -> tuple[QWidget, Any]:
         row = QWidget()
@@ -484,6 +503,14 @@ class InspectionPage(QWidget):
         if not path:
             QMessageBox.warning(self, "缺少输入", "请选择源数据目录。")
             return
+        if self.input_kind.currentData() == "zarr":
+            self.status.setText("正在检查现有 Zarr 元数据。")
+            self.task_requested.emit(
+                "检查现有 Zarr",
+                lambda: inspect_zarr(Path(path)),
+                self._zarr_inspection_done,
+            )
+            return
         workers = self.inspect_workers.value() or None
         config = SourceInspectionConfig(
             input_dir=Path(path),
@@ -502,6 +529,13 @@ class InspectionPage(QWidget):
             ),
             self._time_inspection_done,
         )
+
+    def _zarr_inspection_done(self, result: InspectionResult) -> None:
+        self.result = result
+        self.report.setPlainText(result.report)
+        self.status.setText("Zarr 检查完成，请进入处理流程选择操作。")
+        self.save_button.setEnabled(False)
+        self.zarr_result_ready.emit(result)
 
     def _time_inspection_done(self, result: TimeInspectionResult) -> None:
         self.time_result = result
@@ -1526,7 +1560,7 @@ class PipelinePage(QWidget):
         self.inspection: InspectionResult | None = None
         self.plan = None
         root = QVBoxLayout(self)
-        title = QLabel("一条龙模块")
+        title = QLabel("统一处理流程")
         title.setObjectName("pageTitle")
         root.addWidget(title)
 
@@ -1777,6 +1811,15 @@ class PipelinePage(QWidget):
 
     def set_inspection(self, result: InspectionResult) -> None:
         self.inspection = result
+        if result.kind == "zarr":
+            self.variables.setRowCount(0)
+            self.conversion_checkbox.setChecked(False)
+            self.conversion_group.setVisible(False)
+            self.status.setText("现有 Zarr 检查结果已载入，请至少选择一项处理操作。")
+            self._set_enabled(True)
+            return
+        self.conversion_checkbox.setChecked(True)
+        self.conversion_group.setVisible(True)
         info = result.source_inventory
         self.variables.setRowCount(0)
         for name in info.variables:
@@ -1886,11 +1929,21 @@ class PipelinePage(QWidget):
             raise ValueError("请选择最终输出目录。")
         strategy = self.strategy.currentData()
         custom = tuple(box.value() for box in self.custom_chunks) if strategy == "custom" else None
+        is_zarr = self.inspection.kind == "zarr"
         selected_variables = self._selected_variables()
-        if not selected_variables:
+        if not is_zarr and not selected_variables:
             raise ValueError("至少选择一个转换变量。")
+        if is_zarr and not any(
+            (
+                self.resample_checkbox.isChecked(),
+                self.rechunk_checkbox.isChecked(),
+                self.recompress_checkbox.isChecked(),
+            )
+        ):
+            raise ValueError("现有 Zarr 输入至少需要选择一项处理操作。")
         variable_names, variable_transforms = self._variable_settings()
         return PipelineConfig(
+            input=PipelineInput(kind="zarr" if is_zarr else "raw"),
             general=PipelineGeneralConfig(
                 output=Path(self.output.text().strip()),
                 temporary_dir=Path(self.temporary_dir.text().strip()) if self.temporary_dir.text().strip() else None,
@@ -1964,18 +2017,33 @@ class PipelinePage(QWidget):
             f"{item.operation}: {item.disposition} - {item.reason}"
             for item in plan.operation_decisions
         )
-        self.report.setPlainText(
-            "处理计划\n"
-            f"目标 shape(lat, lon)=({plan.target_grid.lat.size}, {plan.target_grid.lon.size})\n"
-            f"目标范围={plan.target_grid.spatial_extent}\n"
-            f"最终 chunks(time, lat, lon)={plan.final_chunks}\n"
-            f"源读取窗口=lat {plan.source_read_window.lat_bounds}，"
-            f"lon {plan.source_read_window.lon_bounds}\n"
-            f"halo={plan.source_read_window.halo_description}\n"
-            f"需要实际重采样={'是' if plan.needs_resample else '否'}\n"
-            f"操作决策：\n{decisions}"
-            + (f"\n覆盖提醒：{plan.coverage_warning}" if plan.coverage_warning else "")
-        )
+        if isinstance(plan, ZarrPipelinePlan):
+            dimensions = (
+                plan.resample_plan.output_dimensions
+                if plan.resample_plan is not None
+                else plan.input_info.dimensions
+            )
+            self.report.setPlainText(
+                "现有 Zarr 处理计划\n"
+                f"目标 shape(time, lat, lon)=({dimensions['time']}, {dimensions['lat']}, {dimensions['lon']})\n"
+                f"最终 chunks(time, lat, lon)={plan.final_chunks}\n"
+                f"需要重采样={'是' if plan.needs_resample else '否'}\n"
+                f"需要最终化={'是' if plan.finalization_required else '否'}\n"
+                f"操作决策：\n{decisions}"
+            )
+        else:
+            self.report.setPlainText(
+                "处理计划\n"
+                f"目标 shape(lat, lon)=({plan.target_grid.lat.size}, {plan.target_grid.lon.size})\n"
+                f"目标范围={plan.target_grid.spatial_extent}\n"
+                f"最终 chunks(time, lat, lon)={plan.final_chunks}\n"
+                f"源读取窗口=lat {plan.source_read_window.lat_bounds}，"
+                f"lon {plan.source_read_window.lon_bounds}\n"
+                f"halo={plan.source_read_window.halo_description}\n"
+                f"需要实际重采样={'是' if plan.needs_resample else '否'}\n"
+                f"操作决策：\n{decisions}"
+                + (f"\n覆盖提醒：{plan.coverage_warning}" if plan.coverage_warning else "")
+            )
         self.status.setText("计划已生成，请确认报告后开始处理。")
 
     def _run_done(self, result) -> None:
@@ -1988,6 +2056,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("快速 Zarr 转换器")
         self.resize(1280, 820)
+        self._apply_modern_theme()
         self.worker: TaskWorker | None = None
         self.source_result: InspectionResult | None = None
         self.zarr_result: InspectionResult | None = None
@@ -2010,15 +2079,33 @@ class MainWindow(QMainWindow):
         self.navigation.setFixedWidth(150)
         self.stack = QStackedWidget()
         self.task_page_index = len(pages) - 1
-        for label, page in pages:
+        for index, (label, page) in enumerate(pages):
             self.navigation.addItem(QListWidgetItem(label))
-            self.stack.addWidget(page)
+            if index == 0:
+                container = QScrollArea()
+                container.setWidgetResizable(True)
+                container.setFrameShape(QScrollArea.Shape.NoFrame)
+                container.setWidget(page)
+                self.stack.addWidget(container)
+            else:
+                if index in (1, 2, 3):
+                    page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+                self.stack.addWidget(page)
+        self.stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.navigation.item(0).setText("数据检查")
+        self.navigation.item(4).setText("处理流程")
+        self.navigation.item(5).setText("任务中心")
         self.navigation.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.navigation.setCurrentRow(0)
         # Conversion depends on a source inspection; Zarr optimization has
         # its own Zarr input and is intentionally usable independently.
         for index in (1, 4):
             self._set_nav_enabled(index, False)
+        # v1.4 makes the composable workflow the primary entry point.  The
+        # legacy pages stay instantiated for API and automation compatibility,
+        # but are removed from the visual navigation surface.
+        for index in (1, 2, 3):
+            self.navigation.item(index).setHidden(True)
 
         splitter = QSplitter()
         splitter.addWidget(self.navigation)
@@ -2033,7 +2120,32 @@ class MainWindow(QMainWindow):
         self.resample_page.task_requested.connect(self._task_requested)
         self.pipeline_page.task_requested.connect(self._task_requested)
         self.inspection_page.result_ready.connect(self._source_ready)
+        self.inspection_page.zarr_result_ready.connect(self._workflow_zarr_ready)
         self.rechunk_page.result_ready.connect(self._zarr_ready)
+
+    def _apply_modern_theme(self) -> None:
+        """Install a restrained Fusion/QSS theme without changing behavior."""
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.setStyle("Fusion")
+        app.setStyleSheet(
+            """
+            QWidget { font-size: 13px; color: #243447; }
+            QMainWindow { background: #f5f7fb; }
+            QListWidget { background: #17212b; color: #d8e2ec; border: 0; padding: 12px 6px; }
+            QListWidget::item { padding: 11px 14px; margin: 2px 0; border-radius: 6px; }
+            QListWidget::item:selected { background: #2f80ed; color: white; }
+            QGroupBox { border: 1px solid #d8e0ea; border-radius: 6px; margin-top: 14px; padding: 12px; background: white; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #31506f; }
+            QPushButton { background: #2f80ed; color: white; border: 0; border-radius: 5px; padding: 7px 14px; }
+            QPushButton:hover { background: #256dcc; }
+            QPushButton:disabled { background: #b7c3d0; }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QPlainTextEdit, QTableWidget { border: 1px solid #c9d4df; border-radius: 4px; background: white; padding: 4px; }
+            QProgressBar { border: 1px solid #c9d4df; border-radius: 4px; text-align: center; background: white; }
+            QProgressBar::chunk { background: #27ae60; }
+            """
+        )
 
     def _make_menu(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
@@ -2058,8 +2170,15 @@ class MainWindow(QMainWindow):
         for index in (1, 4):
             self._set_nav_enabled(index, True)
         self.navigation.item(1).setText("转换 ✓")
-        self.navigation.item(4).setText("一条龙 ✓")
-        self.navigation.setCurrentRow(1)
+        self.navigation.item(4).setText("处理流程 ✓")
+        self.navigation.setCurrentRow(4)
+
+    def _workflow_zarr_ready(self, result: InspectionResult) -> None:
+        self.zarr_result = result
+        self.pipeline_page.set_inspection(result)
+        self._set_nav_enabled(4, True)
+        self.navigation.item(4).setText("处理流程 ✓")
+        self.navigation.setCurrentRow(4)
 
     def _zarr_ready(self, result: InspectionResult) -> None:
         self.zarr_result = result

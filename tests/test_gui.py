@@ -167,6 +167,14 @@ class GuiServiceTests(unittest.TestCase):
         self.assertEqual(window.navigation.count(), 6)
         self.assertEqual(window.stack.count(), 6)
         self.assertEqual(window.windowTitle(), "快速 Zarr 转换器")
+        self.assertEqual(
+            [
+                window.navigation.item(index).text()
+                for index in range(window.navigation.count())
+                if not window.navigation.item(index).isHidden()
+            ],
+            ["数据检查", "处理流程", "任务中心"],
+        )
         self.assertFalse(bool(window.navigation.item(1).flags() & Qt.ItemFlag.ItemIsEnabled))
         self.assertTrue(bool(window.navigation.item(2).flags() & Qt.ItemFlag.ItemIsEnabled))
         self.assertEqual(window.resample_page.method.count(), 6)
@@ -257,6 +265,24 @@ class GuiServiceTests(unittest.TestCase):
         page.recompress_checkbox.setChecked(False)
         self.assertIsNone(page.plan)
         self.assertFalse(page.run_button.isEnabled())
+        window.close()
+        app.processEvents()
+
+    def test_pipeline_page_accepts_existing_zarr_input(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        result = inspect_zarr(ROOT / "input.zarr")
+        window._workflow_zarr_ready(result)
+        page = window.pipeline_page
+        page.output.setText(str(ROOT / "zarr-pipeline-output.zarr"))
+        self.assertFalse(page.conversion_checkbox.isChecked())
+        self.assertFalse(page.conversion_group.isVisible())
+        page.recompress_checkbox.setChecked(True)
+        config = page._config()
+        self.assertEqual(config.input.kind, "zarr")
+        self.assertFalse(config.operations.resample)
+        self.assertTrue(config.operations.recompress)
+        self.assertEqual(window.navigation.currentRow(), 4)
         window.close()
         app.processEvents()
 

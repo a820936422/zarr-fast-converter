@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Literal
 
 from ..models import OutputLayout, Selection, VariableTransform
-from ..rechunking.models import ChunkPlan, CompressionPlan
-from ..resampling.models import TargetGrid
+from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo
+from ..resampling.models import ResamplePlan, TargetGrid
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,13 @@ class PipelineGeneralConfig:
     lon_max: float = 180.0
     cleanup_intermediate: bool = False
     overwrite: bool = False
+
+
+@dataclass(frozen=True)
+class PipelineInput:
+    """Logical input contract, independent from output publication policy."""
+
+    kind: Literal["auto", "raw", "zarr"] = "auto"
 
 
 @dataclass(frozen=True)
@@ -78,12 +85,27 @@ class PipelineCompressionOptions:
 @dataclass(frozen=True)
 class PipelineConfig:
     general: PipelineGeneralConfig
+    input: PipelineInput = field(default_factory=PipelineInput)
     conversion: PipelineConversionOptions = field(default_factory=PipelineConversionOptions)
     operations: PipelineOperations = field(default_factory=PipelineOperations)
     resampling: PipelineResamplingOptions = field(default_factory=PipelineResamplingOptions)
     chunking: PipelineChunkingOptions = field(default_factory=PipelineChunkingOptions)
     compression: PipelineCompressionOptions = field(default_factory=PipelineCompressionOptions)
     validate: bool = True
+
+    @property
+    def requested_operations(self) -> tuple[str, ...]:
+        """Return logical operations in stable UI/manifest order."""
+        return tuple(
+            name
+            for name, enabled in (
+                ("conversion", self.input.kind != "zarr"),
+                ("resampling", self.operations.resample),
+                ("rechunking", self.operations.rechunk),
+                ("recompression", self.operations.recompress),
+            )
+            if enabled
+        )
 
 
 OperationName = Literal["conversion", "resampling", "rechunking", "recompression"]
@@ -142,6 +164,30 @@ class PipelinePlan:
     direct_finalization: bool = False
     finalization_required: bool = False
     operation_decisions: tuple[OperationDecision, ...] = ()
+
+    def decision(self, operation: OperationName) -> OperationDecision:
+        try:
+            return next(
+                item for item in self.operation_decisions if item.operation == operation
+            )
+        except StopIteration as exc:
+            raise KeyError(f"处理计划缺少操作决策：{operation}") from exc
+
+
+@dataclass(frozen=True)
+class ZarrPipelinePlan:
+    """Pure plan for an existing-Zarr input."""
+
+    inspection_id: str
+    input_info: DatasetInfo
+    needs_resample: bool
+    resample_plan: ResamplePlan | None
+    final_chunk_plan: ChunkPlan | None
+    final_compression: CompressionPlan | None
+    final_chunks: tuple[int, int, int] | None
+    direct_finalization: bool
+    finalization_required: bool
+    operation_decisions: tuple[OperationDecision, ...]
 
     def decision(self, operation: OperationName) -> OperationDecision:
         try:

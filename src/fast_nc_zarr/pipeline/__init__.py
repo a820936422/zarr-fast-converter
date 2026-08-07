@@ -7,10 +7,12 @@ from .models import (
     PipelineCompressionOptions,
     PipelineConversionOptions,
     PipelineGeneralConfig,
+    PipelineInput,
     PipelineOperations,
     PipelinePlan,
     PipelineResamplingOptions,
     SourceReadWindow,
+    ZarrPipelinePlan,
 )
 
 __all__ = [
@@ -20,8 +22,10 @@ __all__ = [
     "PipelineCompressionOptions",
     "PipelineConversionOptions",
     "PipelineGeneralConfig",
+    "PipelineInput",
     "PipelineOperations",
     "PipelinePlan",
     "PipelineResamplingOptions",
     "SourceReadWindow",
+    "ZarrPipelinePlan",
 ]

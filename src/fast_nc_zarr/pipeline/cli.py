@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ..application.services import SourceInspectionConfig, inspect_source
+from ..application.services import SourceInspectionConfig, inspect_source, inspect_zarr
 from .engine import preview_pipeline, run_pipeline
 from .models import (
     PipelineChunkingOptions,
@@ -11,8 +11,10 @@ from .models import (
     PipelineConfig,
     PipelineConversionOptions,
     PipelineGeneralConfig,
+    PipelineInput,
     PipelineOperations,
     PipelineResamplingOptions,
+    ZarrPipelinePlan,
 )
 
 
@@ -22,11 +24,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="将原始地理数据转换为 Zarr v3，并按需组合重采样、重分块和重压缩。",
     )
     parser.add_argument("--input", type=Path, required=True, help="源数据目录。")
+    parser.add_argument(
+        "--input-kind",
+        choices=("auto", "raw", "zarr"),
+        default="auto",
+        help="输入类型；auto 根据检查结果识别，raw 为原始 NC/HDF/TIFF。",
+    )
     parser.add_argument("--output", type=Path, required=True, help="最终 Zarr 目录。")
     parser.add_argument("--temporary-dir", type=Path, help="临时处理根目录。")
     parser.add_argument("--time", nargs=2, metavar=("START", "END"), help="时间起止日期。")
-    parser.add_argument("--lat", nargs=2, type=float, metavar=("MIN", "MAX"), required=True)
-    parser.add_argument("--lon", nargs=2, type=float, metavar=("MIN", "MAX"), required=True)
+    parser.add_argument("--lat", nargs=2, type=float, metavar=("MIN", "MAX"), default=(-90.0, 90.0))
+    parser.add_argument("--lon", nargs=2, type=float, metavar=("MIN", "MAX"), default=(-180.0, 180.0))
     parser.add_argument("--resample", action="store_true", help="执行空间重采样。")
     parser.add_argument("--rechunk", action="store_true", help="应用指定的最终 chunks。")
     parser.add_argument("--recompress", action="store_true", help="应用指定的最终压缩方案。")
@@ -84,22 +92,30 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--resolution 仅在选择 --resample 时有效。")
     time_start, time_end = args.time if args.time else (None, None)
     names = _parse_names(args.variable_name)
-    inspection = inspect_source(
-        SourceInspectionConfig(
-            input_dir=args.input,
-            mode=args.mode,
-            recursive=args.recursive,
-            engine=args.engine,
-            workers=args.inspect_workers,
-            cache_path=args.inspection_cache,
+    input_path = args.input.expanduser().resolve()
+    input_kind = args.input_kind
+    if input_kind == "auto":
+        input_kind = "zarr" if (input_path / "zarr.json").is_file() else "raw"
+    if input_kind == "zarr":
+        inspection = inspect_zarr(input_path)
+    else:
+        inspection = inspect_source(
+            SourceInspectionConfig(
+                input_dir=input_path,
+                mode=args.mode,
+                recursive=args.recursive,
+                engine=args.engine,
+                workers=args.inspect_workers,
+                cache_path=args.inspection_cache,
+            )
         )
-    )
     print(inspection.report)
     if inspection.warnings:
         print("检查警告：")
         for warning in inspection.warnings:
             print(f"  - {warning}")
     config = PipelineConfig(
+        input=PipelineInput(kind=input_kind),
         general=PipelineGeneralConfig(
             output=args.output,
             temporary_dir=args.temporary_dir,
@@ -141,17 +157,29 @@ def main(argv: list[str] | None = None) -> int:
         validate=not args.no_validate,
     )
     plan = preview_pipeline(inspection, config)
-    print(
-        f"一条龙计划：目标 shape(time, lat, lon)=({plan.source_selection.shape[0]}, "
-        f"{plan.target_grid.lat.size}, {plan.target_grid.lon.size})；"
-        f"源读取窗口={plan.source_read_window.lat_shape}x{plan.source_read_window.lon_shape}；"
-        f"需要重采样={'是' if plan.needs_resample else '否'}"
-    )
-    print(f"源窗口依据：{plan.source_read_window.halo_description}")
+    if isinstance(plan, ZarrPipelinePlan):
+        dimensions = (
+            plan.resample_plan.output_dimensions
+            if plan.resample_plan is not None
+            else plan.input_info.dimensions
+        )
+        print(
+            "统一 Zarr 计划：目标 shape(time, lat, lon)="
+            f"({dimensions['time']}, {dimensions['lat']}, {dimensions['lon']})；"
+            f"需要重采样={'是' if plan.needs_resample else '否'}"
+        )
+    else:
+        print(
+            f"一条龙计划：目标 shape(time, lat, lon)=({plan.source_selection.shape[0]}, "
+            f"{plan.target_grid.lat.size}, {plan.target_grid.lon.size})；"
+            f"源读取窗口={plan.source_read_window.lat_shape}x{plan.source_read_window.lon_shape}；"
+            f"需要重采样={'是' if plan.needs_resample else '否'}"
+        )
+        print(f"源窗口依据：{plan.source_read_window.halo_description}")
     print(f"最终 chunks(time, lat, lon)：{plan.final_chunks}")
     if plan.final_compression is not None:
         print(f"最终压缩：{plan.final_compression.description}")
-    if plan.coverage_warning:
+    if getattr(plan, "coverage_warning", None):
         print(f"覆盖提醒：{plan.coverage_warning}")
     print("操作决策：")
     for decision in plan.operation_decisions:

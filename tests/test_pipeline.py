@@ -16,7 +16,11 @@ import zarr
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 
-from fast_nc_zarr.application.services import SourceInspectionConfig, inspect_source  # noqa: E402
+from fast_nc_zarr.application.services import (  # noqa: E402
+    SourceInspectionConfig,
+    inspect_source,
+    inspect_zarr,
+)
 from fast_nc_zarr.pipeline.engine import preview_pipeline, run_pipeline  # noqa: E402
 from fast_nc_zarr.pipeline.models import (  # noqa: E402
     PipelineChunkingOptions,
@@ -24,6 +28,7 @@ from fast_nc_zarr.pipeline.models import (  # noqa: E402
     PipelineConfig,
     PipelineConversionOptions,
     PipelineGeneralConfig,
+    PipelineInput,
     PipelineOperations,
     PipelineResamplingOptions,
 )
@@ -70,6 +75,7 @@ class PipelineTests(unittest.TestCase):
             },
         )
         canonical.to_netcdf(ROOT / "canonical" / "input.nc", engine="h5netcdf")
+        canonical.to_zarr(ROOT / "canonical-input.zarr", mode="w", consolidated=False)
         canonical.close()
 
     @classmethod
@@ -112,6 +118,57 @@ class PipelineTests(unittest.TestCase):
             ),
             compression=PipelineCompressionOptions(profile="fast"),
         )
+
+    def test_zarr_planner_covers_all_nonempty_operation_combinations(self) -> None:
+        inspection = inspect_zarr(ROOT / "canonical-input.zarr")
+        for resample, rechunk, recompress in product((False, True), repeat=3):
+            if not (resample or rechunk or recompress):
+                continue
+            with self.subTest(resample=resample, rechunk=rechunk, recompress=recompress):
+                base = self._config(ROOT / "zarr-plan.zarr")
+                config = replace(
+                    base,
+                    input=PipelineInput(kind="zarr"),
+                    operations=PipelineOperations(resample, rechunk, recompress),
+                )
+                plan = preview_pipeline(inspection, config)
+                self.assertFalse(plan.decision("conversion").requested)
+                self.assertEqual(plan.needs_resample, resample)
+                self.assertEqual(plan.finalization_required, rechunk or recompress)
+                self.assertEqual(plan.decision("rechunking").requested, rechunk)
+                self.assertEqual(plan.decision("recompression").requested, recompress)
+
+    def test_zarr_pipeline_executes_rechunk_only(self) -> None:
+        inspection = inspect_zarr(ROOT / "canonical-input.zarr")
+        base = self._config(ROOT / "zarr-rechunked.zarr")
+        config = replace(
+            base,
+            input=PipelineInput(kind="zarr"),
+            operations=PipelineOperations(rechunk=True),
+            validate=False,
+        )
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["input_kind"], "zarr")
+        self.assertEqual(manifest["physical_stages"], ["finalization"])
+        self.assertTrue((ROOT / "zarr-rechunked.zarr" / "zarr.json").is_file())
+
+    def test_zarr_pipeline_executes_resample_then_recompress(self) -> None:
+        inspection = inspect_zarr(ROOT / "canonical-input.zarr")
+        base = self._config(ROOT / "zarr-resampled-compressed.zarr", resolution=0.2)
+        config = replace(
+            base,
+            input=PipelineInput(kind="zarr"),
+            operations=PipelineOperations(resample=True, recompress=True),
+            general=replace(base.general, cleanup_intermediate=True),
+            validate=False,
+        )
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["physical_stages"], ["resampling", "finalization"])
+        self.assertEqual(manifest["stages"]["resampling"]["status"], "validated_and_cleaned")
+        self.assertGreater(manifest["logical_io"]["write_amplification"], 1.0)
+        self.assertTrue((ROOT / "zarr-resampled-compressed.zarr" / "zarr.json").is_file())
 
     def test_source_window_expands_beyond_target_boundary(self) -> None:
         inspection = inspect_source(
@@ -257,7 +314,21 @@ class PipelineTests(unittest.TestCase):
                 manifest = json.loads(
                     Path(result["manifest"]).read_text(encoding="utf-8")
                 )
-                self.assertEqual(manifest["schema_version"], 2)
+                self.assertEqual(manifest["schema_version"], 3)
+                self.assertEqual(manifest["input_kind"], "raw")
+                self.assertEqual(
+                    manifest["requested_operation_order"],
+                    [
+                        name
+                        for name, enabled in (
+                            ("conversion", True),
+                            ("resampling", resample),
+                            ("rechunking", rechunk),
+                            ("recompression", recompress),
+                        )
+                        if enabled
+                    ],
+                )
                 self.assertEqual(manifest["physical_stages"], ["conversion"])
                 self.assertEqual(
                     manifest["requested_operations"],

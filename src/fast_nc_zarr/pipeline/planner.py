@@ -15,7 +15,16 @@ from ..resampling.autotune import resolve_auto_time_block
 from ..resampling.models import TargetGrid
 from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo, VariableInfo
 from ..rechunking.planning import plan_chunks
-from .models import OperationDecision, PipelineConfig, PipelinePlan, SourceReadWindow
+from ..resampling.engine import plan_resample
+from ..resampling.inspection import inspect_resample_input
+from ..resampling.models import ResampleConfig
+from .models import (
+    OperationDecision,
+    PipelineConfig,
+    PipelinePlan,
+    SourceReadWindow,
+    ZarrPipelinePlan,
+)
 from ..selection import make_selection
 
 
@@ -452,10 +461,161 @@ def _resampling_conversion_chunks(
     return resolved_time, chunks[1], chunks[2]
 
 
-def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan:
+def _zarr_inspection_id(info: DatasetInfo) -> str:
+    digest = blake2b(digest_size=16)
+    digest.update(str(info.path.resolve()).encode())
+    metadata = info.path / "zarr.json"
+    if metadata.is_file():
+        stat = metadata.stat()
+        digest.update(str(stat.st_size).encode())
+        digest.update(str(stat.st_mtime_ns).encode())
+    return digest.hexdigest()
+
+
+def _zarr_target_info(info: DatasetInfo, resample_plan) -> DatasetInfo:
+    dimensions = dict(info.dimensions)
+    dimensions.update(resample_plan.target.dimensions)
+    variables = []
+    for item in info.variables:
+        shape = tuple(dimensions.get(dim, size) for dim, size in zip(item.dims, item.shape))
+        dtype = item.dtype
+        if not item.is_coord and {"lat", "lon"}.issubset(item.dims):
+            if not np.issubdtype(dtype, np.floating):
+                dtype = np.dtype("float64")
+            elif resample_plan.compute_dtype == "float32":
+                dtype = np.dtype("float32")
+        variables.append(
+            VariableInfo(
+                name=item.name,
+                dims=item.dims,
+                shape=shape,
+                dtype=np.dtype(dtype),
+                chunks=resample_plan.output_chunks.get(item.name, item.chunks),
+                is_coord=item.is_coord,
+                attrs=item.attrs,
+                compressors=item.compressors,
+            )
+        )
+    return DatasetInfo(info.path, dimensions, tuple(variables), info.attrs, info.zarr_format)
+
+
+def _existing_chunks(info: DatasetInfo) -> tuple[int, int, int]:
+    reference = next(
+        (item for item in info.data_variables if set(item.dims) == {"time", "lat", "lon"}),
+        None,
+    )
+    if reference is None:
+        raise ValueError("输入 Zarr 没有可处理的 time/lat/lon 三维数据变量。")
+    mapping = dict(zip(reference.dims, reference.chunks))
+    return tuple(int(mapping[name]) for name in ("time", "lat", "lon"))
+
+
+def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipelinePlan:
+    if getattr(inspection, "kind", None) != "zarr" or inspection.dataset_info is None:
+        raise ValueError("现有 Zarr 流程要求已完成 Zarr 输入检查。")
+    operations = config.operations
+    if not (operations.resample or operations.rechunk or operations.recompress):
+        raise ValueError("现有 Zarr 输入至少需要选择重采样、重分块或重压缩中的一项。")
+    info = inspection.zarr_info
+    resample_plan = None
+    target_info = info
+    if operations.resample:
+        resample_inspection = inspect_resample_input(inspection.path)
+        options = config.resampling
+        resample_plan = plan_resample(
+            ResampleConfig(
+                input=inspection.path,
+                output=config.general.output,
+                resolution=options.resolution,
+                method=options.method,
+                skipna=options.skipna,
+                na_thres=options.na_thres,
+                compute_dtype=options.compute_dtype,
+                extent="custom",
+                target_lat_bounds=(config.general.lat_min, config.general.lat_max),
+                target_lon_bounds=(config.general.lon_min, config.general.lon_max),
+                target_lat_descending=True,
+                target_lon_descending=False,
+                tile_size=options.tile_size,
+                time_block=options.time_block,
+                compute_workers=options.compute_workers,
+                space_workers=options.space_workers,
+                temporary_dir=config.general.temporary_dir,
+            ),
+            resample_inspection,
+        )
+        target_info = _zarr_target_info(info, resample_plan)
+    if operations.rechunk:
+        chunk_plan = plan_chunks(
+            target_info,
+            config.chunking.strategy,
+            target_mib=config.chunking.target_mib,
+            workers=config.chunking.workers,
+            custom_chunks=config.chunking.custom_chunks,
+        )
+    else:
+        chunks = _existing_chunks(target_info)
+        chunk_plan = ChunkPlan(
+            strategy="custom",
+            chunks=chunks,
+            target_mib=0.0,
+            estimated_chunk_bytes=0,
+            estimated_chunks={},
+            rationale=("未请求重分块，保持上游输出 chunks。",),
+        )
+    compression = (
+        make_compression_plan(config.compression.profile)
+        if operations.recompress
+        else CompressionPlan("none", None, "未请求重压缩，保持上游 codec。")
+    )
+    storage_requested = operations.rechunk or operations.recompress
+    decisions = (
+        OperationDecision("conversion", False, "not_requested", "现有 Zarr 输入跳过转换。"),
+        OperationDecision(
+            "resampling",
+            operations.resample,
+            "executed_as_stage" if operations.resample else "not_requested",
+            "执行 Zarr 空间重采样。" if operations.resample else "用户未请求重采样。",
+        ),
+        OperationDecision(
+            "rechunking",
+            operations.rechunk,
+            "executed_as_stage" if operations.rechunk else "not_requested",
+            "由最终化阶段应用目标 chunks。" if operations.rechunk else "用户未请求重分块。",
+        ),
+        OperationDecision(
+            "recompression",
+            operations.recompress,
+            "executed_as_stage" if operations.recompress else "not_requested",
+            "由最终化阶段应用目标 codec。" if operations.recompress else "用户未请求重压缩。",
+        ),
+    )
+    return ZarrPipelinePlan(
+        inspection_id=_zarr_inspection_id(info),
+        input_info=info,
+        needs_resample=bool(operations.resample),
+        resample_plan=resample_plan,
+        final_chunk_plan=chunk_plan,
+        final_compression=compression,
+        final_chunks=chunk_plan.chunks,
+        direct_finalization=not storage_requested,
+        finalization_required=storage_requested,
+        operation_decisions=decisions,
+    )
+
+
+def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | ZarrPipelinePlan:
     """Validate user intent and derive a write-minimizing execution plan."""
 
-    if getattr(inspection, "kind", None) != "source" or inspection.inventory is None:
+    inspection_kind = getattr(inspection, "kind", None)
+    requested_kind = config.input.kind
+    if requested_kind not in {"auto", "raw", "zarr"}:
+        raise ValueError("input_kind 必须是 auto、raw 或 zarr。")
+    if requested_kind == "raw" and inspection_kind != "source":
+        raise ValueError("input_kind=raw 要求已完成原始数据检查。")
+    if requested_kind == "zarr" or (requested_kind == "auto" and inspection_kind == "zarr"):
+        return build_zarr_pipeline_plan(inspection, config)
+    if inspection_kind != "source" or inspection.inventory is None:
         raise ValueError("一条龙模块必须使用已完成的数据检查结果。")
     inventory = inspection.source_inventory
     general = config.general

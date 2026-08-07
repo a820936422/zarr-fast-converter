@@ -773,7 +773,7 @@ def run_resample(
 
 
 def preview_pipeline(inspection: InspectionResult, config):
-    """Build a no-write end-to-end plan from a completed source inspection."""
+    """Build a no-write plan from a completed raw or Zarr inspection."""
 
     from ..pipeline.engine import preview_pipeline as core_preview_pipeline
 
@@ -787,7 +787,7 @@ def run_pipeline(
     cancel_event=None,
     progress: bool = True,
 ):
-    """Run the end-to-end source -> final Zarr pipeline."""
+    """Run the unified raw/Zarr input pipeline and publish one final Zarr."""
 
     from ..pipeline.engine import run_pipeline as core_run_pipeline
 
