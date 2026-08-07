@@ -18,7 +18,7 @@ from .models import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="fast-zarr-pipeline",
+        prog="pixi run pipeline",
         description="将原始地理数据转换为 Zarr v3，并按需组合重采样、重分块和重压缩。",
     )
     parser.add_argument("--input", type=Path, required=True, help="源数据目录。")

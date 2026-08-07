@@ -11,11 +11,11 @@
 
 ## 运行
 
-当前 Python 环境由 Pixi 管理，可以直接运行：
+当前 Python 环境和项目命令统一由 Pixi 管理。首次运行会根据 `pixi.lock` 创建当前项目
+专属环境，之后直接使用：
 
 ```bash
-/media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
-  /media/owen/机械硬盘/代码/zarr快速转换器v1/convert.py
+pixi run convert
 ```
 
 无参数时依次提示输入目录、输出目录、时间范围、经度范围、纬度范围和变量编号。
@@ -40,7 +40,7 @@ HDF-EOS 网格（例如 `YDim:*`/`XDim:*`）会优先从 `StructMetadata.0` 恢�
 也可完全使用命令行：
 
 ```bash
-/media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python convert.py \
+pixi run convert \
   --input /path/to/nc \
   --output /path/to/result.zarr \
   --time '[2003, 2010]' \
@@ -56,18 +56,10 @@ HDF-EOS 网格（例如 `YDim:*`/`XDim:*`）会优先从 `StructMetadata.0` 恢�
 当前已提供 PySide6 图形界面，包含数据检查、转换、Zarr 优化、Zarr 重采样和任务日志页面。
 GUI 与命令行共用同一套核心检查和写入引擎。
 
-使用项目当前 Pixi Python 环境启动：
+使用项目 Pixi 环境启动：
 
 ```bash
-PYTHONPATH=/media/owen/机械硬盘/代码/zarr快速转换器v1/src \
-/media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
-/media/owen/机械硬盘/代码/zarr快速转换器v1/gui.py
-```
-
-也可以在已安装项目入口的环境中运行：
-
-```bash
-fast-zarr-gui
+pixi run gui
 ```
 
 ## 可组合一条龙模块（v1.3.0）
@@ -85,8 +77,7 @@ fast-zarr-gui
 命令行入口：
 
 ```bash
-PYTHONPATH=src /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
-  -m fast_nc_zarr.pipeline \
+pixi run pipeline \
   --input /path/to/gosif-tif \
   --output /path/to/gosif.zarr \
   --lat 30 90 --lon -180 180 \
@@ -98,7 +89,7 @@ PYTHONPATH=src /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
   --temporary-dir /path/to/ssd/pipeline-temporary
 ```
 
-也可以使用已安装的 `fast-zarr-pipeline` 入口。`--dry-run` 只执行检查和计划，不写数据；
+`--dry-run` 只执行检查和计划，不写数据；
 `--resample`、`--rechunk`、`--recompress` 分别开启对应可选操作；三者都不提供时
 执行仅转换流程。`--resolution` 只在同时选择 `--resample` 时有效。
 `--cleanup-intermediate` 会在下游验证通过后删除已不再需要的上游临时 Zarr。完整设计与
@@ -116,8 +107,7 @@ PYTHONPATH=src /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
 命令行示例：
 
 ```bash
-PYTHONPATH=src /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
-  -m fast_nc_zarr.resampling \
+pixi run resample \
   --input /path/to/input.zarr \
   --output /path/to/resampled.zarr \
   --resolution 0.25 \
@@ -150,8 +140,7 @@ chunks 会按输入变量逐维保持，若目标维度变短则自动截断；�
 例如：
 
 ```bash
-PYTHONPATH=src /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
-  -m fast_nc_zarr.resampling \
+pixi run resample \
   --input /path/to/input.zarr \
   --output /path/to/resampled.zarr \
   --resolution 0.25 \
@@ -160,8 +149,7 @@ PYTHONPATH=src /media/owen/机械硬盘/pixi-envs/.pixi/envs/py313/bin/python \
   --temporary-dir /path/to/ssd/resample-temporary
 ```
 
-GUI 中新增“Zarr 重采样”页面。当前 py313 环境已经提供 xESMF/ESMF 运行时；部署到其他
-环境时除 Python 的 `xesmf` 外，还需要可用的 ESMF/esmpy 原生运行时。
+GUI 中新增“Zarr 重采样”页面。项目 Pixi 环境已经提供 xESMF/ESMF 运行时。
 
 GUI 的推荐操作顺序是先在“数据检查”页面完成源目录检查并确认时间规则，再进入“转换”；“Zarr 优化”页面接收已经存在的 Zarr v3 目录。
 “Zarr 优化”与原始数据检查相互独立，即使尚未检查源数据，也可以直接输入已有的 Zarr v3 目录执行优化。
@@ -174,7 +162,7 @@ GUI 的推荐操作顺序是先在“数据检查”页面完成源目录检查�
 文件名模式示例：
 
 ```bash
-python convert.py --mode filename \
+pixi run convert --mode filename \
   --input /path/to/files --output /path/to/result.zarr \
   --template doy --year 2001 --doy 001 --step-days 1 \
   --continue-missing
@@ -185,7 +173,7 @@ python convert.py --mode filename \
 `time`、`latitude`、`longitude` 时：
 
 ```bash
-python convert.py \
+pixi run convert \
   --input /path/to/nc \
   --output /path/to/result.zarr \
   --time-dim time \
@@ -199,8 +187,8 @@ python convert.py \
 只检查结构或只查看计划：
 
 ```bash
-python convert.py --input /path/to/nc --inspect-only
-python convert.py --input /path/to/nc --output /path/to/result.zarr --dry-run
+pixi run convert --input /path/to/nc --inspect-only
+pixi run convert --input /path/to/nc --output /path/to/result.zarr --dry-run
 ```
 
 ## 自适应策略
@@ -265,7 +253,7 @@ ds = xr.open_zarr("/path/to/result.zarr", consolidated=False)
 当前已经提供独立的 Zarr 重分块与无损重压缩入口：
 
 ~~~bash
-python rechunk.py --input /path/to/input.zarr --output /path/to/rechunked.zarr --strategy time --compression balanced
+pixi run rechunk --input /path/to/input.zarr --output /path/to/rechunked.zarr --strategy time --compression balanced
 ~~~
 
 第一版重分块器只接受 Zarr v3，并要求输入同时包含完整的 `time`、`lat`、`lon`
@@ -299,7 +287,7 @@ Zarr v3 Fused codec pipeline，以提高批量压缩和写入的 CPU 利用率�
 只检查输入 Zarr：
 
 ~~~bash
-python rechunk.py --input /path/to/input.zarr --inspect-only
+pixi run rechunk --input /path/to/input.zarr --inspect-only
 ~~~
 
 ```bash
@@ -312,12 +300,13 @@ pixi run test
 对真实数据根目录中所有数据集执行全文件元数据检查、分层数值抽样和小范围转换：
 
 ```bash
-fast-zarr-validate-raw \
+pixi run validate-raw \
   --input-root /media/owen/机械硬盘/zarr处理/RAW_DATA \
   --output /media/owen/机械硬盘/codex_test_hdd/p0_hardening/raw-validation.json \
   --time-field GLASS-PAR=3 \
   --smoke-output-root /media/owen/机械硬盘/codex_test_hdd/p0_hardening/smoke
 ```
 
-项目根目录的 `pixi.toml` 和 `pixi.lock` 锁定 Python、GDAL、ESMF、xESMF、Zarr 及 GUI
-运行时；现有共享 `py313` 环境仍可用于日常开发。
+项目根目录的 `pixi.toml` 和 `pixi.lock` 是唯一的环境与依赖来源，锁定 Python、GDAL、
+ESMF、xESMF、Zarr 及 GUI 运行时。`pixi.toml` 的激活配置会把 `src` 加入
+`PYTHONPATH`，不依赖外部共享环境或本地包安装。

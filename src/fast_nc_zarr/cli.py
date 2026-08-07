@@ -32,7 +32,7 @@ def _date_label(value) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="fast-nc-zarr",
+        prog="pixi run convert",
         description="自动分析并高速转换具有 time/lat/lon 维度的 NetCDF 数据为 Zarr v3。",
     )
     parser.add_argument(

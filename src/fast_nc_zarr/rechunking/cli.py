@@ -20,7 +20,7 @@ from .planning import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="fast-zarr-rechunk",
+        prog="pixi run rechunk",
         description="Zarr v3 快速重分块与无损重压缩器。",
     )
     parser.add_argument("--input", type=Path, help="输入 Zarr v3 目录。")

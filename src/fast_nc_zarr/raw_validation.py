@@ -235,6 +235,7 @@ def validate_raw_tree(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="pixi run validate-raw",
         description="对真实 NC/HDF/TIFF 数据集执行全文件元数据和抽样数值正确性验证。"
     )
     parser.add_argument("--input-root", type=Path, required=True)

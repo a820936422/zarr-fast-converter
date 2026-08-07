@@ -400,7 +400,7 @@ src/fast_nc_zarr/
     validation.py   # 四面板参数、网格边界、路径、磁盘校验
     planner.py      # 跳过判断、目标格网、跨阶段布局、空间估算
     engine.py       # 编排、取消、临时生命周期、最终发布
-    cli.py          # fast-zarr-pipeline
+    cli.py          # pixi run pipeline
   application/services.py  # preview_pipeline / run_pipeline
   gui/                      # “一条龙处理”页及后台 worker
 ~~~

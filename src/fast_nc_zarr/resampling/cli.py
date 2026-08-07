@@ -51,7 +51,7 @@ def _time_block_arg(value: str) -> int | str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="fast-zarr-resample",
+        prog="pixi run resample",
         description="使用 xESMF 对 Zarr v3 规则经纬度网格进行空间重采样。",
     )
     parser.add_argument("--input", type=Path, help="输入 Zarr v3 目录。")
