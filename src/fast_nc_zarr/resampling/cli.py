@@ -8,6 +8,7 @@ from .engine import ResampleExecutionError, format_plan, plan_resample, run_resa
 from .grid import RESAMPLING_METHODS
 from .inspection import inspect_resample_input
 from .models import ResampleConfig
+from .replacements import parse_replacement_rules
 
 
 def _tile_size_arg(value: str) -> int | str:
@@ -105,6 +106,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="可选的中间处理目录；大时间 chunk 的中转 Zarr 和权重文件写入此处，成功后自动删除。",
     )
+    parser.add_argument("--before-conditions", default="", help="采样前替换条件，逗号分隔。")
+    parser.add_argument("--before-results", default="", help="采样前替换结果，逗号分隔。")
+    parser.add_argument("--after-conditions", default="", help="采样后替换条件，逗号分隔。")
+    parser.add_argument("--after-results", default="", help="采样后替换结果，逗号分隔。")
+    parser.add_argument(
+        "--statistics-policy",
+        choices=("auto", "sample", "exact"),
+        default="auto",
+    )
     parser.add_argument("--overwrite", action="store_true", help="覆盖已有 Zarr v3 输出。")
     parser.add_argument("--no-validate", action="store_true", help="跳过输出结构校验。")
     parser.add_argument("--inspect-only", action="store_true", help="只检查输入，不生成计划。")
@@ -144,6 +154,11 @@ def _interactive_args() -> argparse.Namespace:
             if (value := input("可选中间处理目录（回车使用输出目录旁临时目录）：").strip())
             else None
         ),
+        before_conditions="",
+        before_results="",
+        after_conditions="",
+        after_results="",
+        statistics_policy="auto",
         overwrite=False,
         no_validate=False,
         inspect_only=False,
@@ -181,6 +196,13 @@ def run(args: argparse.Namespace) -> int:
         temporary_dir=args.temporary_dir,
         overwrite=args.overwrite,
         validate=not args.no_validate,
+        before_replacements=parse_replacement_rules(
+            args.before_conditions, args.before_results
+        ),
+        after_replacements=parse_replacement_rules(
+            args.after_conditions, args.after_results
+        ),
+        statistics_policy=args.statistics_policy,
     )
     plan = plan_resample(config, inspection)
     print(format_plan(plan))

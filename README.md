@@ -51,12 +51,18 @@ pixi run convert \
 
 时间范围中的日期可以直接写成 `--time '[2001-01-01, 2022-12-31]'`，不需要为日期加引号；年份范围仍可写成 `--time '[2003, 2010]'`。
 
-## GUI（v1.4.0）
+## GUI（v1.5.0）
 
 PySide6 图形界面将主导航收敛为“数据检查、处理流程、任务中心”。转换、重采样、重分块
 和重压缩不再作为相互割裂的主页面出现，而是在处理流程中按需组合；未勾选的操作不会进入
 物理执行计划。旧页面对象和独立命令行入口暂时保留，供已有自动化脚本兼容使用。
 界面使用 Fusion + QSS 主题，在 1280x820 和较小窗口下保持紧凑的参数区与计划摘要区。
+
+v1.5.0 在统一处理流程中增加了采样前/后数值替换、显式压缩 codec/等级选择，以及
+只显示本次任务输入、临时和输出文件系统的磁盘监控。替换条件使用逗号分隔，条件与结果
+必须一一对应，例如采样前条件 `<0, >100` 配合结果 `0, 100`。表达式支持安全的基本
+算术和 `median`、`mean`、`min`、`max`、`std`、`p50`、`p95` 统计量，不执行任意
+Python 代码。
 
 使用项目 Pixi 环境启动：
 
@@ -64,7 +70,7 @@ PySide6 图形界面将主导航收敛为“数据检查、处理流程、任务
 pixi run gui
 ```
 
-## 可组合处理流程（v1.4.0）
+## 可组合处理流程（v1.5.0）
 
 一条龙模块会先执行完整的数据检查和时间规则确认。原始数据转换是必经步骤；
 重采样、重分块和重压缩可以独立选择，所有组合始终只发布一份最终 Zarr。规划器按统一
@@ -87,7 +93,8 @@ pixi run pipeline \
   --resample --resolution 0.1 \
   --rechunk --recompress \
   --method conservative --skipna \
-  --strategy time --compression balanced \
+  --strategy time \
+  --compression-codec blosc-zstd --compression-level 4 \
   --inspection-cache /path/to/cache/gosif-inspection.json \
   --temporary-dir /path/to/ssd/pipeline-temporary
 ```
@@ -99,6 +106,10 @@ pixi run pipeline \
 规划器生成“重采样 → 最终化”两阶段任务，仍然只发布一份最终 Zarr；
 `--resample`、`--rechunk`、`--recompress` 分别开启对应可选操作；三者都不提供时
 执行仅转换流程。`--resolution` 只在同时选择 `--resample` 时有效。
+替换规则通过 `--before-conditions`、`--before-results`、`--after-conditions` 和
+`--after-results` 提供；`--statistics-policy auto|sample|exact` 控制统计表达式。
+重压缩既可以继续使用旧 `--compression` profile，也可以通过 `--compression-codec`、
+`--compression-level` 和 `--compression-shuffle` 明确指定最终 Zarr v3 codec。
 `--cleanup-intermediate` 会在下游验证通过后删除已不再需要的上游临时 Zarr。完整设计与
 阶段边界见 [docs/ONE_STOP_PIPELINE_V1.md](docs/ONE_STOP_PIPELINE_V1.md)。
 对于数千个源文件，建议固定使用同一个 `--inspection-cache` 路径。快照记录文件路径、

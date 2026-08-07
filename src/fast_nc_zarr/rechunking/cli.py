@@ -46,6 +46,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="压缩方案；默认 none（交互模式会询问）。",
     )
     parser.add_argument(
+        "--compression-codec",
+        choices=("blosc-zstd", "blosc-lz4", "blosc-lz4hc", "blosc-zlib", "zstd", "gzip"),
+    )
+    parser.add_argument("--compression-level", type=int)
+    parser.add_argument(
+        "--compression-shuffle",
+        choices=("auto", "noshuffle", "shuffle", "bitshuffle"),
+        default="auto",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         help="并行 worker 上限；程序会依据内存和源/目标磁盘类型自动限制。",
@@ -143,6 +153,9 @@ def interactive_args() -> argparse.Namespace:
         chunks=None,
         target_chunk_mib=DEFAULT_TARGET_MIB,
         compression=None,
+        compression_codec=None,
+        compression_level=None,
+        compression_shuffle="auto",
         workers=None,
         overwrite=False,
         no_validate=False,
@@ -187,7 +200,12 @@ def run(args: argparse.Namespace) -> int:
     compression_name = args.compression
     if compression_name is None:
         compression_name = _interactive_compression() if interactive else "none"
-    compression = make_compression_plan(compression_name)
+    compression = make_compression_plan(
+        compression_name,
+        codec=args.compression_codec,
+        level=args.compression_level,
+        shuffle=args.compression_shuffle,
+    )
     print(format_compression_plan(info, compression))
     _print_capacity(args.output, info.logical_bytes)
 

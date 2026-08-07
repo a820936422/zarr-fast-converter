@@ -33,6 +33,7 @@ from .models import (
     ResamplePlan,
     TargetGrid,
 )
+from .replacements import ReplacementRules, apply_replacement_rules, sample_statistics
 
 
 class ResampleExecutionError(RuntimeError):
@@ -680,6 +681,13 @@ def _build_output_skeleton(
                 float(value) for value in target.spatial_extent
             ),
             "resampling_extrapolation": "disabled",
+            "resampling_before_replacements": json.dumps(
+                plan.before_replacements.as_pairs(), ensure_ascii=False
+            ),
+            "resampling_after_replacements": json.dumps(
+                plan.after_replacements.as_pairs(), ensure_ascii=False
+            ),
+            "resampling_statistics_policy": plan.statistics_policy,
         }
     )
     for variable in output.variables.values():
@@ -950,6 +958,9 @@ def _resample_tile_variable(
     time_block: int,
     compute_workers: int,
     compute_dtype: ComputeDType,
+    before_replacements,
+    after_replacements,
+    statistics: dict[str, float],
 ) -> dict[str, float]:
     source_variable = source[item.name]
     prepared = _mask_missing(source_variable, item)
@@ -988,6 +999,10 @@ def _resample_tile_variable(
                 num_workers=max(1, int(compute_workers)),
             ):
                 subset = subset.compute()
+        if before_replacements.rules:
+            subset = subset.copy(data=apply_replacement_rules(
+                np.asarray(subset.data), before_replacements, statistics
+            ))
         timing["read"] += time.perf_counter() - read_started
         regrid_started = time.perf_counter()
         result = regridder(
@@ -1007,6 +1022,8 @@ def _resample_tile_variable(
             values,
             dtype=_resampled_output_dtype(source_variable, compute_dtype),
         )
+        if after_replacements.rules:
+            values = apply_replacement_rules(values, after_replacements, statistics)
         write_started = time.perf_counter()
         _write_region(
             output_group,
@@ -1129,6 +1146,9 @@ def _process_space_tile(
                 plan.time_block,
                 plan.compute_workers,
                 plan.compute_dtype,
+                plan.before_replacements,
+                plan.after_replacements,
+                plan.statistics.get(item.name, {}),
             ))
         return _TileMetrics(
             task,
@@ -1225,6 +1245,9 @@ def _execute_serial_tile(
                 plan.time_block,
                 plan.compute_workers,
                 plan.compute_dtype,
+                plan.before_replacements,
+                plan.after_replacements,
+                plan.statistics.get(item.name, {}),
             ))
         return _TileMetrics(
             task,
@@ -1356,6 +1379,8 @@ def plan_resample(
         raise ValueError(
             "计算 dtype 必须是：" + ", ".join(COMPUTE_DTYPES)
         )
+    if config.statistics_policy not in {"auto", "sample", "exact"}:
+        raise ValueError("统计策略必须是 auto、sample 或 exact。")
     if not np.isfinite(float(config.na_thres)) or not 0 <= float(config.na_thres) <= 1:
         raise ValueError("na_thres 必须位于 0 到 1 之间。")
     if config.tile_size != "auto":
@@ -1485,6 +1510,9 @@ def plan_resample(
         space_workers_requested=config.space_workers,
         auto_tile=auto_tile,
         output_layout=config.output_layout,
+        before_replacements=config.before_replacements,
+        after_replacements=config.after_replacements,
+        statistics_policy=config.statistics_policy,
     )
 
 
@@ -1509,6 +1537,9 @@ def format_plan(plan: ResamplePlan) -> str:
             f"空间进程={plan.space_workers}"
             f"（{'自动' if plan.space_workers_requested == 'auto' else '手动'}）"
         ),
+        f"采样前替换规则：{plan.before_replacements.as_pairs() or '无'}",
+        f"采样后替换规则：{plan.after_replacements.as_pairs() or '无'}",
+        f"表达式统计策略：{plan.statistics_policy}",
         (
             "目标边界："
             f"lon={plan.target.spatial_extent[0]:g} .. {plan.target.spatial_extent[1]:g}，"
@@ -1600,6 +1631,109 @@ def _validate_output(
         target.close()
 
 
+def _statistics_limit(plan: ResamplePlan) -> tuple[int | None, str]:
+    if plan.statistics_policy == "exact":
+        return None, "exact"
+    if plan.statistics_policy == "sample":
+        return 250_000, "sample"
+    output_logical_bytes = 0
+    for item in plan.inspection.info.data_variables:
+        shape = tuple(
+            plan.target.dimensions.get(dim, int(size))
+            for dim, size in zip(item.dims, item.shape)
+        )
+        dtype = np.dtype(item.dtype)
+        if {"lat", "lon"}.issubset(item.dims):
+            if not np.issubdtype(dtype, np.floating):
+                dtype = np.dtype("float64")
+            elif plan.compute_dtype == "float32":
+                dtype = np.dtype("float32")
+        output_logical_bytes += int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    if max(plan.inspection.info.logical_bytes, output_logical_bytes) <= 128 * 1024**2:
+        return None, "exact"
+    return 250_000, "sample"
+
+
+def _source_replacement_statistics(
+    source: xr.Dataset,
+    plan: ResamplePlan,
+) -> tuple[dict[str, dict[str, float]], str]:
+    if not plan.before_replacements.data_dependent:
+        return {}, "not_required"
+    items = tuple(
+        item
+        for item in plan.inspection.info.data_variables
+        if {"lat", "lon"}.issubset(item.dims)
+    )
+    if plan.method == "nearest_d2s":
+        lat_slice = slice(0, plan.inspection.grid.lat.size)
+        lon_slice = slice(0, plan.inspection.grid.lon.size)
+    else:
+        _target, lat_slice, lon_slice = _resolve_local_source_window(
+            plan.inspection.grid,
+            plan.target,
+            plan.method,
+        )
+        if lat_slice is None or lon_slice is None:
+            return {}, "not_required"
+    variables = {
+        item.name: _mask_missing(source[item.name], item).isel(
+            lat=lat_slice,
+            lon=lon_slice,
+        )
+        for item in items
+    }
+    dataset = xr.Dataset(variables)
+    maximum, mode = _statistics_limit(plan)
+    try:
+        return sample_statistics(
+            dataset,
+            tuple(item.name for item in items),
+            maximum_values=maximum,
+        ), mode
+    finally:
+        dataset.close()
+
+
+def _apply_data_dependent_post_replacements(
+    path: Path,
+    plan: ResamplePlan,
+    *,
+    cancel_event=None,
+) -> tuple[dict[str, dict[str, float]], str]:
+    names = tuple(
+        item.name
+        for item in plan.inspection.info.data_variables
+        if {"lat", "lon"}.issubset(item.dims)
+    )
+    dataset = xr.open_zarr(
+        path,
+        consolidated=False,
+        chunks={},
+        decode_times=False,
+        mask_and_scale=False,
+    )
+    maximum, mode = _statistics_limit(plan)
+    try:
+        statistics = sample_statistics(dataset, names, maximum_values=maximum)
+    finally:
+        dataset.close()
+    group = zarr.open_group(path, mode="r+")
+    for name in names:
+        array = group[name]
+        for region in _chunk_regions(tuple(array.shape), tuple(array.chunks)):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ResampleExecutionError("任务已取消，未生成输出。")
+            values = np.asarray(array[region])
+            replaced = apply_replacement_rules(
+                values,
+                plan.after_replacements,
+                statistics.get(name, {}),
+            )
+            array[region] = replaced.astype(array.dtype, copy=False)
+    return statistics, mode
+
+
 def run_resample(
     config: ResampleConfig,
     plan: ResamplePlan | None = None,
@@ -1608,6 +1742,7 @@ def run_resample(
     progress: bool = True,
 ) -> dict[str, object]:
     plan = plan or plan_resample(config)
+    requested_plan = plan
     source_path = Path(config.input).expanduser().resolve()
     target_path = Path(config.output).expanduser().resolve()
     if source_path == target_path:
@@ -1636,31 +1771,48 @@ def run_resample(
             decode_times=False,
             mask_and_scale=False,
         )
+        before_statistics, before_statistics_mode = _source_replacement_statistics(
+            source, requested_plan
+        )
+        runtime_plan = replace(requested_plan, statistics=before_statistics)
+        processing_plan = runtime_plan
+        if requested_plan.after_replacements.data_dependent:
+            # Data-dependent post rules require statistics from the unmodified
+            # resampled product, so they run as a bounded second pass below.
+            processing_plan = replace(
+                runtime_plan,
+                after_replacements=ReplacementRules(),
+            )
         if progress:
-            print(format_plan(plan))
+            print(format_plan(runtime_plan))
             print("初始化最终输出骨架；随后按空间块和时间块计算……")
         spatial_names = _initialize_output_store(
             source,
-            plan.inspection.info,
-            plan,
+            runtime_plan.inspection.info,
+            runtime_plan,
             staging,
         )
-        intermediate_chunks = _intermediate_chunks(plan.inspection.info, plan)
+        intermediate_chunks = _intermediate_chunks(
+            runtime_plan.inspection.info,
+            runtime_plan,
+        )
         use_intermediate = _needs_intermediate(
-            plan.inspection.info,
-            plan,
+            runtime_plan.inspection.info,
+            runtime_plan,
             intermediate_chunks,
         )
-        processing_plan = plan
         processing_path = staging
         if use_intermediate:
             intermediate = temporary_root / (
                 f".{target_path.name}.intermediate-{uuid4().hex}.tmp"
             )
-            processing_plan = replace(plan, output_chunks=intermediate_chunks)
+            processing_plan = replace(
+                processing_plan,
+                output_chunks=intermediate_chunks,
+            )
             _initialize_output_store(
                 source,
-                plan.inspection.info,
+                runtime_plan.inspection.info,
                 processing_plan,
                 intermediate,
             )
@@ -1675,16 +1827,16 @@ def run_resample(
         if cancel_event is not None and cancel_event.is_set():
             raise ResampleExecutionError("任务已取消，未生成输出。")
 
-        grid = plan.inspection.grid
+        grid = runtime_plan.inspection.grid
         spatial_items = tuple(
             item
-            for item in plan.inspection.info.data_variables
+            for item in runtime_plan.inspection.info.data_variables
             if item.name in spatial_names
         )
         lat_ranges, lon_ranges = _aligned_tile_ranges(
-            plan.inspection.info,
-            plan.target,
-            plan.tile_size,
+            runtime_plan.inspection.info,
+            runtime_plan.target,
+            runtime_plan.tile_size,
         )
         tasks = [
             (lat_start, lat_stop, lon_start, lon_stop)
@@ -1695,8 +1847,8 @@ def run_resample(
         if progress:
             print(
                 f"流式计算：{total_tiles} 个空间块，"
-                f"空间进程={plan.space_workers}，"
-                f"每个进程使用 {plan.compute_workers} 个 Dask 线程；"
+                f"空间进程={runtime_plan.space_workers}，"
+                f"每个进程使用 {runtime_plan.compute_workers} 个 Dask 线程；"
                 "空间块已对齐输出 chunks。"
             )
         full_regridder = None
@@ -1709,14 +1861,14 @@ def run_resample(
             "regrid_seconds": 0.0,
             "write_seconds": 0.0,
         }
-        if plan.method == "nearest_d2s":
+        if runtime_plan.method == "nearest_d2s":
             full_regridder, full_weight_path = _build_regridder(
                 grid.lat,
                 grid.lon,
                 grid.lat_bounds,
                 grid.lon_bounds,
-                plan.target,
-                plan.method,
+                runtime_plan.target,
+                runtime_plan.method,
                 workdir,
                 lat_attrs=dict(source.lat.attrs),
                 lon_attrs=dict(source.lon.attrs),
@@ -1725,7 +1877,11 @@ def run_resample(
         try:
             # d2s must retain one full-grid weight matrix, so it deliberately
             # stays in the caller.  Tiny jobs also avoid the spawn overhead.
-            if full_regridder is not None or total_tiles <= 1 or plan.space_workers <= 1:
+            if (
+                full_regridder is not None
+                or total_tiles <= 1
+                or runtime_plan.space_workers <= 1
+            ):
                 for index, task in enumerate(tasks, start=1):
                     if cancel_event is not None and cancel_event.is_set():
                         raise ResampleExecutionError("任务已取消，未生成输出。")
@@ -1752,14 +1908,17 @@ def run_resample(
                         print(_format_tile_progress(index, total_tiles, metrics), flush=True)
             else:
                 parallel_plan = replace(
-                    plan,
-                    space_workers=min(int(plan.space_workers), total_tiles),
+                    processing_plan,
+                    space_workers=min(
+                        int(runtime_plan.space_workers),
+                        total_tiles,
+                    ),
                 )
                 tile_timing = _run_parallel_tiles(
                     source_path,
                     processing_path,
                     workdir,
-                    replace(parallel_plan, output_chunks=processing_plan.output_chunks),
+                    parallel_plan,
                     spatial_items,
                     tasks,
                     cancel_event=cancel_event,
@@ -1785,6 +1944,19 @@ def run_resample(
                 progress=progress,
             )
 
+        after_statistics: dict[str, dict[str, float]] = {}
+        after_statistics_mode = "not_required"
+        if requested_plan.after_replacements.data_dependent:
+            if progress:
+                print("计算采样后规则统计量，并对最终 staging 执行替换……")
+            after_statistics, after_statistics_mode = (
+                _apply_data_dependent_post_replacements(
+                    staging,
+                    requested_plan,
+                    cancel_event=cancel_event,
+                )
+            )
+
         if progress:
             print(
                 "空间块耗时汇总："
@@ -1800,12 +1972,12 @@ def run_resample(
         if cancel_event is not None and cancel_event.is_set():
             raise ResampleExecutionError("任务已取消，未生成输出。")
         if config.validate:
-            _validate_output(source, staging, plan)
+            _validate_output(source, staging, runtime_plan)
         logical_bytes = sum(
             int(
                 np.prod(
                     tuple(
-                        plan.target.dimensions.get(dim, int(size))
+                        runtime_plan.target.dimensions.get(dim, int(size))
                         for dim, size in zip(
                             variable.dims,
                             variable.shape,
@@ -1816,9 +1988,9 @@ def run_resample(
             )
             * _resampled_output_dtype(
                 source[variable.name],
-                plan.compute_dtype,
+                runtime_plan.compute_dtype,
             ).itemsize
-            for variable in plan.inspection.info.data_variables
+            for variable in runtime_plan.inspection.info.data_variables
         )
         source.close()
         source = None
@@ -1839,6 +2011,12 @@ def run_resample(
             "throughput_mib_s": physical_bytes / 1024**2 / max(elapsed, 1e-9),
             "temporary_dir": str(temporary_root),
             "tile_timing": tile_timing,
+            "replacement_statistics": {
+                "before": before_statistics,
+                "before_mode": before_statistics_mode,
+                "after": after_statistics,
+                "after_mode": after_statistics_mode,
+            },
         }
     except Exception as exc:
         if source is not None:

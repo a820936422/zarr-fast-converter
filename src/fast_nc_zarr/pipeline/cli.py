@@ -45,6 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skipna", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--na-thres", type=float, default=1.0)
     parser.add_argument("--compute-dtype", choices=("source", "float32"), default="source")
+    parser.add_argument("--before-conditions", default="", help="采样前替换条件，逗号分隔。")
+    parser.add_argument("--before-results", default="", help="采样前替换结果，逗号分隔。")
+    parser.add_argument("--after-conditions", default="", help="采样后替换条件，逗号分隔。")
+    parser.add_argument("--after-results", default="", help="采样后替换结果，逗号分隔。")
+    parser.add_argument(
+        "--statistics-policy",
+        choices=("auto", "sample", "exact"),
+        default="auto",
+        help="替换表达式统计策略。",
+    )
     parser.add_argument("--cleanup-intermediate", action="store_true")
     parser.add_argument("--no-tune", action="store_true")
     parser.add_argument("--tune-budget", type=float, default=60.0)
@@ -53,6 +63,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-mib", type=float, default=128.0)
     parser.add_argument("--custom-chunks", nargs=3, type=int)
     parser.add_argument("--compression", choices=("fast", "balanced", "maximum"), default="balanced")
+    parser.add_argument(
+        "--compression-codec",
+        choices=("blosc-zstd", "blosc-lz4", "blosc-lz4hc", "blosc-zlib", "zstd", "gzip"),
+        help="显式选择 Zarr v3 压缩 codec；未指定时沿用 profile。",
+    )
+    parser.add_argument("--compression-level", type=int, help="显式压缩等级。")
+    parser.add_argument(
+        "--compression-shuffle",
+        choices=("auto", "noshuffle", "shuffle", "bitshuffle"),
+        default="auto",
+    )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--mode", choices=("auto", "complete", "filename"), default="auto")
     parser.add_argument("--engine", default="auto")
@@ -90,6 +111,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--resample 需要同时提供 --resolution。")
     if not args.resample and args.resolution is not None:
         parser.error("--resolution 仅在选择 --resample 时有效。")
+    if not args.resample and any(
+        (args.before_conditions, args.before_results, args.after_conditions, args.after_results)
+    ):
+        parser.error("采样前后替换参数仅在选择 --resample 时有效。")
+    if (args.compression_codec is not None or args.compression_level is not None) and not args.recompress:
+        parser.error("显式压缩 codec/level 仅在选择 --recompress 时有效。")
     time_start, time_end = args.time if args.time else (None, None)
     names = _parse_names(args.variable_name)
     input_path = args.input.expanduser().resolve()
@@ -146,6 +173,11 @@ def main(argv: list[str] | None = None) -> int:
             skipna=args.skipna,
             na_thres=args.na_thres,
             compute_dtype=args.compute_dtype,
+            before_conditions=args.before_conditions,
+            before_results=args.before_results,
+            after_conditions=args.after_conditions,
+            after_results=args.after_results,
+            statistics_policy=args.statistics_policy,
         ),
         chunking=PipelineChunkingOptions(
             strategy=args.strategy,
@@ -153,7 +185,12 @@ def main(argv: list[str] | None = None) -> int:
             custom_chunks=tuple(args.custom_chunks) if args.custom_chunks else None,
             workers=args.workers,
         ),
-        compression=PipelineCompressionOptions(profile=args.compression),
+        compression=PipelineCompressionOptions(
+            profile=args.compression,
+            codec=args.compression_codec,
+            level=args.compression_level,
+            shuffle=args.compression_shuffle,
+        ),
         validate=not args.no_validate,
     )
     plan = preview_pipeline(inspection, config)
@@ -179,6 +216,24 @@ def main(argv: list[str] | None = None) -> int:
     print(f"最终 chunks(time, lat, lon)：{plan.final_chunks}")
     if plan.final_compression is not None:
         print(f"最终压缩：{plan.final_compression.description}")
+    if args.resample:
+        before_rules = list(
+            zip(
+                (item.strip() for item in args.before_conditions.split(",")),
+                (item.strip() for item in args.before_results.split(",")),
+                strict=True,
+            )
+        ) if args.before_conditions else []
+        after_rules = list(
+            zip(
+                (item.strip() for item in args.after_conditions.split(",")),
+                (item.strip() for item in args.after_results.split(",")),
+                strict=True,
+            )
+        ) if args.after_conditions else []
+        print(f"采样前替换：{before_rules or '无'}")
+        print(f"采样后替换：{after_rules or '无'}")
+        print(f"替换统计策略：{args.statistics_policy}")
     if getattr(plan, "coverage_warning", None):
         print(f"覆盖提醒：{plan.coverage_warning}")
     print("操作决策：")

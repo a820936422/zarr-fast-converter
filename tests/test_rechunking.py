@@ -111,6 +111,40 @@ class RechunkingTests(unittest.TestCase):
             )
             self.assertEqual(dataset.attrs["title"], "rechunk test")
 
+    def test_explicit_codec_level_and_dtype_shuffle_round_trip(self) -> None:
+        source = ROOT / "input.zarr"
+        output = ROOT / "lz4-level3.zarr"
+        info = inspect_store(source)
+        plan = plan_chunks(info, "custom", custom_chunks=(3, 4, 5))
+        compression = make_compression_plan(
+            "balanced",
+            codec="blosc-lz4",
+            level=3,
+            shuffle="auto",
+        )
+        self.assertEqual(compression.profile, "custom")
+        self.assertEqual(compression.codec, "blosc-lz4")
+        run_rechunk(
+            source,
+            output,
+            info,
+            plan,
+            compression,
+            workers=1,
+            progress=False,
+        )
+        with xr.open_zarr(output, consolidated=False, chunks=None) as dataset:
+            float_codec = dataset.float_value.encoding["compressors"][0]
+            integer_codec = dataset.integer_value.encoding["compressors"][0]
+            self.assertEqual(float_codec.cname, "lz4")
+            self.assertEqual(float_codec.clevel, 3)
+            self.assertEqual(float_codec.shuffle, "shuffle")
+            self.assertEqual(integer_codec.shuffle, "bitshuffle")
+            np.testing.assert_array_equal(
+                dataset.integer_value.values,
+                np.arange(6 * 8 * 10, dtype="int16").reshape(6, 8, 10),
+            )
+
     def test_custom_temporary_directory_is_used_for_intermediate_data(self) -> None:
         source = ROOT / "input.zarr"
         output = ROOT / "temporary-output.zarr"

@@ -8,7 +8,17 @@ import numpy as np
 
 
 Strategy = Literal["time", "space", "custom"]
-CompressionProfile = Literal["none", "fast", "balanced", "maximum"]
+CompressionProfile = Literal["none", "fast", "balanced", "maximum", "custom"]
+CompressionCodec = Literal[
+    "none",
+    "blosc-zstd",
+    "blosc-lz4",
+    "blosc-lz4hc",
+    "blosc-zlib",
+    "zstd",
+    "gzip",
+]
+ShufflePolicy = Literal["auto", "noshuffle", "shuffle", "bitshuffle"]
 
 
 @dataclass(frozen=True)
@@ -97,7 +107,9 @@ class CompressionPlan:
     profile: CompressionProfile
     level: int | None
     description: str
+    codec: CompressionCodec = "blosc-zstd"
+    shuffle: ShufflePolicy = "auto"
 
     @property
     def enabled(self) -> bool:
-        return self.profile != "none"
+        return self.codec != "none" and self.profile != "none"

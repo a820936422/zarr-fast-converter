@@ -157,18 +157,21 @@ class TaskPage(QWidget):
             resource_row.addWidget(self.cpu_plot)
             resource_row.addWidget(self.memory_plot)
             layout.addLayout(resource_row)
-        layout.addWidget(QLabel("磁盘空间（自动识别已挂载文件系统）"))
-        self.disk_table = QTableWidget(0, 5)
+        layout.addWidget(QLabel("本次任务涉及的磁盘"))
+        self.disk_table = QTableWidget(0, 7)
         self.disk_table.setHorizontalHeaderLabels(
-            ("设备", "挂载点", "已用", "可用", "使用率")
+            ("用途", "设备", "挂载点", "已用", "可用", "读取", "写入")
         )
         self.disk_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
         self.disk_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
+            1, QHeaderView.ResizeMode.ResizeToContents
         )
-        for column in (2, 3, 4):
+        self.disk_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
+        )
+        for column in (3, 4, 5, 6):
             self.disk_table.horizontalHeader().setSectionResizeMode(
                 column, QHeaderView.ResizeMode.ResizeToContents
             )
@@ -234,11 +237,13 @@ class TaskPage(QWidget):
         self.disk_table.setRowCount(len(disks))
         for row, disk in enumerate(disks):
             values = (
+                str(disk.get("roles", "")),
                 str(disk.get("device", "")),
                 str(disk.get("mountpoint", "")),
                 f"{float(disk.get('used_gib', 0.0)):.1f} GiB",
                 f"{float(disk.get('free_gib', 0.0)):.1f} GiB",
-                f"{float(disk.get('percent', 0.0)):.1f}%",
+                f"{float(disk.get('read_mib_s', 0.0)):.1f} MiB/s",
+                f"{float(disk.get('write_mib_s', 0.0)):.1f} MiB/s",
             )
             for column, value in enumerate(values):
                 self.disk_table.setItem(row, column, QTableWidgetItem(value))
@@ -1655,6 +1660,23 @@ class PipelinePage(QWidget):
         self.compute_dtype.addItem("保持源浮点 dtype", "source")
         self.compute_dtype.addItem("浮点转 float32", "float32")
         resampling_form.addRow("计算 dtype", self.compute_dtype)
+        self.before_conditions = QLineEdit()
+        self.before_conditions.setPlaceholderText("例如 <0, >100")
+        resampling_form.addRow("采样前替换值", self.before_conditions)
+        self.before_results = QLineEdit()
+        self.before_results.setPlaceholderText("例如 0, 100")
+        resampling_form.addRow("采样前替换结果", self.before_results)
+        self.after_conditions = QLineEdit()
+        self.after_conditions.setPlaceholderText("例如 <=median")
+        resampling_form.addRow("采样后替换值", self.after_conditions)
+        self.after_results = QLineEdit()
+        self.after_results.setPlaceholderText("例如 100")
+        resampling_form.addRow("采样后替换结果", self.after_results)
+        self.statistics_policy = QComboBox()
+        self.statistics_policy.addItem("自动（小数据精确，大数据采样）", "auto")
+        self.statistics_policy.addItem("确定性采样", "sample")
+        self.statistics_policy.addItem("精确全量统计", "exact")
+        resampling_form.addRow("表达式统计策略", self.statistics_policy)
         settings_layout.addWidget(self.resampling_group)
 
         self.chunking_group = QGroupBox("重分块参数")
@@ -1680,10 +1702,27 @@ class PipelinePage(QWidget):
         self.compression_group = QGroupBox("重压缩参数")
         compression_form = QFormLayout(self.compression_group)
         self.compression = QComboBox()
-        for value in ("fast", "balanced", "maximum"):
-            self.compression.addItem(value, value)
-        self.compression.setCurrentIndex(self.compression.findData("balanced"))
-        compression_form.addRow("压缩方案", self.compression)
+        for label, value in (
+            ("Blosc / Zstd", "blosc-zstd"),
+            ("Blosc / LZ4", "blosc-lz4"),
+            ("Blosc / LZ4HC", "blosc-lz4hc"),
+            ("Blosc / Zlib", "blosc-zlib"),
+            ("原生 Zstd", "zstd"),
+            ("原生 Gzip", "gzip"),
+        ):
+            self.compression.addItem(label, value)
+        compression_form.addRow("压缩 codec", self.compression)
+        self.compression_level = QSpinBox()
+        self.compression_level.setRange(0, 9)
+        self.compression_level.setValue(4)
+        compression_form.addRow("压缩等级", self.compression_level)
+        self.compression_shuffle = QComboBox()
+        self.compression_shuffle.addItem("按变量 dtype 自动", "auto")
+        self.compression_shuffle.addItem("不使用 shuffle", "noshuffle")
+        self.compression_shuffle.addItem("字节 shuffle", "shuffle")
+        self.compression_shuffle.addItem("bitshuffle", "bitshuffle")
+        compression_form.addRow("Shuffle", self.compression_shuffle)
+        self.compression.currentIndexChanged.connect(self._compression_codec_changed)
         settings_layout.addWidget(self.compression_group)
 
         actions = QHBoxLayout()
@@ -1775,15 +1814,43 @@ class PipelinePage(QWidget):
             self.na_thres,
             self.target_mib,
             self.final_workers,
+            self.compression_level,
             *self.custom_chunks,
         ):
             widget.valueChanged.connect(self._invalidate_plan)
-        for widget in (self.method, self.compute_dtype, self.strategy, self.compression):
+        for widget in (
+            self.method,
+            self.compute_dtype,
+            self.statistics_policy,
+            self.strategy,
+            self.compression,
+            self.compression_shuffle,
+        ):
             widget.currentIndexChanged.connect(self._invalidate_plan)
         for widget in (self.auto_tune, self.skipna, self.cleanup_intermediate):
             widget.toggled.connect(self._invalidate_plan)
-        for widget in (self.temporary_dir, self.output):
+        for widget in (
+            self.temporary_dir,
+            self.output,
+            self.before_conditions,
+            self.before_results,
+            self.after_conditions,
+            self.after_results,
+        ):
             widget.textChanged.connect(self._invalidate_plan)
+
+    def _compression_codec_changed(self, *_args) -> None:
+        codec = self.compression.currentData()
+        if codec == "zstd":
+            self.compression_level.setRange(-7, 22)
+        else:
+            self.compression_level.setRange(0, 9)
+        native = codec in {"zstd", "gzip"}
+        if native and self.compression_shuffle.currentData() not in {"auto", "noshuffle"}:
+            self.compression_shuffle.setCurrentIndex(
+                self.compression_shuffle.findData("auto")
+            )
+        self.compression_shuffle.setEnabled(not native)
 
     def _invalidate_plan(self, *_args) -> None:
         had_plan = self.plan is not None
@@ -1974,6 +2041,11 @@ class PipelinePage(QWidget):
                 skipna=self.skipna.isChecked(),
                 na_thres=self.na_thres.value(),
                 compute_dtype=self.compute_dtype.currentData(),
+                before_conditions=self.before_conditions.text().strip(),
+                before_results=self.before_results.text().strip(),
+                after_conditions=self.after_conditions.text().strip(),
+                after_results=self.after_results.text().strip(),
+                statistics_policy=self.statistics_policy.currentData(),
             ),
             chunking=PipelineChunkingOptions(
                 strategy=strategy,
@@ -1982,7 +2054,10 @@ class PipelinePage(QWidget):
                 workers=self.final_workers.value(),
             ),
             compression=PipelineCompressionOptions(
-                profile=self.compression.currentData(),
+                profile="balanced",
+                codec=self.compression.currentData(),
+                level=self.compression_level.value(),
+                shuffle=self.compression_shuffle.currentData(),
             ),
         )
 
@@ -2029,6 +2104,9 @@ class PipelinePage(QWidget):
                 f"最终 chunks(time, lat, lon)={plan.final_chunks}\n"
                 f"需要重采样={'是' if plan.needs_resample else '否'}\n"
                 f"需要最终化={'是' if plan.finalization_required else '否'}\n"
+                f"最终压缩={plan.final_compression.description if plan.final_compression else '保持'}\n"
+                f"采样前替换={plan.resample_plan.before_replacements.as_pairs() if plan.resample_plan else ()}\n"
+                f"采样后替换={plan.resample_plan.after_replacements.as_pairs() if plan.resample_plan else ()}\n"
                 f"操作决策：\n{decisions}"
             )
         else:
@@ -2041,6 +2119,9 @@ class PipelinePage(QWidget):
                 f"lon {plan.source_read_window.lon_bounds}\n"
                 f"halo={plan.source_read_window.halo_description}\n"
                 f"需要实际重采样={'是' if plan.needs_resample else '否'}\n"
+                f"最终压缩={plan.final_compression.description if plan.final_compression else '保持'}\n"
+                f"采样前替换={self.before_conditions.text().strip() or '无'}\n"
+                f"采样后替换={self.after_conditions.text().strip() or '无'}\n"
                 f"操作决策：\n{decisions}"
                 + (f"\n覆盖提醒：{plan.coverage_warning}" if plan.coverage_warning else "")
             )
@@ -2192,12 +2273,50 @@ class MainWindow(QMainWindow):
         else:
             item.setFlags(flags & ~Qt.ItemFlag.ItemIsEnabled)
 
+    def _task_storage_paths(self, sender: object) -> tuple[tuple[str, str], ...]:
+        paths: list[tuple[str, str]] = []
+
+        def add(role: str, value: object) -> None:
+            text = value.text().strip() if isinstance(value, QLineEdit) else str(value or "").strip()
+            if text:
+                paths.append((role, text))
+
+        if sender is self.inspection_page:
+            add("输入", self.inspection_page.path)
+        elif sender is self.pipeline_page:
+            inspection = self.pipeline_page.inspection
+            if inspection is not None and inspection.kind == "source":
+                for record in inspection.source_inventory.files:
+                    add("输入", record.path)
+            elif inspection is not None:
+                add("输入", inspection.path)
+            add("临时", self.pipeline_page.temporary_dir)
+            add("输出", self.pipeline_page.output)
+        elif sender is self.rechunk_page:
+            add("输入", self.rechunk_page.input)
+            add("临时", self.rechunk_page.temporary_dir)
+            add("输出", self.rechunk_page.output)
+        elif sender is self.resample_page:
+            add("输入", self.resample_page.input)
+            add("临时", self.resample_page.temporary_dir)
+            add("输出", self.resample_page.output)
+        elif sender is self.conversion_page:
+            if self.source_result is not None:
+                for record in self.source_result.source_inventory.files:
+                    add("输入", record.path)
+            add("输出", self.conversion_page.output)
+        return tuple(dict.fromkeys(paths))
+
     def _task_requested(self, label: str, function: Callable[[], Any], callback: TaskCallback) -> None:
         if self.worker is not None and self.worker.isRunning():
             QMessageBox.warning(self, "已有任务运行", "请等待当前任务完成或先请求取消。")
             return
         self.navigation.setCurrentRow(self.task_page_index)
-        worker = TaskWorker(function, self)
+        worker = TaskWorker(
+            function,
+            self,
+            storage_paths=self._task_storage_paths(self.sender()),
+        )
         self.worker = worker
         self.task_page.started(label, worker.request_cancel)
         worker.log.connect(self.task_page.append)

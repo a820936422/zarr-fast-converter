@@ -267,6 +267,9 @@ class RechunkConfig:
     rechunk: bool = True
     recompress: bool | None = None
     temporary_dir: Path | None = None
+    compression_codec: str | None = None
+    compression_level: int | None = None
+    compression_shuffle: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -722,7 +725,10 @@ def preview_rechunk(config: RechunkConfig, info: DatasetInfo | None = None) -> R
         custom_chunks=custom,
     )
     compression = make_compression_plan(
-        config.compression if recompress_enabled else "none"
+        config.compression if recompress_enabled else "none",
+        codec=config.compression_codec if recompress_enabled else None,
+        level=config.compression_level if recompress_enabled else None,
+        shuffle=config.compression_shuffle,
     )
     return RechunkPreview(info, plan, compression)
 

@@ -28,6 +28,7 @@ from ..resampling.engine import (
 )
 from ..resampling.grid import _axis_bounds
 from ..resampling.models import GridInfo, ResampleConfig
+from ..resampling.replacements import apply_replacement_rules, parse_replacement_rules
 from .models import (
     PipelineConfig,
     PipelinePaths,
@@ -147,6 +148,7 @@ def validate_resample_samples(
     max_samples: int = 6,
     cancel_event=None,
     progress: bool = True,
+    replacement_statistics: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Check samples with bounded local xESMF reference calculations.
 
@@ -184,6 +186,17 @@ def validate_resample_samples(
     max_error = 0.0
     weights_built = 0
     started = time.perf_counter()
+    before_rules = parse_replacement_rules(
+        config.resampling.before_conditions,
+        config.resampling.before_results,
+    )
+    after_rules = parse_replacement_rules(
+        config.resampling.after_conditions,
+        config.resampling.after_results,
+    )
+    replacement_statistics = replacement_statistics or {}
+    before_statistics = replacement_statistics.get("before", {})
+    after_statistics = replacement_statistics.get("after", {})
     try:
         grid = _reference_grid(source, source_path)
         pairs = _validation_pairs(plan, max_samples)
@@ -280,6 +293,14 @@ def validate_resample_samples(
                                 and np.issubdtype(source_values.dtype, np.floating)
                             ):
                                 source_values = source_values.astype("float32")
+                            if before_rules.rules:
+                                source_values = source_values.copy(
+                                    data=apply_replacement_rules(
+                                        np.asarray(source_values.data),
+                                        before_rules,
+                                        before_statistics.get(name, {}),
+                                    )
+                                )
                             expected = regridder(
                                 source_values,
                                 keep_attrs=False,
@@ -290,6 +311,12 @@ def validate_resample_samples(
                                 lat_index - lat_start,
                                 lon_index - lon_start,
                             ]
+                            if after_rules.rules:
+                                expected_value = apply_replacement_rules(
+                                    np.asarray(expected_value),
+                                    after_rules,
+                                    after_statistics.get(name, {}),
+                                )
                             actual_value = np.asarray(
                                 output[name].isel(
                                     time=time_index,
@@ -388,7 +415,7 @@ def _run_zarr_pipeline(
     if plan.finalization_required:
         physical_stages.append("finalization")
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "job_id": paths.root.name,
         "status": "running",
         "source": str(inspection.path),
@@ -411,6 +438,9 @@ def _run_zarr_pipeline(
             plan.resample_plan.target.spatial_extent if plan.resample_plan else None
         ),
         "config": asdict(config),
+        "resolved_compression": (
+            asdict(plan.final_compression) if plan.final_compression is not None else None
+        ),
         "stages": {},
     }
     _write_manifest(paths.manifest, manifest)
@@ -445,6 +475,13 @@ def _run_zarr_pipeline(
                     compute_workers=options.compute_workers,
                     space_workers=options.space_workers,
                     temporary_dir=paths.root,
+                    before_replacements=parse_replacement_rules(
+                        options.before_conditions, options.before_results
+                    ),
+                    after_replacements=parse_replacement_rules(
+                        options.after_conditions, options.after_results
+                    ),
+                    statistics_policy=options.statistics_policy,
                 ),
                 plan.resample_plan.inspection if plan.resample_plan else None,
                 cancel_event=cancel_event,
@@ -482,6 +519,9 @@ def _run_zarr_pipeline(
                     rechunk=config.operations.rechunk,
                     recompress=config.operations.recompress,
                     temporary_dir=paths.root,
+                    compression_codec=config.compression.codec,
+                    compression_level=config.compression.level,
+                    compression_shuffle=config.compression.shuffle,
                 ),
                 cancel_event=cancel_event,
             )
@@ -575,7 +615,7 @@ def run_pipeline(
     if plan.finalization_required:
         physical_stages.append("finalization")
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "job_id": paths.root.name,
         "status": "running",
         "source": str(inspection.path),
@@ -590,6 +630,9 @@ def run_pipeline(
         "operation_decisions": operation_decisions,
         "physical_stages": physical_stages,
         "output_layout": asdict(plan.output_layout) if plan.output_layout else None,
+        "resolved_compression": (
+            asdict(plan.final_compression) if plan.final_compression is not None else None
+        ),
         "source_read_window": asdict(plan.source_read_window),
         "target_shape": plan.target_grid.dimensions,
         "target_extent": plan.target_grid.spatial_extent,
@@ -699,6 +742,13 @@ def run_pipeline(
                 space_workers=resampling.space_workers,
                 temporary_dir=paths.root,
                 output_layout=plan.output_layout if resampling_is_final else None,
+                before_replacements=parse_replacement_rules(
+                    resampling.before_conditions, resampling.before_results
+                ),
+                after_replacements=parse_replacement_rules(
+                    resampling.after_conditions, resampling.after_results
+                ),
+                statistics_policy=resampling.statistics_policy,
             )
             if progress:
                 print(
@@ -724,6 +774,7 @@ def run_pipeline(
                 inspection=inspection,
                 cancel_event=cancel_event,
                 progress=progress,
+                replacement_statistics=resample_metrics.get("replacement_statistics"),
             )
             manifest["stages"]["resampling"] = {
                 "status": "validated",
@@ -782,6 +833,9 @@ def run_pipeline(
                 rechunk=config.operations.rechunk,
                 recompress=config.operations.recompress,
                 temporary_dir=paths.root,
+                compression_codec=config.compression.codec,
+                compression_level=config.compression.level,
+                compression_shuffle=config.compression.shuffle,
             )
             if progress:
                 print(

@@ -49,7 +49,7 @@ class VariableTransform:
 class CodecSpec:
     """Serializable Zarr v3 compressor description used across stages."""
 
-    kind: Literal["blosc", "zstd"]
+    kind: Literal["blosc", "zstd", "gzip"]
     level: int
     cname: str | None = None
     shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] = "noshuffle"

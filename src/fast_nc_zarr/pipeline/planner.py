@@ -18,6 +18,7 @@ from ..rechunking.planning import plan_chunks
 from ..resampling.engine import plan_resample
 from ..resampling.inspection import inspect_resample_input
 from ..resampling.models import ResampleConfig
+from ..resampling.replacements import parse_replacement_rules
 from .models import (
     OperationDecision,
     PipelineConfig,
@@ -239,15 +240,26 @@ def _final_layout(
             rationale=("未请求重分块，使用终端写入器的标准 chunks。",),
         )
     compression = (
-        make_compression_plan(config.compression.profile)
+        _pipeline_compression_plan(config)
         if config.operations.recompress
         else CompressionPlan(
             "none",
             None,
             "未请求重压缩；数据变量使用转换基线 Zstd level 1 codec。",
+            codec="none",
         )
     )
     return chunk_plan, compression
+
+
+def _pipeline_compression_plan(config: PipelineConfig) -> CompressionPlan:
+    options = config.compression
+    return make_compression_plan(
+        options.profile,
+        codec=options.codec,
+        level=options.level,
+        shuffle=options.shuffle,
+    )
 
 
 def _converted_dtype(inventory, name: str, config: PipelineConfig) -> np.dtype:
@@ -269,7 +281,13 @@ def _codec_spec(dtype: np.dtype, compression) -> CodecSpec | None:
         # The existing conversion engine writes this codec before a
         # compression-preserving final rechunk.
         return CodecSpec("blosc", level=1, cname="zstd", shuffle="noshuffle")
-    if np.issubdtype(dtype, np.integer):
+    if compression.codec == "zstd":
+        return CodecSpec("zstd", level=int(compression.level or 0))
+    if compression.codec == "gzip":
+        return CodecSpec("gzip", level=int(compression.level or 0))
+    if compression.shuffle != "auto":
+        shuffle = compression.shuffle
+    elif np.issubdtype(dtype, np.integer):
         shuffle = "bitshuffle"
     elif np.issubdtype(dtype, np.floating):
         shuffle = "shuffle"
@@ -278,7 +296,7 @@ def _codec_spec(dtype: np.dtype, compression) -> CodecSpec | None:
     return CodecSpec(
         "blosc",
         level=int(compression.level or 1),
-        cname="zstd",
+        cname=compression.codec.removeprefix("blosc-"),
         shuffle=shuffle,
     )
 
@@ -510,10 +528,26 @@ def _existing_chunks(info: DatasetInfo) -> tuple[int, int, int]:
     return tuple(int(mapping[name]) for name in ("time", "lat", "lon"))
 
 
+def _replacement_rules(config: PipelineConfig):
+    options = config.resampling
+    before = parse_replacement_rules(
+        options.before_conditions,
+        options.before_results,
+    )
+    after = parse_replacement_rules(
+        options.after_conditions,
+        options.after_results,
+    )
+    if (before.rules or after.rules) and not config.operations.resample:
+        raise ValueError("采样前后替换规则仅在选择重采样时有效。")
+    return before, after
+
+
 def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipelinePlan:
     if getattr(inspection, "kind", None) != "zarr" or inspection.dataset_info is None:
         raise ValueError("现有 Zarr 流程要求已完成 Zarr 输入检查。")
     operations = config.operations
+    before_replacements, after_replacements = _replacement_rules(config)
     if not (operations.resample or operations.rechunk or operations.recompress):
         raise ValueError("现有 Zarr 输入至少需要选择重采样、重分块或重压缩中的一项。")
     info = inspection.zarr_info
@@ -541,6 +575,9 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
                 compute_workers=options.compute_workers,
                 space_workers=options.space_workers,
                 temporary_dir=config.general.temporary_dir,
+                before_replacements=before_replacements,
+                after_replacements=after_replacements,
+                statistics_policy=options.statistics_policy,
             ),
             resample_inspection,
         )
@@ -564,9 +601,11 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
             rationale=("未请求重分块，保持上游输出 chunks。",),
         )
     compression = (
-        make_compression_plan(config.compression.profile)
+        _pipeline_compression_plan(config)
         if operations.recompress
-        else CompressionPlan("none", None, "未请求重压缩，保持上游 codec。")
+        else CompressionPlan(
+            "none", None, "未请求重压缩，保持上游 codec。", codec="none"
+        )
     )
     storage_requested = operations.rechunk or operations.recompress
     decisions = (
@@ -608,6 +647,7 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
     """Validate user intent and derive a write-minimizing execution plan."""
 
     inspection_kind = getattr(inspection, "kind", None)
+    before_replacements, after_replacements = _replacement_rules(config)
     requested_kind = config.input.kind
     if requested_kind not in {"auto", "raw", "zarr"}:
         raise ValueError("input_kind 必须是 auto、raw 或 zarr。")
@@ -735,7 +775,8 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
         halo_description=halo_description,
     )
 
-    needs_resample = operations.resample and not same_grid
+    has_replacements = bool(before_replacements.rules or after_replacements.rules)
+    needs_resample = operations.resample and (not same_grid or has_replacements)
     if needs_resample:
         conversion_chunks = _resampling_conversion_chunks(
             inventory, source_selection, grid, target, config
@@ -828,7 +869,7 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
                 else "not_requested"
             ),
             (
-                "目标网格与源网格不同，执行 xESMF 重采样。"
+                "目标网格与源网格不同或包含采样替换规则，执行 xESMF 重采样。"
                 if needs_resample
                 else "目标网格与源网格等价，以恒等转换满足请求。"
                 if operations.resample

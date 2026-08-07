@@ -91,6 +91,10 @@ def compressor_from_spec(spec: CodecSpec | None):
         from zarr.codecs import ZstdCodec
 
         return ZstdCodec(level=spec.level)
+    if spec.kind == "gzip":
+        from zarr.codecs import GzipCodec
+
+        return GzipCodec(level=spec.level)
     return make_compressor(spec.cname or "zstd", spec.level, spec.shuffle)
 
 

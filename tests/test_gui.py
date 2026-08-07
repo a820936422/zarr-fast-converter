@@ -31,6 +31,7 @@ from fast_nc_zarr.application.services import (  # noqa: E402
 )
 from fast_nc_zarr.models import VariableTransform
 from fast_nc_zarr.gui.main_window import MainWindow  # noqa: E402
+from fast_nc_zarr.gui.workers import resolve_storage_targets  # noqa: E402
 from fast_nc_zarr.time_mapping import inspect_time_metadata  # noqa: E402
 
 
@@ -186,18 +187,47 @@ class GuiServiceTests(unittest.TestCase):
                 "write_mib_s": 2,
                 "disks": [
                     {
+                        "roles": "输入/输出",
                         "device": "/dev/test",
                         "mountpoint": "/data",
                         "used_gib": 10,
                         "free_gib": 20,
                         "percent": 33.3,
+                        "read_mib_s": 3,
+                        "write_mib_s": 4,
                     }
                 ],
             }
         )
         self.assertEqual(window.task_page.disk_table.rowCount(), 1)
+        self.assertEqual(window.task_page.disk_table.columnCount(), 7)
         window.close()
         app.processEvents()
+
+    def test_storage_targets_include_only_task_paths_and_merge_roles(self) -> None:
+        class Partition:
+            device = "/dev/root-test"
+            mountpoint = "/"
+            fstype = "ext4"
+
+        class FakePsutil:
+            class Error(Exception):
+                pass
+
+            @staticmethod
+            def disk_partitions(all=True):
+                return [Partition()]
+
+        targets = resolve_storage_targets(
+            FakePsutil,
+            (
+                ("输入", str(ROOT / "input.zarr")),
+                ("输出", str(ROOT / "not-created" / "output.zarr")),
+            ),
+        )
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0]["roles"], "输入/输出")
+        self.assertEqual(targets[0]["device"], "/dev/root-test")
 
     def test_zarr_operation_page_can_combine_rechunk_and_recompression(self) -> None:
         app = QApplication.instance() or QApplication([])
@@ -250,12 +280,18 @@ class GuiServiceTests(unittest.TestCase):
         page.resample_checkbox.setChecked(True)
         page.rechunk_checkbox.setChecked(True)
         page.recompress_checkbox.setChecked(True)
+        page.before_conditions.setText("<0, >100")
+        page.before_results.setText("0, 100")
         config = page._config()
         self.assertTrue(config.operations.resample)
         self.assertTrue(config.operations.rechunk)
         self.assertTrue(config.operations.recompress)
         self.assertEqual(config.resampling.resolution, 0.1)
+        self.assertEqual(config.resampling.before_conditions, "<0, >100")
+        self.assertEqual(config.resampling.before_results, "0, 100")
         self.assertEqual(config.compression.profile, "balanced")
+        self.assertEqual(config.compression.codec, "blosc-zstd")
+        self.assertEqual(config.compression.level, 4)
         self.assertTrue(page.resampling_group.isEnabled())
         self.assertTrue(page.chunking_group.isEnabled())
         self.assertTrue(page.compression_group.isEnabled())

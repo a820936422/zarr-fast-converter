@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import shutil
 import json
 from dataclasses import replace
@@ -22,6 +24,7 @@ from fast_nc_zarr.application.services import (  # noqa: E402
     inspect_zarr,
 )
 from fast_nc_zarr.pipeline.engine import preview_pipeline, run_pipeline  # noqa: E402
+from fast_nc_zarr.pipeline.cli import main as pipeline_main  # noqa: E402
 from fast_nc_zarr.pipeline.models import (  # noqa: E402
     PipelineChunkingOptions,
     PipelineCompressionOptions,
@@ -170,6 +173,29 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(manifest["logical_io"]["write_amplification"], 1.0)
         self.assertTrue((ROOT / "zarr-resampled-compressed.zarr" / "zarr.json").is_file())
 
+    def test_replacement_rules_prevent_identity_resample_from_becoming_noop(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(
+                ROOT / "canonical",
+                mode="complete",
+                engine="h5netcdf",
+                workers=1,
+            )
+        )
+        base = self._config(ROOT / "identity-with-replacement.zarr")
+        config = replace(
+            base,
+            operations=PipelineOperations(resample=True),
+            resampling=replace(
+                base.resampling,
+                before_conditions="<5",
+                before_results="5",
+            ),
+        )
+        plan = preview_pipeline(inspection, config)
+        self.assertTrue(plan.needs_resample)
+        self.assertEqual(plan.decision("resampling").disposition, "executed_as_stage")
+
     def test_source_window_expands_beyond_target_boundary(self) -> None:
         inspection = inspect_source(
             SourceInspectionConfig(
@@ -314,7 +340,7 @@ class PipelineTests(unittest.TestCase):
                 manifest = json.loads(
                     Path(result["manifest"]).read_text(encoding="utf-8")
                 )
-                self.assertEqual(manifest["schema_version"], 3)
+                self.assertEqual(manifest["schema_version"], 4)
                 self.assertEqual(manifest["input_kind"], "raw")
                 self.assertEqual(
                     manifest["requested_operation_order"],
@@ -387,6 +413,124 @@ class PipelineTests(unittest.TestCase):
         value_layout = plan.output_layout.for_source("value")
         self.assertEqual(group["value"].chunks, value_layout.chunks)
         self.assertIn("shuffle", repr(group["value"].compressors).lower())
+
+    def test_raw_pipeline_replacements_pass_mathematical_validation(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        base = self._config(ROOT / "replacement-validated.zarr")
+        config = replace(
+            base,
+            operations=PipelineOperations(resample=True),
+            resampling=replace(
+                base.resampling,
+                before_conditions="<10",
+                before_results="10",
+                after_conditions=">40",
+                after_results="40",
+                statistics_policy="exact",
+            ),
+        )
+
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        validation = manifest["stages"]["resampling"]["mathematical_validation"]
+        self.assertGreater(validation["comparisons"], 0)
+        with xr.open_zarr(
+            config.general.output,
+            consolidated=False,
+            chunks=None,
+            decode_times=False,
+        ) as dataset:
+            self.assertGreaterEqual(float(np.nanmin(dataset["value"].values)), 10.0)
+            self.assertLessEqual(float(np.nanmax(dataset["value"].values)), 40.0)
+
+    def test_pipeline_cli_dry_run_accepts_replacement_flags(self) -> None:
+        output = ROOT / "cli-replacements.zarr"
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            result = pipeline_main(
+                [
+                    "--input",
+                    str(ROOT / "canonical"),
+                    "--output",
+                    str(output),
+                    "--mode",
+                    "complete",
+                    "--engine",
+                    "h5netcdf",
+                    "--inspect-workers",
+                    "1",
+                    "--time",
+                    "2001-01-01",
+                    "2001-01-09",
+                    "--lat",
+                    "0.1",
+                    "0.3",
+                    "--lon",
+                    "-0.1",
+                    "0.1",
+                    "--resample",
+                    "--resolution",
+                    "0.1",
+                    "--before-conditions",
+                    "<5,>20",
+                    "--before-results",
+                    "5,20",
+                    "--after-conditions",
+                    ">median",
+                    "--after-results",
+                    "median",
+                    "--statistics-policy",
+                    "exact",
+                    "--no-tune",
+                    "--dry-run",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertIn("resampling: executed_as_stage", stdout.getvalue())
+        self.assertIn("采样前替换：[('<5', '5'), ('>20', '20')]", stdout.getvalue())
+        self.assertIn("采样后替换：[('>median', 'median')]", stdout.getvalue())
+        self.assertIn("替换统计策略：exact", stdout.getvalue())
+        self.assertFalse(output.exists())
+
+    def test_pipeline_cli_dry_run_accepts_explicit_codec_and_level(self) -> None:
+        output = ROOT / "cli-compression.zarr"
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            result = pipeline_main(
+                [
+                    "--input",
+                    str(ROOT / "canonical"),
+                    "--output",
+                    str(output),
+                    "--mode",
+                    "complete",
+                    "--engine",
+                    "h5netcdf",
+                    "--inspect-workers",
+                    "1",
+                    "--time",
+                    "2001-01-01",
+                    "2001-01-09",
+                    "--lat",
+                    "0.1",
+                    "0.3",
+                    "--lon",
+                    "-0.1",
+                    "0.1",
+                    "--recompress",
+                    "--compression-codec",
+                    "gzip",
+                    "--compression-level",
+                    "3",
+                    "--no-tune",
+                    "--dry-run",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertIn("最终压缩：gzip level 3；shuffle=auto", stdout.getvalue())
+        self.assertFalse(output.exists())
 
     def test_resampling_without_storage_operations_uses_baseline_layout(self) -> None:
         inspection = inspect_source(

@@ -7,61 +7,90 @@ import os
 import time
 import threading
 import traceback
+from pathlib import Path
 from typing import Callable, Any
 
 from PySide6.QtCore import QThread, Signal
 
 
-def _disk_mounts(psutil) -> list[tuple[str, str]]:
-    """Discover mounted, non-pseudo filesystems for compact GUI monitoring."""
+def _nearest_existing(path: Path) -> Path:
+    current = path.expanduser().resolve()
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    return current
 
-    pseudo_types = {
-        "autofs",
-        "cgroup",
-        "cgroup2",
-        "devpts",
-        "devtmpfs",
-        "mqueue",
-        "proc",
-        "pstore",
-        "securityfs",
-        "sysfs",
-        "tmpfs",
-        "tracefs",
-        "overlay",
-        "squashfs",
-    }
-    mounts: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+
+def _disk_counter_keys(device: str, device_id: int) -> tuple[str, ...]:
+    """Return psutil counter names for plain, partitioned and mapped devices."""
+
+    candidates: list[str] = []
     try:
-        partitions = psutil.disk_partitions(all=False)
+        sys_device = Path(
+            f"/sys/dev/block/{os.major(device_id)}:{os.minor(device_id)}"
+        ).resolve(strict=True)
+        candidates.append(sys_device.name)
+        if sys_device.parent.name != "block":
+            candidates.append(sys_device.parent.name)
+    except (OSError, ValueError):
+        pass
+    if device:
+        candidates.append(Path(device).name)
+    return tuple(dict.fromkeys(item for item in candidates if item))
+
+
+def resolve_storage_targets(
+    psutil,
+    paths: tuple[tuple[str, str], ...],
+) -> list[dict[str, object]]:
+    """Resolve only filesystems used by the current task."""
+
+    try:
+        partitions = sorted(
+            psutil.disk_partitions(all=True),
+            key=lambda item: len(str(item.mountpoint or "")),
+            reverse=True,
+        )
     except psutil.Error:
         partitions = []
-    for partition in partitions:
-        device = str(partition.device or "")
-        mountpoint = str(partition.mountpoint or "")
-        filesystem = str(partition.fstype or "").lower()
-        if not mountpoint or filesystem in pseudo_types:
+    resolved: dict[int, dict[str, object]] = {}
+    for role, raw_path in paths:
+        if not raw_path:
             continue
-        key = (device, mountpoint)
-        if key in seen:
-            continue
+        existing = _nearest_existing(Path(raw_path))
         try:
-            psutil.disk_usage(mountpoint)
-        except (OSError, psutil.Error):
+            stat = existing.stat()
+        except OSError:
             continue
-        seen.add(key)
-        mounts.append(key)
-    if mounts:
-        return mounts
-    # Some container/desktop environments hide partition metadata.  Keep a
-    # useful fallback for the filesystem hosting the application.
-    try:
-        mountpoint = os.getcwd()
-        psutil.disk_usage(mountpoint)
-        return [("filesystem", mountpoint)]
-    except (OSError, psutil.Error):
-        return []
+        match = next(
+            (
+                item
+                for item in partitions
+                if existing == Path(item.mountpoint)
+                or Path(item.mountpoint) in existing.parents
+            ),
+            None,
+        )
+        if match is None:
+            continue
+        device = str(match.device or "filesystem")
+        mountpoint = str(match.mountpoint)
+        device_id = int(stat.st_dev)
+        entry = resolved.setdefault(
+            device_id,
+            {
+                "device": device,
+                "mountpoint": mountpoint,
+                "roles": set(),
+                "counter_keys": _disk_counter_keys(device, device_id),
+            },
+        )
+        entry["roles"].add(role)
+    result = []
+    for entry in resolved.values():
+        copied = dict(entry)
+        copied["roles"] = "/".join(sorted(entry["roles"]))
+        result.append(copied)
+    return sorted(result, key=lambda item: (str(item["roles"]), str(item["mountpoint"])))
 
 
 class _SignalStream(io.TextIOBase):
@@ -101,10 +130,17 @@ class TaskWorker(QThread):
     resource = Signal(object)
     cancelled = Signal()
 
-    def __init__(self, function: Callable[[], Any], parent=None) -> None:
+    def __init__(
+        self,
+        function: Callable[[], Any],
+        parent=None,
+        *,
+        storage_paths: tuple[tuple[str, str], ...] = (),
+    ) -> None:
         super().__init__(parent)
         self.function = function
         self.cancel_event = threading.Event()
+        self.storage_paths = storage_paths
 
     def request_cancel(self) -> None:
         self.cancel_event.set()
@@ -126,7 +162,8 @@ class TaskWorker(QThread):
             root = psutil.Process(os.getpid())
             previous_time = time.perf_counter()
             previous_io: dict[int, tuple[int, int]] = {}
-            mounts = _disk_mounts(psutil)
+            targets = resolve_storage_targets(psutil, self.storage_paths)
+            previous_disk_io: dict[str, tuple[int, int]] = {}
             root.cpu_percent(None)
             while not stop.wait(0.5):
                 processes = [root]
@@ -153,20 +190,42 @@ class TaskWorker(QThread):
                         continue
                 now = time.perf_counter()
                 elapsed = max(now - previous_time, 1e-6)
+                try:
+                    disk_counters = psutil.disk_io_counters(perdisk=True) or {}
+                except psutil.Error:
+                    disk_counters = {}
                 disks = []
-                for device, mountpoint in mounts:
+                for target in targets:
+                    device = str(target["device"])
+                    mountpoint = str(target["mountpoint"])
                     try:
                         usage = psutil.disk_usage(mountpoint)
                     except (OSError, psutil.Error):
                         continue
+                    counter_keys = tuple(target.get("counter_keys", ()))
+                    counter_key = next(
+                        (key for key in counter_keys if key in disk_counters),
+                        "",
+                    )
+                    counter = disk_counters.get(counter_key)
+                    disk_read = disk_write = 0.0
+                    if counter is not None:
+                        current_disk = (int(counter.read_bytes), int(counter.write_bytes))
+                        previous_disk = previous_disk_io.get(counter_key, current_disk)
+                        disk_read = max(0, current_disk[0] - previous_disk[0]) / 1024**2 / elapsed
+                        disk_write = max(0, current_disk[1] - previous_disk[1]) / 1024**2 / elapsed
+                        previous_disk_io[counter_key] = current_disk
                     disks.append(
                         {
+                            "roles": target.get("roles", ""),
                             "device": device,
                             "mountpoint": mountpoint,
                             "total_gib": usage.total / 1024**3,
                             "used_gib": usage.used / 1024**3,
                             "free_gib": usage.free / 1024**3,
                             "percent": float(usage.percent),
+                            "read_mib_s": disk_read,
+                            "write_mib_s": disk_write,
                         }
                     )
                 self.resource.emit(

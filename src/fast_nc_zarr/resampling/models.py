@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -8,6 +8,7 @@ import numpy as np
 
 from ..models import OutputLayout
 from ..rechunking.models import DatasetInfo
+from .replacements import ReplacementRules
 
 
 ResampleExtent = Literal["source", "global", "custom"]
@@ -103,6 +104,9 @@ class ResampleConfig:
     space_workers: SpaceWorkers = "auto"
     temporary_dir: Path | None = None
     output_layout: OutputLayout | None = None
+    before_replacements: ReplacementRules = field(default_factory=ReplacementRules)
+    after_replacements: ReplacementRules = field(default_factory=ReplacementRules)
+    statistics_policy: Literal["auto", "sample", "exact"] = "auto"
 
 
 @dataclass(frozen=True)
@@ -150,6 +154,10 @@ class ResamplePlan:
     space_workers_requested: SpaceWorkers = "auto"
     auto_tile: AutoTileDecision | None = None
     output_layout: OutputLayout | None = None
+    before_replacements: ReplacementRules = field(default_factory=ReplacementRules)
+    after_replacements: ReplacementRules = field(default_factory=ReplacementRules)
+    statistics_policy: Literal["auto", "sample", "exact"] = "auto"
+    statistics: dict[str, dict[str, float]] = field(default_factory=dict)
 
     @property
     def output_dimensions(self) -> dict[str, int]:

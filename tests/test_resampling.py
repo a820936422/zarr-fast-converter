@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 import sys
@@ -31,6 +32,7 @@ from fast_nc_zarr.resampling.grid import (  # noqa: E402
 )
 from fast_nc_zarr.resampling.inspection import inspect_resample_input  # noqa: E402
 from fast_nc_zarr.resampling.models import GridInfo, ResampleConfig  # noqa: E402
+from fast_nc_zarr.resampling.replacements import parse_replacement_rules  # noqa: E402
 
 
 ROOT = Path("/tmp/codex_test/fast_nc_zarr_resampling_tests")
@@ -230,6 +232,56 @@ class ResamplingTests(unittest.TestCase):
             self.assertEqual(dataset.sizes["lon"], 2)
             np.testing.assert_array_equal(dataset.time.values, np.arange(2))
             self.assertTrue(np.isfinite(dataset.value.values).any())
+
+    def test_before_and_after_literal_replacements_are_fused_into_tiles(self) -> None:
+        output = ROOT / "replacement-literal.zarr"
+        metrics = run_resample(
+            ResampleConfig(
+                ROOT / "input.zarr",
+                output,
+                resolution=1.0,
+                method="nearest_s2d",
+                space_workers=1,
+                before_replacements=parse_replacement_rules("<5", "5"),
+                after_replacements=parse_replacement_rules(">25", "25"),
+            ),
+            progress=False,
+        )
+        with xr.open_zarr(output, consolidated=False, chunks=None) as dataset:
+            values = dataset.value.values
+            self.assertGreaterEqual(float(np.nanmin(values)), 5.0)
+            self.assertLessEqual(float(np.nanmax(values)), 25.0)
+            self.assertTrue(np.isnan(values).any())
+        self.assertEqual(
+            metrics["replacement_statistics"]["before_mode"],
+            "not_required",
+        )
+
+    def test_data_dependent_after_replacement_uses_unmodified_output_statistics(self) -> None:
+        output = ROOT / "replacement-statistic.zarr"
+        metrics = run_resample(
+            ResampleConfig(
+                ROOT / "input.zarr",
+                output,
+                resolution=1.0,
+                method="nearest_s2d",
+                space_workers=1,
+                after_replacements=parse_replacement_rules(">median", "median"),
+                statistics_policy="exact",
+            ),
+            progress=False,
+        )
+        statistics = metrics["replacement_statistics"]["after"]
+        with xr.open_zarr(output, consolidated=False, chunks=None) as dataset:
+            self.assertLessEqual(
+                float(np.nanmax(dataset.value.values)),
+                float(statistics["value"]["median"]),
+            )
+            self.assertEqual(
+                json.loads(dataset.attrs["resampling_after_replacements"]),
+                [[">median", "median"]],
+            )
+        self.assertEqual(metrics["replacement_statistics"]["after_mode"], "exact")
 
     def test_float32_mode_changes_float_output_dtype(self) -> None:
         source = ROOT / "float64-input.zarr"

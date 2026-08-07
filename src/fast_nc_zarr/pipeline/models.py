@@ -54,6 +54,11 @@ class PipelineResamplingOptions:
     time_block: int | Literal["auto"] = "auto"
     compute_workers: int = 2
     space_workers: int | Literal["auto"] = "auto"
+    before_conditions: str = ""
+    before_results: str = ""
+    after_conditions: str = ""
+    after_results: str = ""
+    statistics_policy: Literal["auto", "sample", "exact"] = "auto"
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,16 @@ class PipelineChunkingOptions:
 @dataclass(frozen=True)
 class PipelineCompressionOptions:
     profile: Literal["fast", "balanced", "maximum"] = "balanced"
+    codec: Literal[
+        "blosc-zstd",
+        "blosc-lz4",
+        "blosc-lz4hc",
+        "blosc-zlib",
+        "zstd",
+        "gzip",
+    ] | None = None
+    level: int | None = None
+    shuffle: Literal["auto", "noshuffle", "shuffle", "bitshuffle"] = "auto"
 
 
 @dataclass(frozen=True)

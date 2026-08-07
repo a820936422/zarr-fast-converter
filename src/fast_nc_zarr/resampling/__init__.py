@@ -11,6 +11,12 @@ from .models import (
     TargetGrid,
     TimeBlock,
 )
+from .replacements import (
+    ReplacementRule,
+    ReplacementRules,
+    apply_replacement_rules,
+    parse_replacement_rules,
+)
 
 __all__ = [
     "AutoTileDecision",
@@ -22,4 +28,8 @@ __all__ = [
     "SpaceWorkers",
     "TargetGrid",
     "TimeBlock",
+    "ReplacementRule",
+    "ReplacementRules",
+    "apply_replacement_rules",
+    "parse_replacement_rules",
 ]
