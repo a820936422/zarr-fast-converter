@@ -4,7 +4,9 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 
@@ -498,10 +500,9 @@ def chunk_tasks(
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
     output_layout: OutputLayout | None = None,
-) -> list[ChunkTask]:
+) -> Iterator[ChunkTask]:
     nt, ny, nx = selection.shape
     lookup = _time_lookup(inventory, selection)
-    tasks = []
     for t0 in range(0, nt, plan.chunk_time):
         t1 = min(nt, t0 + plan.chunk_time)
         for name in selection.variables:
@@ -509,14 +510,11 @@ def chunk_tasks(
                 y1 = min(ny, y0 + plan.chunk_lat)
                 for x0 in range(0, nx, plan.chunk_lon):
                     x1 = min(nx, x0 + plan.chunk_lon)
-                    tasks.append(
-                        _chunk_task(
-                            inventory, selection, plan, lookup, name,
-                            t0, t1, y0, y1, x0, x1,
-                            variable_transforms, variable_names, output_layout,
-                        )
+                    yield _chunk_task(
+                        inventory, selection, plan, lookup, name,
+                        t0, t1, y0, y1, x0, x1,
+                        variable_transforms, variable_names, output_layout,
                     )
-    return tasks
 
 
 def file_tasks(
@@ -526,33 +524,47 @@ def file_tasks(
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
     output_layout: OutputLayout | None = None,
-) -> list[tuple[ChunkTask, ...]]:
+) -> Iterator[tuple[ChunkTask, ...]]:
     if plan.chunk_time != 1:
         raise ValueError("文件优先策略当前要求 chunk_time=1。")
     nt, ny, nx = selection.shape
     lookup = _time_lookup(inventory, selection)
-    time_batches = []
+    grouped: list[ChunkTask] = []
     for t0 in range(nt):
-        one_time = []
         for name in selection.variables:
             for y0 in range(0, ny, plan.chunk_lat):
                 y1 = min(ny, y0 + plan.chunk_lat)
                 for x0 in range(0, nx, plan.chunk_lon):
                     x1 = min(nx, x0 + plan.chunk_lon)
-                    one_time.append(
+                    grouped.append(
                         _chunk_task(
                             inventory, selection, plan, lookup, name,
                             t0, t0 + 1, y0, y1, x0, x1,
                             variable_transforms, variable_names, output_layout,
                         )
                     )
-        time_batches.append(tuple(one_time))
-    if plan.task_batch <= 1:
-        return time_batches
-    grouped = []
-    for index in range(0, len(time_batches), plan.task_batch):
-        grouped.append(tuple(task for batch in time_batches[index : index + plan.task_batch] for task in batch))
-    return grouped
+        if (t0 + 1) % max(1, plan.task_batch) == 0:
+            yield tuple(grouped)
+            grouped.clear()
+    if grouped:
+        yield tuple(grouped)
+
+
+def _task_count(
+    selection: Selection,
+    plan: ConversionPlan,
+) -> int:
+    nt, ny, nx = selection.shape
+    if plan.strategy == "file":
+        return ceil(nt / max(1, plan.task_batch))
+    if plan.strategy == "chunk":
+        return (
+            ceil(nt / plan.chunk_time)
+            * len(selection.variables)
+            * ceil(ny / plan.chunk_lat)
+            * ceil(nx / plan.chunk_lon)
+        )
+    raise ValueError(f"direct_write 不支持策略 {plan.strategy}")
 
 
 def _monitor(stop: threading.Event, samples: list[tuple[float, int]]) -> None:
@@ -601,7 +613,7 @@ def direct_write(
         output_layout,
     )
     if plan.strategy == "file":
-        tasks: list = file_tasks(
+        tasks = file_tasks(
             inventory, selection, plan, variable_transforms, variable_names, output_layout
         )
     elif plan.strategy == "chunk":
@@ -610,35 +622,36 @@ def direct_write(
         )
     else:
         raise ValueError(f"direct_write 不支持策略 {plan.strategy}")
+    total_tasks = _task_count(selection, plan)
 
     stop = threading.Event()
     samples: list[tuple[float, int]] = []
     monitor = threading.Thread(target=_monitor, args=(stop, samples), daemon=True)
     logical_bytes = 0
     started = time.perf_counter()
-    report_every = max(1, len(tasks) // 100)
+    report_every = max(1, total_tasks // 100)
     monitor.start()
     if progress:
-        print(progress_line(0, len(tasks), 0, 0.0), end="", flush=True)
+        print(progress_line(0, total_tasks, 0, 0.0), end="", flush=True)
     try:
         worker = _write_batch if plan.strategy == "file" else _write_chunk
         results = bounded_process_map(
             worker,
             tasks,
-            workers=min(plan.workers, len(tasks)),
+            workers=min(plan.workers, total_tasks),
             initializer=_worker_init,
             initargs=(str(output),),
             cancel_event=cancel_event,
         )
         for completed, amount in enumerate(results, 1):
             logical_bytes += amount
-            if progress and (completed == len(tasks) or completed % report_every == 0):
+            if progress and (completed == total_tasks or completed % report_every == 0):
                 elapsed = max(time.perf_counter() - started, 1e-9)
                 cpu, rss = samples[-1] if samples else (None, None)
                 print(
                     progress_line(
                         completed,
-                        len(tasks),
+                        total_tasks,
                         logical_bytes,
                         elapsed,
                         cpu=cpu,
@@ -659,7 +672,7 @@ def direct_write(
         "throughput_mib_s": logical_bytes / max(elapsed, 1e-9) / 1024**2,
         "average_cpu": sum(cpu for cpu, _ in samples) / len(samples) if samples else 0.0,
         "peak_rss": max((rss for _, rss in samples), default=0),
-        "tasks": len(tasks),
+        "tasks": total_tasks,
     }
 
 

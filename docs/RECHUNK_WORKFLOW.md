@@ -233,7 +233,7 @@ rechunk.py                         # 模块二：重分块入口（实现阶段�
 src/fast_nc_zarr/                  # 模块一现有实现
 src/fast_nc_zarr/rechunking/       # 模块二的独立实现边界
 docs/RECHUNK_WORKFLOW.md           # 本文档
-CONVERTER_WORKFLOW.md              # 模块一流程文档
+docs/CONVERTER_WORKFLOW.md           # 模块一流程文档
 tests/                             # 两个模块的自动化测试
 ~~~
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
@@ -366,6 +367,44 @@ class ResamplingTests(unittest.TestCase):
             self.assertTrue(np.isfinite(result.value.values).all())
         self.assertTrue(temporary.is_dir())
         self.assertEqual(metrics["temporary_dir"], str(temporary.resolve()))
+        self.assertEqual(list(temporary.glob(".*.tmp")), [])
+        self.assertEqual(list(temporary.glob(".resample-buffer-*.bin")), [])
+
+    def test_spatial_compute_tiles_are_decoupled_from_final_chunks(self) -> None:
+        source = ROOT / "input.zarr"
+        output = ROOT / "spatial-intermediate-output.zarr"
+        temporary = ROOT / "spatial-intermediate-temporary"
+        config = ResampleConfig(
+            source,
+            output,
+            resolution=1.0,
+            method="nearest_s2d",
+            tile_size=2,
+            time_block=2,
+            compute_workers=1,
+            space_workers=1,
+            temporary_dir=temporary,
+        )
+        plan = plan_resample(config)
+        final_chunks = dict(plan.output_chunks)
+        final_chunks["value"] = (2, 4, 4)
+        final_chunks["reordered"] = (4, 2, 4)
+        metrics = run_resample(
+            config,
+            replace(plan, output_chunks=final_chunks),
+            progress=False,
+        )
+
+        self.assertTrue(metrics["used_intermediate"])
+        self.assertEqual(int(metrics["tile_timing"]["tiles"]), 4)
+        self.assertEqual(metrics["logical_write_amplification"], 2.0)
+        self.assertGreater(metrics["throughput_mib_s"], 0.0)
+        self.assertGreater(metrics["physical_throughput_mib_s"], 0.0)
+        with xr.open_zarr(output, consolidated=False, chunks=None) as result:
+            self.assertEqual(result.value.encoding["chunks"], (2, 4, 4))
+            self.assertEqual(result.reordered.encoding["chunks"], (4, 2, 4))
+            self.assertTrue(np.isfinite(result.value.values).any())
+            self.assertTrue(np.isfinite(result.reordered.values).any())
         self.assertEqual(list(temporary.glob(".*.tmp")), [])
         self.assertEqual(list(temporary.glob(".resample-buffer-*.bin")), [])
 

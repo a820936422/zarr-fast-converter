@@ -672,7 +672,7 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
     ]
     if unsupported:
         raise ValueError(
-            "一条龙 v1.3.0 仅支持 time/lat/lon 三维数据变量："
+            "一条龙 v1.6.0 仅支持 time/lat/lon 三维数据变量："
             + ", ".join(unsupported)
         )
     if not (-90 <= general.lat_min < general.lat_max <= 90):

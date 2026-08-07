@@ -15,7 +15,7 @@ import contextlib
 import gc
 import re
 from pathlib import Path
-from math import gcd
+from math import ceil, gcd
 import shutil
 import threading
 import time
@@ -1566,10 +1566,6 @@ def filename_direct_write(
     }
     source_map = source_path_by_time(inventory)
     selected_keys = inventory.time_keys[selection.time_start : selection.time_stop]
-    entries = tuple(
-        (index, str(source_map[key]) if key in source_map else None)
-        for index, key in enumerate(selected_keys)
-    )
     nt, ny, nx = selection.shape
     blocks = tuple(
         (y0, min(ny, y0 + max(1, plan.chunk_lat)), x0, min(nx, x0 + max(1, plan.chunk_lon)))
@@ -1578,34 +1574,44 @@ def filename_direct_write(
     )
     batch_size = plan.task_batch if plan.strategy == "file" else plan.chunk_time
     batch_size = max(1, batch_size)
-    tasks = [
-        FilenameTimeWriteTask(
-            entries=entries[start : start + batch_size],
-            blocks=blocks,
-        )
-        for start in range(0, nt, batch_size)
-    ]
-    if not tasks:
+    total_tasks = ceil(nt / batch_size)
+    if total_tasks == 0:
         raise ValueError("没有可写入的时间点。")
 
-    worker_count = max(1, min(plan.workers, len(tasks)))
+    def write_tasks():
+        for start in range(0, nt, batch_size):
+            stop = min(nt, start + batch_size)
+            yield FilenameTimeWriteTask(
+                entries=tuple(
+                    (
+                        index,
+                        str(source_map[selected_keys[index]])
+                        if selected_keys[index] in source_map
+                        else None,
+                    )
+                    for index in range(start, stop)
+                ),
+                blocks=blocks,
+            )
+
+    worker_count = max(1, min(plan.workers, total_tasks))
     stop = threading.Event()
     samples: list[tuple[float, int]] = []
     monitor = threading.Thread(target=_monitor, args=(stop, samples), daemon=True)
     logical_bytes = 0
     started = time.perf_counter()
-    report_every = max(1, len(tasks) // 100)
+    report_every = max(1, total_tasks // 100)
     monitor.start()
     if progress:
         print(
-            progress_line(0, len(tasks), 0, 0.0, prefix="文件名时间写入"),
+            progress_line(0, total_tasks, 0, 0.0, prefix="文件名时间写入"),
             end="",
             flush=True,
         )
     try:
         results = bounded_process_map(
             _filename_write_task,
-            tasks,
+            write_tasks(),
             workers=worker_count,
             initializer=_filename_worker_init,
             initargs=(
@@ -1626,13 +1632,13 @@ def filename_direct_write(
         )
         for completed, amount in enumerate(results, 1):
             logical_bytes += amount
-            if progress and (completed == len(tasks) or completed % report_every == 0):
+            if progress and (completed == total_tasks or completed % report_every == 0):
                 elapsed = max(time.perf_counter() - started, 1e-9)
                 cpu, rss = samples[-1] if samples else (None, None)
                 print(
                     progress_line(
                         completed,
-                        len(tasks),
+                        total_tasks,
                         logical_bytes,
                         elapsed,
                         prefix="文件名时间写入",
@@ -1664,7 +1670,7 @@ def filename_direct_write(
         "throughput_mib_s": logical_bytes / max(elapsed, 1e-9) / 1024**2,
         "average_cpu": sum(cpu for cpu, _ in samples) / len(samples) if samples else 0.0,
         "peak_rss": max((rss for _, rss in samples), default=0),
-        "tasks": len(tasks),
+        "tasks": total_tasks,
     }
 
 

@@ -7,6 +7,7 @@ import itertools
 from pathlib import Path
 import shutil
 import time
+from typing import Iterable
 from uuid import uuid4
 
 import dask
@@ -381,6 +382,7 @@ def _aligned_tile_ranges(
     info: DatasetInfo,
     target: TargetGrid,
     tile_size: int,
+    chunks_by_name: dict[str, tuple[int, ...]] | None = None,
 ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """Build ranges that never split a spatial output Zarr chunk.
 
@@ -396,13 +398,18 @@ def _aligned_tile_ranges(
     for variable in info.data_variables:
         if "lat" not in variable.dims or "lon" not in variable.dims:
             continue
+        chunks = (
+            variable.chunks
+            if chunks_by_name is None
+            else chunks_by_name.get(variable.name, variable.chunks)
+        )
         lat_index = variable.dims.index("lat")
         lon_index = variable.dims.index("lon")
         lat_boundaries.update(
-            _chunk_boundaries(target.lat.size, variable.chunks[lat_index])
+            _chunk_boundaries(target.lat.size, chunks[lat_index])
         )
         lon_boundaries.update(
-            _chunk_boundaries(target.lon.size, variable.chunks[lon_index])
+            _chunk_boundaries(target.lon.size, chunks[lon_index])
         )
 
     def merge(boundaries: set[int]) -> list[tuple[int, int]]:
@@ -716,7 +723,12 @@ def _intermediate_chunks(
     info: DatasetInfo,
     plan: ResamplePlan,
 ) -> dict[str, tuple[int, ...]]:
-    """Use the streaming time block for an ephemeral intermediate store."""
+    """Build a compute-oriented layout for the ephemeral intermediate store.
+
+    Time chunks follow the vectorized computation batch.  Spatial chunks are
+    shared by every resampled variable so workers can own independent tiles
+    even when the final Zarr layout contains a much larger spatial chunk.
+    """
 
     result = dict(plan.output_chunks)
     for item in info.data_variables:
@@ -731,6 +743,12 @@ def _intermediate_chunks(
             int(plan.time_block),
             int(item.shape[time_index]),
         )
+        for dimension in ("lat", "lon"):
+            axis = item.dims.index(dimension)
+            chunks[axis] = min(
+                int(plan.tile_size),
+                int(plan.target.dimensions[dimension]),
+            )
         result[item.name] = tuple(chunks)
     return result
 
@@ -745,8 +763,7 @@ def _needs_intermediate(
             continue
         if "lat" not in item.dims or "lon" not in item.dims:
             continue
-        time_index = item.dims.index("time")
-        if intermediate_chunks[item.name][time_index] < plan.output_chunks[item.name][time_index]:
+        if intermediate_chunks[item.name] != plan.output_chunks[item.name]:
             return True
     return False
 
@@ -782,15 +799,10 @@ def _merge_intermediate_variable(
     name: str,
     temporary_root: Path,
 ) -> None:
-    """Assemble smaller time chunks and write each final chunk exactly once."""
+    """Assemble compute chunks and write each final chunk exactly once."""
 
     source_array = intermediate_group[name]
     target_array = final_group[name]
-    time_axis = None
-    # Zarr arrays do not retain dimension names, so the caller stores the
-    # arrays with identical dimension order and supplies the time axis via
-    # the chunk layout.  A time chunk smaller than the target chunk is the
-    # indicator for the only multi-read assembly path.
     for region in _chunk_regions(
         tuple(int(size) for size in target_array.shape),
         tuple(int(chunk) for chunk in target_array.chunks),
@@ -804,27 +816,30 @@ def _merge_intermediate_variable(
             shape=buffer_shape,
         )
         try:
-            # The intermediate chunks are smaller only along time.  Find that
-            # axis from the first chunk-size mismatch, which is safe because
-            # spatial chunks are intentionally identical between both stores.
-            for axis, (source_chunk, target_chunk) in enumerate(
-                zip(source_array.chunks, target_array.chunks)
-            ):
-                if int(source_chunk) < int(target_chunk):
-                    time_axis = axis
-                    break
-            if time_axis is None:
-                buffer[...] = source_array[region]
-            else:
-                start = int(region[time_axis].start)
-                stop = int(region[time_axis].stop)
-                step = max(1, int(source_array.chunks[time_axis]))
-                while start < stop:
-                    sub = list(region)
-                    sub[time_axis] = slice(start, min(start + step, stop))
-                    subregion = tuple(sub)
-                    buffer[_relative_region(region, subregion)] = source_array[subregion]
-                    start = int(subregion[time_axis].stop)
+            starts = [
+                range(
+                    int(part.start),
+                    int(part.stop),
+                    max(1, int(source_chunk)),
+                )
+                for part, source_chunk in zip(region, source_array.chunks)
+            ]
+            for origin in itertools.product(*starts):
+                subregion = tuple(
+                    slice(
+                        int(start),
+                        min(
+                            int(start) + int(source_chunk),
+                            int(part.stop),
+                        ),
+                    )
+                    for start, source_chunk, part in zip(
+                        origin,
+                        source_array.chunks,
+                        region,
+                    )
+                )
+                buffer[_relative_region(region, subregion)] = source_array[subregion]
             buffer.flush()
             target_array[region] = buffer
         finally:
@@ -1273,7 +1288,8 @@ def _run_parallel_tiles(
     workdir: Path,
     plan: ResamplePlan,
     spatial_items: tuple[VariableInfo, ...],
-    tasks: list[tuple[int, int, int, int]],
+    tasks: Iterable[tuple[int, int, int, int]],
+    total_tasks: int,
     *,
     cancel_event=None,
     progress: bool,
@@ -1345,10 +1361,10 @@ def _run_parallel_tiles(
                 )
                 if progress and (
                     completed == 1
-                    or completed == len(tasks)
-                    or completed % max(1, len(tasks) // 20) == 0
+                    or completed == total_tasks
+                    or completed % max(1, total_tasks // 20) == 0
                 ):
-                    print(_format_tile_progress(completed, len(tasks), metrics), flush=True)
+                    print(_format_tile_progress(completed, total_tasks, metrics), flush=True)
             if cancelled:
                 raise ResampleExecutionError("任务已取消，未生成输出。")
     finally:
@@ -1833,23 +1849,37 @@ def run_resample(
             for item in runtime_plan.inspection.info.data_variables
             if item.name in spatial_names
         )
-        lat_ranges, lon_ranges = _aligned_tile_ranges(
-            runtime_plan.inspection.info,
-            runtime_plan.target,
-            runtime_plan.tile_size,
-        )
-        tasks = [
-            (lat_start, lat_stop, lon_start, lon_stop)
-            for lat_start, lat_stop in lat_ranges
-            for lon_start, lon_stop in lon_ranges
-        ]
-        total_tiles = len(tasks)
+        if use_intermediate:
+            lat_ranges = list(
+                _tile_ranges(runtime_plan.target.lat.size, runtime_plan.tile_size)
+            )
+            lon_ranges = list(
+                _tile_ranges(runtime_plan.target.lon.size, runtime_plan.tile_size)
+            )
+            tile_layout_description = "空间计算块与最终 chunks 解耦"
+        else:
+            lat_ranges, lon_ranges = _aligned_tile_ranges(
+                runtime_plan.inspection.info,
+                runtime_plan.target,
+                runtime_plan.tile_size,
+                processing_plan.output_chunks,
+            )
+            tile_layout_description = "空间块已对齐最终输出 chunks"
+        total_tiles = len(lat_ranges) * len(lon_ranges)
+
+        def tile_tasks():
+            return (
+                (lat_start, lat_stop, lon_start, lon_stop)
+                for lat_start, lat_stop in lat_ranges
+                for lon_start, lon_stop in lon_ranges
+            )
+
         if progress:
             print(
                 f"流式计算：{total_tiles} 个空间块，"
                 f"空间进程={runtime_plan.space_workers}，"
                 f"每个进程使用 {runtime_plan.compute_workers} 个 Dask 线程；"
-                "空间块已对齐输出 chunks。"
+                f"{tile_layout_description}。"
             )
         full_regridder = None
         full_weight_path = None
@@ -1882,7 +1912,7 @@ def run_resample(
                 or total_tiles <= 1
                 or runtime_plan.space_workers <= 1
             ):
-                for index, task in enumerate(tasks, start=1):
+                for index, task in enumerate(tile_tasks(), start=1):
                     if cancel_event is not None and cancel_event.is_set():
                         raise ResampleExecutionError("任务已取消，未生成输出。")
                     metrics = _execute_serial_tile(
@@ -1920,7 +1950,8 @@ def run_resample(
                     workdir,
                     parallel_plan,
                     spatial_items,
-                    tasks,
+                    tile_tasks(),
+                    total_tiles,
                     cancel_event=cancel_event,
                     progress=progress,
                 )
@@ -2003,12 +2034,19 @@ def run_resample(
             print(f"重采样完成并通过校验：{target_path}")
         return {
             "elapsed": elapsed,
+            "wall_seconds": elapsed,
             "output": str(target_path),
             "physical_bytes": physical_bytes,
             "logical_bytes": logical_bytes,
             "used_intermediate": intermediate is not None,
             "intermediate_logical_bytes": logical_bytes if use_intermediate else 0,
-            "throughput_mib_s": physical_bytes / 1024**2 / max(elapsed, 1e-9),
+            "throughput_mib_s": logical_bytes / 1024**2 / max(elapsed, 1e-9),
+            "physical_throughput_mib_s": (
+                physical_bytes / 1024**2 / max(elapsed, 1e-9)
+            ),
+            "logical_write_amplification": 2.0 if use_intermediate else 1.0,
+            "space_workers": min(runtime_plan.space_workers, total_tiles),
+            "compute_workers_per_space_worker": runtime_plan.compute_workers,
             "temporary_dir": str(temporary_root),
             "tile_timing": tile_timing,
             "replacement_statistics": {

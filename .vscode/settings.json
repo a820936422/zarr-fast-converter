@@ -1,0 +1,12 @@
+{
+    "ompChat.model": "",
+    "ompChat.mode": "Agent",
+    "pendant.notifications.playSound": false,
+    "pendant.notifications.agentFinished": true,
+    "pendant.showThinking": true,
+    "pendant.context.autoAttach": true,
+    "pendant.thinkingLevel": "medium",
+    "pendant.thinkingDisplayMode": "expanded",
+    "pendant.autoGenerateSessionNames": true,
+    "pendant.diagnostics.enabled": false
+}

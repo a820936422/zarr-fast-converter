@@ -388,6 +388,8 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(plan.direct_finalization)
         result = run_pipeline(inspection, self._config(output), progress=False)
         self.assertTrue(result["needs_resample"])
+        self.assertGreater(result["resampling"]["logical_bytes"], 0)
+        self.assertGreater(result["mathematical_validation"]["comparisons"], 0)
         with xr.open_zarr(output, consolidated=False, chunks=None, decode_times=False) as dataset:
             self.assertEqual(dataset["value"].dims, ("time", "lat", "lon"))
             self.assertEqual(dataset.sizes["lat"], 2)

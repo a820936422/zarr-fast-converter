@@ -705,6 +705,7 @@ def run_pipeline(
         if cancel_event is not None and cancel_event.is_set():
             raise PipelineExecutionError("任务已取消。")
 
+        resample_metrics = None
         validation_metrics = None
         if plan.needs_resample:
             resampling = config.resampling
@@ -894,7 +895,8 @@ def run_pipeline(
             "physical_stages": physical_stages,
             "manifest": str(paths.manifest),
             "conversion": conversion_metrics,
-            "resampling": validation_metrics,
+            "resampling": resample_metrics,
+            "mathematical_validation": validation_metrics,
             "finalization": rechunk_metrics,
             "logical_io": logical_io,
         }

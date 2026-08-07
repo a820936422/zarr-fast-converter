@@ -8,6 +8,7 @@ import shutil
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Iterable, Iterator
 from uuid import uuid4
 
 import dask.array as dask_array
@@ -417,7 +418,7 @@ def _initialize_store(
         gc.collect()
 
 
-def _chunk_regions(variable: xr.DataArray) -> list[dict[str, slice]]:
+def _chunk_regions(variable: xr.DataArray) -> Iterator[dict[str, slice]]:
     """Chunk-region helper that avoids repeated index searches for large arrays."""
 
     data = variable.data
@@ -428,21 +429,17 @@ def _chunk_regions(variable: xr.DataArray) -> list[dict[str, slice]]:
         tuple(int(value) for value in np.cumsum((0,) + tuple(axis_chunks[:-1])))
         for axis_chunks in chunks
     ]
-    regions: list[dict[str, slice]] = []
     for indices in itertools.product(*(range(len(axis)) for axis in chunks)):
-        regions.append(
-            {
-                dim: slice(
-                    starts[axis][index],
-                    starts[axis][index] + int(chunks[axis][index]),
-                )
-                for axis, (dim, index) in enumerate(zip(variable.dims, indices))
-            }
-        )
-    return regions
+        yield {
+            dim: slice(
+                starts[axis][index],
+                starts[axis][index] + int(chunks[axis][index]),
+            )
+            for axis, (dim, index) in enumerate(zip(variable.dims, indices))
+        }
 
 
-def _source_chunk_indices(variable: xr.DataArray) -> tuple[tuple[int, ...], ...]:
+def _source_chunk_indices(variable: xr.DataArray) -> Iterator[tuple[int, ...]]:
     """Return the physical chunk coordinates in the same order as regions.
 
     ``xarray.DataArray.isel`` rebuilds an indexing graph for every source
@@ -454,10 +451,17 @@ def _source_chunk_indices(variable: xr.DataArray) -> tuple[tuple[int, ...], ...]
     chunks = getattr(variable.data, "chunks", None)
     if chunks is None:
         chunks = tuple((int(size),) for size in variable.shape)
-    return tuple(
+    return (
         tuple(int(index) for index in indices)
         for indices in itertools.product(*(range(len(axis)) for axis in chunks))
     )
+
+
+def _array_chunk_count(variable: xr.DataArray) -> int:
+    chunks = getattr(variable.data, "chunks", None)
+    if chunks is None:
+        return 1
+    return int(np.prod([len(axis) for axis in chunks], dtype=np.int64))
 
 
 def _chunk_layout(
@@ -719,7 +723,8 @@ def _stage2_region_task(
 
 
 def _run_process_tasks(
-    tasks: list[tuple],
+    tasks: Iterable[tuple],
+    total: int,
     *,
     workers: int,
     initializer: object,
@@ -734,7 +739,6 @@ def _run_process_tasks(
     started = time.perf_counter()
     processed_bytes = 0
     processed_chunks = 0
-    total = len(tasks)
     # Keep progress output useful without turning hundreds of process
     # completions into another serialization bottleneck.
     progress_interval = max(1, min(32, total // 20))
@@ -766,20 +770,28 @@ def _run_process_tasks(
         raise
 
 
-def _stage1_time_tasks(info: DatasetInfo) -> list[tuple[str, int]]:
-    tasks: list[tuple[str, int]] = []
+def _stage1_time_tasks(info: DatasetInfo) -> Iterator[tuple[str, int]]:
     for variable in info.data_variables:
         if variable.ndim != 3:
             continue
         time_axis = variable.dims.index("time")
-        tasks.extend(
+        yield from (
             (variable.name, index)
             for index in range(
                 (int(variable.shape[time_axis]) + int(variable.chunks[time_axis]) - 1)
                 // int(variable.chunks[time_axis])
             )
         )
-    return tasks
+
+
+def _stage1_time_task_count(info: DatasetInfo) -> int:
+    return sum(
+        (int(variable.shape[variable.dims.index("time")])
+         + int(variable.chunks[variable.dims.index("time")]) - 1)
+        // int(variable.chunks[variable.dims.index("time")])
+        for variable in info.data_variables
+        if variable.ndim == 3
+    )
 
 
 def _stage1_source_chunk_count(info: DatasetInfo) -> int:
@@ -817,8 +829,7 @@ def _stage2_tasks(
     plan: ChunkPlan,
     intermediate_chunks: tuple[int, int, int],
     region_chunks: dict[str, tuple[int, ...]] | None = None,
-) -> list[tuple[str, tuple[int, ...], tuple[int, ...]]]:
-    tasks: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+) -> Iterator[tuple[str, tuple[int, ...], tuple[int, ...]]]:
     for variable in info.data_variables:
         if variable.ndim != 3:
             continue
@@ -833,8 +844,7 @@ def _stage2_tasks(
                 int(region[dim].stop or size)
                 for dim, size in zip(variable.dims, variable.shape)
             )
-            tasks.append((variable.name, starts, stops))
-    return tasks
+            yield variable.name, starts, stops
 
 
 def _populate_intermediate_parallel(
@@ -846,12 +856,13 @@ def _populate_intermediate_parallel(
     progress: bool,
     cancel_event=None,
 ) -> None:
-    tasks = _stage1_time_tasks(info)
-    if not tasks:
+    total_tasks = _stage1_time_task_count(info)
+    if total_tasks == 0:
         raise RechunkExecutionError("没有可并行处理的三维数据变量。")
     codec_workers = max(1, min(2, workers))
     _run_process_tasks(
-        tasks,
+        _stage1_time_tasks(info),
+        total_tasks,
         workers=workers,
         initializer=_init_stage1_worker,
         initargs=(str(source_path), str(intermediate), codec_workers),
@@ -874,12 +885,13 @@ def _populate_final_parallel(
     progress: bool,
     cancel_event=None,
 ) -> None:
-    tasks = _stage2_tasks(info, plan, intermediate_chunks, region_chunks)
-    if not tasks:
+    total_tasks = _stage2_task_count(info, plan, intermediate_chunks, region_chunks)
+    if total_tasks == 0:
         raise RechunkExecutionError("没有可并行合并的三维数据变量。")
     codec_workers = max(1, min(2, workers))
     _run_process_tasks(
-        tasks,
+        _stage2_tasks(info, plan, intermediate_chunks, region_chunks),
+        total_tasks,
         workers=workers,
         initializer=_init_stage2_worker,
         initargs=(str(intermediate), str(staging), codec_workers),
@@ -935,7 +947,7 @@ def _populate_intermediate(
                 source_variable = source[variable.name]
                 regions = _chunk_regions(source_variable)
                 source_indices = _source_chunk_indices(source_variable)
-                total = len(regions)
+                total = _array_chunk_count(source_variable)
                 progress_interval = max(1, min(32, total // 100))
                 array = zarr.open_array(store=intermediate, path=variable.name, mode="r+")
                 if progress:
@@ -1181,35 +1193,64 @@ def _group_regions(
     variable: VariableInfo,
     plan: ChunkPlan,
     intermediate_chunks: tuple[int, int, int],
-) -> list[dict[str, slice]]:
+) -> Iterator[dict[str, slice]]:
     mapping = dict(zip(("time", "lat", "lon"), plan.chunks))
     intermediate_mapping = dict(
         zip(("time", "lat", "lon"), intermediate_chunks)
     )
-    starts: list[list[int]] = []
+    starts: list[range] = []
     for dim, size in zip(variable.dims, variable.shape):
         chunk = mapping[dim] if dim == "time" else intermediate_mapping[dim]
-        starts.append(list(range(0, int(size), int(chunk))))
-    regions: list[dict[str, slice]] = []
+        starts.append(range(0, int(size), int(chunk)))
     for offsets in itertools.product(*starts):
-        regions.append(
-            {
-                dim: slice(
-                    start,
-                    min(
-                        start
-                        + (
-                            mapping[dim]
-                            if dim == "time"
-                            else intermediate_mapping[dim]
-                        ),
-                        int(size),
+        yield {
+            dim: slice(
+                start,
+                min(
+                    start
+                    + (
+                        mapping[dim]
+                        if dim == "time"
+                        else intermediate_mapping[dim]
                     ),
-                )
-                for dim, size, start in zip(variable.dims, variable.shape, offsets)
-            }
+                    int(size),
+                ),
+            )
+            for dim, size, start in zip(variable.dims, variable.shape, offsets)
+        }
+
+
+def _group_region_count(
+    variable: VariableInfo,
+    plan: ChunkPlan,
+    intermediate_chunks: tuple[int, int, int],
+) -> int:
+    final = dict(zip(("time", "lat", "lon"), plan.chunks))
+    intermediate = dict(zip(("time", "lat", "lon"), intermediate_chunks))
+    return int(np.prod([
+        (int(size) + int(final[dim] if dim == "time" else intermediate[dim]) - 1)
+        // int(final[dim] if dim == "time" else intermediate[dim])
+        for dim, size in zip(variable.dims, variable.shape)
+    ], dtype=np.int64))
+
+
+def _stage2_task_count(
+    info: DatasetInfo,
+    plan: ChunkPlan,
+    intermediate_chunks: tuple[int, int, int],
+    region_chunks: dict[str, tuple[int, ...]] | None = None,
+) -> int:
+    return sum(
+        _group_region_count(
+            variable,
+            plan,
+            region_chunks.get(variable.name, intermediate_chunks)
+            if region_chunks is not None
+            else intermediate_chunks,
         )
-    return regions
+        for variable in info.data_variables
+        if variable.ndim == 3
+    )
 
 
 def _write_final_group(
@@ -1268,7 +1309,7 @@ def _populate_final_from_intermediate(
                 array = zarr.open_array(store=staging, path=variable.name, mode="r+")
                 chunks_by_dim = dict(zip(("time", "lat", "lon"), plan.chunks))
                 final_chunks = tuple(chunks_by_dim[dim] for dim in variable.dims)
-                total = len(regions)
+                total = _group_region_count(variable, plan, chunks)
                 progress_interval = max(1, min(32, total // 100))
                 if progress:
                     print(
@@ -1509,7 +1550,7 @@ def run_rechunk(
         if grouped_text:
             print(f"阶段 2 读取区域批处理：{grouped_text}")
         stage1_task_count = (
-            len(_stage1_time_tasks(info)) if plan.strategy == "time" else 0
+            _stage1_time_task_count(info) if plan.strategy == "time" else 0
         )
         stage1_source_chunk_count = _stage1_source_chunk_count(info)
         output_chunk_count = sum(plan.estimated_chunks.values())
