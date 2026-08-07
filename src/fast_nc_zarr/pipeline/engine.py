@@ -1,0 +1,540 @@
+from __future__ import annotations
+
+import json
+import shutil
+import time
+from tempfile import TemporaryDirectory
+from dataclasses import asdict
+from pathlib import Path
+from uuid import uuid4
+
+import numpy as np
+
+from ..application.services import (
+    ConversionConfig,
+    RechunkConfig,
+    inspect_resample,
+    preview_rechunk,
+    run_conversion,
+    run_rechunk,
+    run_resample,
+)
+from ..resampling.engine import (
+    _build_regridder,
+    _mask_missing,
+    _resolve_local_source_window,
+    _tile_target,
+)
+from ..resampling.grid import _axis_bounds
+from ..resampling.models import GridInfo, ResampleConfig
+from .models import (
+    PipelineConfig,
+    PipelinePaths,
+    PipelinePlan,
+)
+from .planner import build_pipeline_plan
+
+
+class PipelineExecutionError(RuntimeError):
+    """Raised when an end-to-end task cannot safely publish its output."""
+
+
+def _json_default(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return str(value)
+
+
+def _write_manifest(path: Path, payload: dict) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _paths(config: PipelineConfig) -> PipelinePaths:
+    output = Path(config.general.output).expanduser().resolve()
+    base = (
+        Path(config.general.temporary_dir).expanduser().resolve()
+        if config.general.temporary_dir is not None
+        else output.parent
+    )
+    root = base / "fast-nc-zarr-pipeline" / uuid4().hex
+    return PipelinePaths(
+        root=root,
+        manifest=root / "manifest.json",
+        converted=root / "source-crop.zarr",
+        resampled=root / "resampled.zarr",
+        final_staging=output.parent / f".{output.name}.pipeline-{uuid4().hex}.tmp",
+    )
+
+
+def _sample_indices(size: int) -> list[int]:
+    if size <= 0:
+        return []
+    values = {0, size - 1, size // 2, size // 4, (3 * size) // 4}
+    return sorted(value for value in values if 0 <= value < size)
+
+
+def _reference_grid(source, source_path: Path) -> GridInfo:
+    """Build the same regular-grid description used by the resampling engine."""
+
+    lat = np.asarray(source.lat.values, dtype="float64")
+    lon = np.asarray(source.lon.values, dtype="float64")
+    if lat.size < 2 or lon.size < 2:
+        raise PipelineExecutionError("数学验证要求源 lat/lon 至少各含两个格点。")
+    return GridInfo(
+        path=source_path,
+        lat=lat,
+        lon=lon,
+        lat_bounds=_axis_bounds(lat),
+        lon_bounds=_axis_bounds(lon),
+        lat_resolution=float(np.median(np.abs(np.diff(lat)))),
+        lon_resolution=float(np.median(np.abs(np.diff(lon)))),
+        lat_descending=bool(lat[0] > lat[-1]),
+        lon_descending=bool(lon[0] > lon[-1]),
+        lat_uniform=True,
+        lon_uniform=True,
+    )
+
+
+def _validation_pairs(plan: PipelinePlan, maximum: int) -> list[tuple[int, int]]:
+    """Select deterministic windows across edges, centre and interior."""
+
+    lat_indices = _sample_indices(int(plan.target_grid.lat.size))
+    lon_indices = _sample_indices(int(plan.target_grid.lon.size))
+    candidates = [(lat, lon) for lat in lat_indices for lon in lon_indices]
+    if not candidates:
+        return []
+    count = min(len(candidates), max(1, int(maximum)))
+    positions = np.linspace(0, len(candidates) - 1, count, dtype=int)
+    return [candidates[int(position)] for position in dict.fromkeys(positions)]
+
+
+def _validation_time_indices(size: int) -> list[int]:
+    if size <= 0:
+        return []
+    # A long time series must include the end rather than merely its first
+    # three quartile candidates; this catches final-chunk write mistakes.
+    return sorted({0, int(size) // 2, int(size) - 1})
+
+
+def validate_resample_samples(
+    source_path: Path,
+    output_path: Path,
+    plan: PipelinePlan,
+    config: PipelineConfig,
+    inspection=None,
+    *,
+    max_samples: int = 6,
+    cancel_event=None,
+    progress: bool = True,
+) -> dict[str, object]:
+    """Check samples with bounded local xESMF reference calculations.
+
+    The reference follows the production engine's source-window and periodic
+    rules, but builds one tiny weight matrix per target sample window and
+    reuses it for every sampled time.  It must never construct a global-source
+    weight matrix merely to validate one output point.
+    """
+
+    import xarray as xr
+    import xesmf as xe
+
+    # The verified conversion store is the exact production input, including
+    # variable renames, fill-value replacement and scale factors.  Reopening
+    # the raw collection here would duplicate conversion semantics, can force
+    # a full multi-file metadata combine, and previously made validation look
+    # stalled after resampling had already completed.
+    del inspection
+    source = xr.open_zarr(
+        source_path,
+        consolidated=False,
+        chunks=None,
+        decode_times=False,
+        mask_and_scale=False,
+    )
+    reference_mode = "converted-source-crop"
+    output = xr.open_zarr(
+        output_path,
+        consolidated=False,
+        chunks=None,
+        decode_times=False,
+        mask_and_scale=False,
+    )
+    comparisons = 0
+    max_error = 0.0
+    weights_built = 0
+    started = time.perf_counter()
+    try:
+        grid = _reference_grid(source, source_path)
+        pairs = _validation_pairs(plan, max_samples)
+        item_names = [
+            name
+            for name in output.data_vars
+            if "lat" in output[name].dims and "lon" in output[name].dims
+        ]
+        time_indices = _validation_time_indices(int(output.sizes.get("time", 1)))
+        total = len(pairs) * len(item_names) * len(time_indices)
+        if progress:
+            print(
+                f"重采样数学验证：{len(pairs)} 个局部窗口、"
+                f"{len(time_indices)} 个时间点、{len(item_names)} 个变量；"
+                "按生产局部窗口规则计算。",
+                flush=True,
+            )
+        with TemporaryDirectory(
+            prefix=".fast-nc-zarr-validation-",
+            dir=output_path.parent,
+        ) as weight_root:
+            for window_index, (lat_index, lon_index) in enumerate(pairs, start=1):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PipelineExecutionError("任务已取消。")
+                lat_start = max(0, lat_index - 1)
+                lat_stop = min(int(plan.target_grid.lat.size), lat_index + 2)
+                lon_start = max(0, lon_index - 1)
+                lon_stop = min(int(plan.target_grid.lon.size), lon_index + 2)
+                target_tile = _tile_target(
+                    plan.target_grid,
+                    lat_start,
+                    lat_stop,
+                    lon_start,
+                    lon_stop,
+                )
+                local_target, source_lat_slice, source_lon_slice = _resolve_local_source_window(
+                    grid,
+                    target_tile,
+                    config.resampling.method,
+                )
+                if source_lat_slice is None or source_lon_slice is None:
+                    for name in item_names:
+                        for time_index in time_indices:
+                            actual = np.asarray(
+                                output[name].isel(
+                                    time=time_index,
+                                    lat=lat_index,
+                                    lon=lon_index,
+                                ).values
+                            )
+                            if not bool(np.asarray(np.isnan(actual)).all()):
+                                raise PipelineExecutionError(
+                                    "重采样数学验证失败：无源覆盖目标格点未保持缺测。"
+                                )
+                            comparisons += 1
+                    continue
+                lat_source_start = int(source_lat_slice.start)
+                lat_source_stop = int(source_lat_slice.stop)
+                lon_source_start = int(source_lon_slice.start)
+                lon_source_stop = int(source_lon_slice.stop)
+                regridder = None
+                weight_path = None
+                try:
+                    regridder, weight_path = _build_regridder(
+                        grid.lat[source_lat_slice],
+                        grid.lon[source_lon_slice],
+                        grid.lat_bounds[lat_source_start : lat_source_stop + 1],
+                        grid.lon_bounds[lon_source_start : lon_source_stop + 1],
+                        local_target,
+                        config.resampling.method,
+                        Path(weight_root),
+                        lat_attrs=dict(source.lat.attrs),
+                        lon_attrs=dict(source.lon.attrs),
+                        periodic=bool(
+                            grid.periodic
+                            and lon_source_start == 0
+                            and lon_source_stop == grid.lon.size
+                        ),
+                    )
+                    weights_built += 1
+                    for name in item_names:
+                        for time_index in time_indices:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise PipelineExecutionError("任务已取消。")
+                            source_values = source[name].isel(
+                                time=time_index,
+                                lat=source_lat_slice,
+                                lon=source_lon_slice,
+                                drop=True,
+                            ).transpose("lat", "lon")
+                            source_values = _mask_missing(source_values, None)
+                            if (
+                                config.resampling.compute_dtype == "float32"
+                                and np.issubdtype(source_values.dtype, np.floating)
+                            ):
+                                source_values = source_values.astype("float32")
+                            expected = regridder(
+                                source_values,
+                                keep_attrs=False,
+                                skipna=config.resampling.skipna,
+                                na_thres=config.resampling.na_thres,
+                            )
+                            expected_value = np.asarray(expected.values)[
+                                lat_index - lat_start,
+                                lon_index - lon_start,
+                            ]
+                            actual_value = np.asarray(
+                                output[name].isel(
+                                    time=time_index,
+                                    lat=lat_index,
+                                    lon=lon_index,
+                                ).values
+                            )
+                            expected_missing = bool(np.isnan(expected_value))
+                            actual_missing = bool(np.isnan(actual_value))
+                            if expected_missing or actual_missing:
+                                if expected_missing != actual_missing:
+                                    raise PipelineExecutionError(
+                                        f"重采样数学验证缺测语义不一致：变量={name}，"
+                                        f"time={time_index}，lat={lat_index}，lon={lon_index}"
+                                    )
+                            else:
+                                error = float(abs(float(actual_value) - float(expected_value)))
+                                scale = max(1.0, abs(float(expected_value)))
+                                tolerance = (
+                                    5e-5
+                                    if np.dtype(output[name].dtype).itemsize <= 4
+                                    else 1e-10
+                                )
+                                if error > tolerance * scale:
+                                    raise PipelineExecutionError(
+                                        f"重采样数学验证失败：变量={name}，time={time_index}，"
+                                        f"lat={lat_index}，lon={lon_index}，实际={actual_value!r}，"
+                                        f"参考={expected_value!r}"
+                                    )
+                                max_error = max(max_error, error)
+                            comparisons += 1
+                            if progress and (
+                                comparisons == 1
+                                or comparisons == total
+                                or comparisons % max(1, total // 10) == 0
+                            ):
+                                print(
+                                    f"重采样数学验证进度：{comparisons}/{total}；"
+                                    f"窗口 {window_index}/{len(pairs)}",
+                                    flush=True,
+                                )
+                            del source_values, expected
+                finally:
+                    del regridder
+                    if weight_path is not None:
+                        try:
+                            weight_path.unlink()
+                        except OSError:
+                            pass
+    finally:
+        source.close()
+        output.close()
+    return {
+        "comparisons": comparisons,
+        "max_absolute_error": max_error,
+        "xesmf_version": getattr(xe, "__version__", "unknown"),
+        "method": config.resampling.method,
+        "skipna": bool(config.resampling.skipna),
+        "na_thres": float(config.resampling.na_thres),
+        "reference_mode": reference_mode,
+        "sample_windows": len(pairs),
+        "weights_built": weights_built,
+        "elapsed": time.perf_counter() - started,
+    }
+
+
+def preview_pipeline(inspection, config: PipelineConfig) -> PipelinePlan:
+    """Build a no-write pipeline plan from an already completed inspection."""
+
+    return build_pipeline_plan(inspection, config)
+
+
+def run_pipeline(
+    inspection,
+    config: PipelineConfig,
+    *,
+    cancel_event=None,
+    progress: bool = True,
+) -> dict[str, object]:
+    """Execute conversion, optional resampling, and finalization atomically."""
+
+    plan = build_pipeline_plan(inspection, config)
+    paths = _paths(config)
+    paths.root.mkdir(parents=True, exist_ok=False)
+    manifest = {
+        "job_id": paths.root.name,
+        "status": "running",
+        "source": str(inspection.path),
+        "output": str(Path(config.general.output).expanduser().resolve()),
+        "temporary_root": str(paths.root),
+        "cleanup_intermediate": bool(config.general.cleanup_intermediate),
+        "needs_resample": bool(plan.needs_resample),
+        "source_read_window": asdict(plan.source_read_window),
+        "target_shape": plan.target_grid.dimensions,
+        "target_extent": plan.target_grid.spatial_extent,
+        "coverage_warning": plan.coverage_warning,
+        "config": asdict(config),
+        "stages": {},
+    }
+    _write_manifest(paths.manifest, manifest)
+    started = time.perf_counter()
+    current = paths.converted
+    try:
+        conversion = config.conversion
+        conversion_config = ConversionConfig(
+            output=paths.converted,
+            time_start=config.general.time_start,
+            time_end=config.general.time_end,
+            lat_min=plan.source_read_window.lat_bounds[0],
+            lat_max=plan.source_read_window.lat_bounds[1],
+            lon_min=plan.source_read_window.lon_bounds[0],
+            lon_max=plan.source_read_window.lon_bounds[1],
+            variables=conversion.variables,
+            variable_names=conversion.variable_names,
+            variable_transforms=conversion.variable_transforms,
+            auto_tune=conversion.auto_tune,
+            tune_budget=conversion.tune_budget,
+            max_workers=conversion.max_workers,
+            reserve_memory_gib=conversion.reserve_memory_gib,
+            chunks=plan.conversion_chunks,
+            overwrite=False,
+            validate=config.validate,
+        )
+        if progress:
+            print(
+                f"一条龙阶段 1/3：转换源读取窗口 "
+                f"lat={plan.source_read_window.lat_bounds}，"
+                f"lon={plan.source_read_window.lon_bounds}"
+            )
+            if plan.coverage_warning:
+                print("覆盖提醒：" + plan.coverage_warning)
+        conversion_plan, conversion_metrics = run_conversion(
+            inspection,
+            conversion_config,
+            cancel_event=cancel_event,
+        )
+        manifest["stages"]["conversion"] = {
+            "status": "validated",
+            "metrics": conversion_metrics,
+            "plan": asdict(conversion_plan),
+        }
+        _write_manifest(paths.manifest, manifest)
+        if cancel_event is not None and cancel_event.is_set():
+            raise PipelineExecutionError("任务已取消。")
+
+        validation_metrics = None
+        if plan.needs_resample:
+            resampling = config.resampling
+            resample_config = ResampleConfig(
+                input=paths.converted,
+                output=paths.resampled,
+                resolution=config.general.resolution,
+                method=resampling.method,
+                skipna=resampling.skipna,
+                na_thres=resampling.na_thres,
+                compute_dtype=resampling.compute_dtype,
+                extent="custom",
+                target_lat_bounds=(config.general.lat_min, config.general.lat_max),
+                target_lon_bounds=(config.general.lon_min, config.general.lon_max),
+                target_lat_descending=True,
+                target_lon_descending=False,
+                overwrite=False,
+                validate=config.validate,
+                tile_size=resampling.tile_size,
+                # The conversion planner has already resolved a safe time
+                # batch for its temporary layout.  Do not independently
+                # re-auto-tune it after conversion or the source and output
+                # time chunks can drift apart.
+                time_block=(
+                    plan.conversion_chunks[0]
+                    if resampling.time_block == "auto" and plan.conversion_chunks is not None
+                    else resampling.time_block
+                ),
+                compute_workers=resampling.compute_workers,
+                space_workers=resampling.space_workers,
+                temporary_dir=paths.root,
+            )
+            if progress:
+                print("一条龙阶段 2/3：xESMF 重采样到目标网格")
+            resample_metrics = run_resample(
+                resample_config,
+                cancel_event=cancel_event,
+            )
+            manifest["stages"]["resampling"] = {
+                "status": "validating_math_samples",
+                "metrics": resample_metrics,
+            }
+            _write_manifest(paths.manifest, manifest)
+            if progress:
+                print("重采样主体完成，开始局部数学验证……", flush=True)
+            validation_metrics = validate_resample_samples(
+                paths.converted,
+                paths.resampled,
+                plan,
+                config,
+                inspection=inspection,
+                cancel_event=cancel_event,
+                progress=progress,
+            )
+            manifest["stages"]["resampling"] = {
+                "status": "validated",
+                "metrics": resample_metrics,
+                "mathematical_validation": validation_metrics,
+            }
+            _write_manifest(paths.manifest, manifest)
+            current = paths.resampled
+            if config.general.cleanup_intermediate:
+                shutil.rmtree(paths.converted)
+                manifest["stages"]["conversion"]["status"] = "validated_and_cleaned"
+                _write_manifest(paths.manifest, manifest)
+
+        finalization = config.finalization
+        rechunk_config = RechunkConfig(
+            input=current,
+            output=Path(config.general.output).expanduser().resolve(),
+            strategy=finalization.strategy,
+            target_mib=finalization.target_mib,
+            custom_chunks=finalization.custom_chunks,
+            compression=finalization.compression,
+            workers=finalization.workers,
+            overwrite=config.general.overwrite,
+            validate=config.validate,
+            rechunk=True,
+            recompress=finalization.compression != "none",
+            temporary_dir=paths.root,
+        )
+        if progress:
+            print("一条龙阶段 3/3：最终重分块与重压缩")
+        rechunk_metrics = run_rechunk(rechunk_config, cancel_event=cancel_event)
+        manifest["stages"]["finalization"] = {
+            "status": "published_and_validated",
+            "metrics": rechunk_metrics,
+        }
+        if config.general.cleanup_intermediate:
+            shutil.rmtree(current, ignore_errors=False)
+            manifest["stages"]["resampling" if plan.needs_resample else "conversion"]["status"] = "validated_and_cleaned"
+        manifest["status"] = "succeeded"
+        manifest["elapsed"] = time.perf_counter() - started
+        _write_manifest(paths.manifest, manifest)
+        if progress:
+            print(f"一条龙处理完成：{config.general.output}")
+        return {
+            "output": str(Path(config.general.output).expanduser().resolve()),
+            "elapsed": manifest["elapsed"],
+            "needs_resample": plan.needs_resample,
+            "manifest": str(paths.manifest),
+            "conversion": conversion_metrics,
+            "resampling": validation_metrics,
+            "finalization": rechunk_metrics,
+        }
+    except Exception as exc:
+        manifest["status"] = "failed"
+        manifest["elapsed"] = time.perf_counter() - started
+        manifest["error"] = str(exc)
+        _write_manifest(paths.manifest, manifest)
+        if isinstance(exc, PipelineExecutionError):
+            raise
+        raise PipelineExecutionError(
+            f"一条龙处理失败；任务临时目录保留用于排查：{paths.root}\n{exc}"
+        ) from exc

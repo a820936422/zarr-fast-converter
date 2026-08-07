@@ -1,0 +1,14 @@
+# Python cache and local build products
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local converter scratch stores
+.fast_nc_zarr_*
+*.zarr.tmp/
