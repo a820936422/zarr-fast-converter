@@ -36,6 +36,7 @@ from fast_nc_zarr.pipeline.models import (  # noqa: E402
     PipelineResamplingOptions,
 )
 from fast_nc_zarr.pipeline.planner import build_pipeline_plan  # noqa: E402
+from fast_nc_zarr.models import VariableSpec  # noqa: E402
 
 
 ROOT = Path("/tmp/codex_test/fast_nc_zarr_pipeline_tests")
@@ -699,6 +700,27 @@ class PipelineTests(unittest.TestCase):
         run_pipeline(inspection, config, progress=False)
         with xr.open_zarr(config.general.output, consolidated=False, chunks=None, decode_times=False) as dataset:
             self.assertTrue(np.isnan(dataset["value"].values).all())
+
+    def test_default_variables_exclude_bounds_and_crs_metadata(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        inventory = inspection.source_inventory
+        inventory.variables["time_bnds"] = VariableSpec(
+            "time_bnds", ("time", "nv"), "datetime64[ns]", (2,), None
+        )
+        inventory.variables["crs"] = VariableSpec("crs", (), "|S1", (), None)
+        plan = build_pipeline_plan(inspection, self._config(ROOT / "metadata-plan.zarr"))
+        self.assertEqual(plan.source_selection.variables, ("value",))
+
+        config = replace(
+            self._config(ROOT / "metadata-explicit.zarr"),
+            conversion=PipelineConversionOptions(
+                variables=("value", "time_bnds"), auto_tune=False, max_workers=1
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "辅助坐标、边界或 CRS"):
+            build_pipeline_plan(inspection, config)
 
 
 if __name__ == "__main__":

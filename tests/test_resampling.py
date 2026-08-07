@@ -28,6 +28,7 @@ from fast_nc_zarr.resampling.autotune import resolve_auto_tile_size  # noqa: E40
 from fast_nc_zarr.resampling.grid import (  # noqa: E402
     GridInspectionError,
     RESAMPLING_METHODS,
+    _axis_is_uniform,
     build_target_grid,
     inspect_grid,
 )
@@ -521,6 +522,14 @@ class ResamplingTests(unittest.TestCase):
         dataset.close()
         with self.assertRaises(GridInspectionError):
             inspect_resample_input(path)
+
+    def test_float32_global_coordinates_are_treated_as_regular(self) -> None:
+        lat = np.linspace(-89.975, 89.975, 3600, dtype="float32")
+        resolution = float(np.median(np.abs(np.diff(lat.astype("float64")))))
+        self.assertTrue(_axis_is_uniform(lat, resolution))
+        irregular = lat.copy()
+        irregular[1800] += np.float32(0.001)
+        self.assertFalse(_axis_is_uniform(irregular, resolution))
 
 
 if __name__ == "__main__":

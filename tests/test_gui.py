@@ -29,7 +29,7 @@ from fast_nc_zarr.application.services import (  # noqa: E402
     save_inspection_snapshot,
     run_conversion,
 )
-from fast_nc_zarr.models import VariableTransform
+from fast_nc_zarr.models import VariableSpec, VariableTransform
 from fast_nc_zarr.gui.main_window import MainWindow  # noqa: E402
 from fast_nc_zarr.gui.workers import resolve_storage_targets  # noqa: E402
 from fast_nc_zarr.time_mapping import inspect_time_metadata  # noqa: E402
@@ -301,6 +301,31 @@ class GuiServiceTests(unittest.TestCase):
         page.recompress_checkbox.setChecked(False)
         self.assertIsNone(page.plan)
         self.assertFalse(page.run_button.isEnabled())
+        window.close()
+        app.processEvents()
+
+    def test_pipeline_disables_auxiliary_metadata_variables(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        result = inspect_source(
+            SourceInspectionConfig(ROOT / "source", engine="h5netcdf", workers=1)
+        )
+        inventory = result.source_inventory
+        inventory.variables["time_bnds"] = VariableSpec(
+            "time_bnds", ("time", "nv"), "datetime64[ns]", (2,), None
+        )
+        inventory.variables["crs"] = VariableSpec("crs", (), "|S1", (), None)
+        page = window.pipeline_page
+        page.set_inspection(result)
+        rows = {
+            page.variables.item(row, 1).text(): page.variables.cellWidget(row, 0)
+            for row in range(page.variables.rowCount())
+        }
+        self.assertTrue(rows["value"].isChecked())
+        self.assertTrue(rows["value"].isEnabled())
+        for name in ("time_bnds", "crs"):
+            self.assertFalse(rows[name].isChecked())
+            self.assertFalse(rows[name].isEnabled())
         window.close()
         app.processEvents()
 

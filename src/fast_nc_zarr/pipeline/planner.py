@@ -10,7 +10,7 @@ import numpy as np
 from ..models import CodecSpec, Inventory, OutputLayout, VariableOutputLayout
 from ..planner import resolve_conversion_plan
 from ..rechunking.compression import make_compression_plan
-from ..resampling.grid import GridInfo, _axis_bounds, build_target_grid
+from ..resampling.grid import GridInfo, _axis_bounds, _axis_is_uniform, build_target_grid
 from ..resampling.autotune import resolve_auto_time_block
 from ..resampling.models import TargetGrid
 from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo, VariableInfo
@@ -45,9 +45,9 @@ def _grid_info(inventory: Inventory) -> GridInfo:
         raise ValueError("源 lon 坐标必须严格单调。")
     lat_resolution = float(np.median(np.abs(lat_diff)))
     lon_resolution = float(np.median(np.abs(lon_diff)))
-    if not np.allclose(np.abs(lat_diff), lat_resolution, rtol=1e-5, atol=1e-10):
+    if not _axis_is_uniform(lat, lat_resolution):
         raise ValueError("源 lat 坐标不是规则网格。")
-    if not np.allclose(np.abs(lon_diff), lon_resolution, rtol=1e-5, atol=1e-10):
+    if not _axis_is_uniform(lon, lon_resolution):
         raise ValueError("源 lon 坐标不是规则网格。")
     return GridInfo(
         path=inventory.input_dir,
@@ -660,21 +660,22 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
     inventory = inspection.source_inventory
     general = config.general
     operations = config.operations
-    selected_names = config.conversion.variables or tuple(inventory.variables)
+    supported_names = tuple(
+        name for name, spec in inventory.variables.items() if spec.direct_compatible
+    )
+    selected_names = config.conversion.variables or supported_names
     unknown = sorted(set(selected_names) - set(inventory.variables))
     if unknown:
         raise ValueError("未知变量：" + ", ".join(unknown))
-    unsupported = [
-        name
-        for name in selected_names
-        if set(inventory.variables[name].dims) != {"time", "lat", "lon"}
-        or len(inventory.variables[name].dims) != 3
-    ]
+    unsupported = [name for name in selected_names if name not in supported_names]
     if unsupported:
         raise ValueError(
-            "一条龙 v1.6.0 仅支持 time/lat/lon 三维数据变量："
+            "一条龙处理仅支持 time/lat/lon 三维数值数据变量；"
+            "请取消选择辅助坐标、边界或 CRS 元数据变量："
             + ", ".join(unsupported)
         )
+    if not selected_names:
+        raise ValueError("输入中没有可用于一条龙处理的 time/lat/lon 三维数值数据变量。")
     if not (-90 <= general.lat_min < general.lat_max <= 90):
         raise ValueError("纬度范围必须满足 -90 <= min < max <= 90。")
     if not (-180 <= general.lon_min < general.lon_max <= 180):

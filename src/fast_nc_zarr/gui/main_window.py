@@ -1892,15 +1892,19 @@ class PipelinePage(QWidget):
         for name in info.variables:
             row = self.variables.rowCount()
             self.variables.insertRow(row)
+            spec = info.variables[name]
+            supported = spec.direct_compatible
             check = QCheckBox()
-            check.setChecked(True)
+            check.setChecked(supported)
+            check.setEnabled(supported)
+            if not supported:
+                check.setToolTip("辅助坐标、边界或 CRS 元数据变量不参与一条龙栅格处理。")
             check.toggled.connect(self._invalidate_plan)
             self.variables.setCellWidget(row, 0, check)
             self.variables.setItem(row, 1, QTableWidgetItem(name))
             output_name = QLineEdit(name)
             output_name.textChanged.connect(self._invalidate_plan)
             self.variables.setCellWidget(row, 2, output_name)
-            spec = info.variables[name]
             fill_edit = QLineEdit()
             fill_edit.textChanged.connect(self._invalidate_plan)
             source_fill = ", ".join(
@@ -2333,7 +2337,11 @@ class MainWindow(QMainWindow):
         def failed(details: str) -> None:
             self.task_page.append(details)
             self.task_page.failed()
-            QMessageBox.critical(self, "任务失败", details.splitlines()[0] if details else "未知错误")
+            summary = next(
+                (line.strip() for line in reversed(details.splitlines()) if line.strip()),
+                "未知错误",
+            )
+            QMessageBox.critical(self, "任务失败", summary)
 
         def cancelled() -> None:
             self.task_page.append("任务已取消。")

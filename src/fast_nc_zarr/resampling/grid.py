@@ -33,6 +33,20 @@ def _axis_bounds(values: np.ndarray) -> np.ndarray:
     bounds[-1] = values[-1] + differences[-1] / 2.0
     return bounds
 
+def _axis_is_uniform(values: np.ndarray, resolution: float) -> bool:
+    """Accept spacing noise caused by storing global coordinates as float32."""
+    values = np.asarray(values, dtype="float64")
+    scale = max(float(np.max(np.abs(values))), abs(float(resolution)), 1.0)
+    float32_quantization = abs(float(np.spacing(np.float32(scale)))) * 2.0
+    return bool(
+        np.allclose(
+            np.abs(np.diff(values)),
+            resolution,
+            rtol=1e-5,
+            atol=max(resolution * 1e-6, float32_quantization, 1e-10),
+        )
+    )
+
 
 def _validate_axis(
     dataset: xr.Dataset,
@@ -57,14 +71,7 @@ def _validate_axis(
     ):
         raise GridInspectionError(f"{name} 坐标必须严格单调。")
     resolution = float(np.median(np.abs(differences)))
-    uniform = bool(
-        np.allclose(
-            np.abs(differences),
-            resolution,
-            rtol=1e-5,
-            atol=max(resolution * 1e-6, 1e-10),
-        )
-    )
+    uniform = _axis_is_uniform(values, resolution)
     if not uniform:
         raise GridInspectionError(
             f"第一版重采样要求 {name} 为规则网格，检测到非等间距坐标。"
