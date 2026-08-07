@@ -42,6 +42,7 @@ def _dask_write(
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
     chunks: tuple[int, int, int] | None = None,
+    output_layout: OutputLayout | None = None,
     cancel_event=None,
     *,
     progress: bool = True,
@@ -150,24 +151,55 @@ def _dask_write(
         }
         if rename_map:
             ds = ds.rename(rename_map)
+
+        if output_layout is not None:
+            reversals = {
+                axis: slice(None, None, -1)
+                for axis in output_layout.axis_reversals
+            }
+            if reversals:
+                ds = ds.isel(reversals)
+            for item in output_layout.variables:
+                if item.output_name not in ds.variables:
+                    continue
+                variable = ds[item.output_name]
+                target_dtype = np.dtype(item.dtype)
+                if np.dtype(variable.dtype) != target_dtype:
+                    ds[item.output_name] = variable.astype(target_dtype)
         compressor = make_compressor(plan.compression, plan.compression_level, plan.shuffle)
         chunk_map = {"time": plan.chunk_time, "lat": plan.chunk_lat, "lon": plan.chunk_lon}
+        layout_by_output = (
+            {item.output_name: item for item in output_layout.variables}
+            if output_layout is not None
+            else {}
+        )
         encoding = {}
         for name, variable in ds.variables.items():
             if variable.ndim == 0:
                 continue
+            layout_item = layout_by_output.get(name)
             preferred = variable.encoding.get("preferred_chunks") or {}
-            encoding[name] = {
-                "chunks": tuple(
+            variable_chunks = (
+                layout_item.chunks
+                if layout_item is not None
+                else tuple(
                     min(
                         variable.sizes[dim],
                         chunk_map.get(dim, preferred.get(dim, variable.sizes[dim])),
                     )
                     for dim in variable.dims
                 )
-            }
-            if name in ds.data_vars and compressor is not None:
-                encoding[name]["compressors"] = [compressor]
+            )
+            entry = {"chunks": variable_chunks}
+            if layout_item is not None:
+                codec = layout_item.codec
+                if codec is not None:
+                    from .writer import compressor_from_spec
+
+                    entry["compressors"] = [compressor_from_spec(codec)]
+            elif name in ds.data_vars and compressor is not None:
+                entry["compressors"] = [compressor]
+            encoding[name] = entry
         delayed = ds.to_zarr(
             output,
             mode="w",
@@ -284,8 +316,6 @@ def convert(
     staging = make_staging_path(output, "convert")
     try:
         if plan.strategy == "dask":
-            if output_layout is not None:
-                raise ValueError("Dask 回退路径暂不能直接消费最终输出布局。")
             metrics = _dask_write(
                 inventory,
                 selection,
@@ -294,6 +324,7 @@ def convert(
                 variable_transforms=variable_transforms,
                 variable_names=variable_names,
                 chunks=chunks,
+                output_layout=output_layout,
                 cancel_event=cancel_event,
                 progress=progress,
             )

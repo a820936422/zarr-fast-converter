@@ -20,7 +20,7 @@ from fast_nc_zarr.inspection import (  # noqa: E402
 from fast_nc_zarr.cli import _date_label  # noqa: E402
 from fast_nc_zarr.engine import convert  # noqa: E402
 from fast_nc_zarr.benchmark import representative_selection, tune  # noqa: E402
-from fast_nc_zarr.models import ConversionPlan, Selection  # noqa: E402
+from fast_nc_zarr.models import CodecSpec, ConversionPlan, OutputLayout, Selection, VariableOutputLayout
 from fast_nc_zarr.selection import make_selection, parse_list  # noqa: E402
 from fast_nc_zarr.validation import validate_output  # noqa: E402
 from fast_nc_zarr.writer import direct_write  # noqa: E402
@@ -263,6 +263,51 @@ class EndToEndTests(unittest.TestCase):
         with xr.open_zarr(output, chunks=None, consolidated=False) as actual:
             self.assertEqual(set(actual.sizes), {"time", "lat", "lon"})
             self.assertEqual(set(actual.data_vars), {"temperature", "scalar"})
+
+    def test_dask_fallback_consumes_output_layout(self) -> None:
+        inventory = inspect_dataset(
+            ROOT / "aliased",
+            dimension_names=("time", "latitude", "longitude"),
+            workers=1,
+            progress=False,
+        )
+        selection = make_selection(inventory, variables=["temperature", "scalar"])
+        output = ROOT / "aliased-dask-layout-output.zarr"
+        shape = selection.shape
+        codec = CodecSpec("blosc", level=1, cname="zstd")
+        layout = OutputLayout(
+            variables=(
+                VariableOutputLayout(
+                    "temperature", "temperature", ("time", "lat", "lon"),
+                    shape, "float32", (2, 6, 8), codec=codec,
+                ),
+                VariableOutputLayout(
+                    "time", "time", ("time",), (shape[0],),
+                    str(inventory.times.dtype), (shape[0],), codec=codec, is_coord=True,
+                ),
+                VariableOutputLayout(
+                    "lat", "lat", ("lat",), (shape[1],),
+                    str(inventory.lat_values.dtype), (shape[1],), codec=codec, is_coord=True,
+                ),
+                VariableOutputLayout(
+                    "lon", "lon", ("lon",), (shape[2],),
+                    str(inventory.lon_values.dtype), (shape[2],), codec=codec, is_coord=True,
+                ),
+            )
+        )
+        plan, _ = convert(
+            inventory,
+            selection,
+            output,
+            auto_tune=False,
+            output_layout=layout,
+            validate=True,
+            progress=False,
+        )
+        self.assertEqual(plan.strategy, "dask")
+        with xr.open_zarr(output, chunks=None, consolidated=False) as actual:
+            self.assertEqual(actual.temperature.encoding["chunks"], (2, 6, 8))
+            self.assertEqual(tuple(actual.temperature.dims), ("time", "lat", "lon"))
 
 
 if __name__ == "__main__":
