@@ -20,6 +20,7 @@ from fast_nc_zarr import __version__  # noqa: E402
 
 from fast_nc_zarr.application.services import (  # noqa: E402
     ConversionConfig,
+    InspectionResult,
     RechunkConfig,
     SourceInspectionConfig,
     inspect_source,
@@ -34,6 +35,15 @@ from fast_nc_zarr.models import VariableSpec, VariableTransform
 from fast_nc_zarr.gui.main_window import MainWindow  # noqa: E402
 from fast_nc_zarr.gui.workers import resolve_storage_targets  # noqa: E402
 from fast_nc_zarr.time_mapping import inspect_time_metadata  # noqa: E402
+from fast_nc_zarr.pipeline.models import (  # noqa: E402
+    PipelineChunkingOptions,
+    PipelineConfig,
+    PipelineGeneralConfig,
+    PipelineInput,
+    PipelineOperations,
+    PipelineResamplingOptions,
+)
+from fast_nc_zarr.pipeline.recovery import PipelineRecovery  # noqa: E402
 
 
 ROOT = Path("/tmp/codex_test/fast_nc_zarr_gui_tests")
@@ -44,8 +54,8 @@ class VersionTests(unittest.TestCase):
     def test_window_title_displays_release_version(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = MainWindow()
-        self.assertEqual(__version__, "1.6.2")
-        self.assertIn("v1.6.2", window.windowTitle())
+        self.assertEqual(__version__, "1.6.3")
+        self.assertIn("v1.6.3", window.windowTitle())
         window.close()
         app.processEvents()
 
@@ -178,7 +188,7 @@ class GuiServiceTests(unittest.TestCase):
         window = MainWindow()
         self.assertEqual(window.navigation.count(), 6)
         self.assertEqual(window.stack.count(), 6)
-        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.2")
+        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.3")
         self.assertEqual(
             [
                 window.navigation.item(index).text()
@@ -355,6 +365,67 @@ class GuiServiceTests(unittest.TestCase):
         self.assertFalse(config.operations.resample)
         self.assertTrue(config.operations.recompress)
         self.assertEqual(window.navigation.currentRow(), 4)
+        window.close()
+        app.processEvents()
+
+    def test_temporary_pipeline_restores_plan_and_continue_action(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        zarr = inspect_zarr(ROOT / "input.zarr")
+        config = PipelineConfig(
+            input=PipelineInput(kind="zarr"),
+            general=PipelineGeneralConfig(
+                output=ROOT / "resumed-output.zarr",
+                temporary_dir=ROOT / "resume-temp",
+                lat_min=10,
+                lat_max=40,
+                lon_min=100,
+                lon_max=140,
+                cleanup_intermediate=True,
+            ),
+            operations=PipelineOperations(True, True, True),
+            resampling=PipelineResamplingOptions(
+                resolution=0.5,
+                method="conservative",
+                time_block=3,
+                compute_workers=1,
+                space_workers=2,
+            ),
+            chunking=PipelineChunkingOptions(strategy="space", target_mib=64, workers=2),
+        )
+        recovery = PipelineRecovery(
+            ROOT / "resume-job",
+            ROOT / "resume-job" / "manifest.json",
+            ROOT / "input.zarr",
+            "conversion",
+            zarr.zarr_info,
+            config,
+            {},
+            "临时处理产物检查通过",
+        )
+        result = InspectionResult(
+            kind="temporary",
+            path=ROOT / "input.zarr",
+            report=recovery.report,
+            dataset_info=zarr.zarr_info,
+            recovery=recovery,
+        )
+        window._workflow_zarr_ready(result)
+        page = window.pipeline_page
+        self.assertEqual(
+            window.inspection_page.input_kind.findData("temporary"), 2
+        )
+        self.assertEqual(page.run_button.text(), "继续执行")
+        self.assertTrue(page.run_button.isEnabled())
+        restored = page._config()
+        self.assertEqual(restored.input.kind, "zarr")
+        self.assertEqual(restored.general.output, ROOT / "resumed-output.zarr")
+        self.assertEqual(restored.resampling.method, "conservative")
+        self.assertEqual(restored.resampling.time_block, 3)
+        self.assertEqual(restored.resampling.space_workers, 2)
+        self.assertTrue(restored.operations.resample)
+        self.assertTrue(restored.operations.rechunk)
+        self.assertTrue(restored.operations.recompress)
         window.close()
         app.processEvents()
 

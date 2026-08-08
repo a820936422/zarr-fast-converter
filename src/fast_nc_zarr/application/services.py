@@ -56,6 +56,11 @@ from ..resampling.models import (
     ResampleInspection,
     ResamplePlan,
 )
+from ..pipeline.recovery import (
+    PipelineRecovery,
+    inspect_pipeline_recovery,
+    mark_recovery_succeeded,
+)
 from ..engine import convert as core_convert
 from ..time_mapping import (
     FilenameField,
@@ -88,7 +93,7 @@ class SourceInspectionConfig:
 class InspectionResult:
     """A checked source or Zarr input kept by the GUI session."""
 
-    kind: Literal["source", "zarr"]
+    kind: Literal["source", "zarr", "temporary"]
     path: Path
     report: str
     inventory: Inventory | None = None
@@ -97,6 +102,7 @@ class InspectionResult:
     mode: str | None = None
     warnings: list[str] = field(default_factory=list)
     time_inspection: TimeInspectionResult | None = None
+    recovery: PipelineRecovery | None = None
     time_rule: TimeRule | None = None
 
     @property
@@ -468,6 +474,16 @@ def inspect_zarr(path: Path) -> InspectionResult:
         dataset_info=info,
     )
 
+def inspect_temporary_pipeline(path: Path) -> InspectionResult:
+    recovery = inspect_pipeline_recovery(Path(path))
+    return InspectionResult(
+        kind="temporary",
+        path=recovery.checkpoint,
+        report=recovery.report,
+        dataset_info=recovery.info,
+        recovery=recovery,
+    )
+
 
 def inspect_resample(path: Path) -> ResampleInspection:
     """Inspect a Zarr input for the xESMF resampling page."""
@@ -795,17 +811,21 @@ def run_pipeline(
     cancel_event=None,
     progress: bool = True,
 ):
-    """Run the unified raw/Zarr input pipeline and publish one final Zarr."""
-
     from ..pipeline.engine import run_pipeline as core_run_pipeline
 
-    return core_run_pipeline(
+    result = core_run_pipeline(
         inspection,
         config,
         cancel_event=cancel_event,
         progress=progress,
     )
-
+    if inspection.kind == "temporary" and inspection.recovery is not None:
+        mark_recovery_succeeded(
+            inspection.recovery,
+            result,
+            cleanup=bool(config.general.cleanup_intermediate),
+        )
+    return result
 
 def format_resample_preview(preview: ResamplePreview) -> str:
     return format_resample_plan(preview.plan)

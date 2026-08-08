@@ -22,7 +22,9 @@ sys.path.insert(0, str(PROJECT / "src"))
 from fast_nc_zarr.application.services import (  # noqa: E402
     SourceInspectionConfig,
     inspect_source,
+    inspect_temporary_pipeline,
     inspect_zarr,
+    run_pipeline as run_pipeline_service,
 )
 from fast_nc_zarr.pipeline.engine import (  # noqa: E402
     PipelineExecutionError,
@@ -347,7 +349,7 @@ class PipelineTests(unittest.TestCase):
                 manifest = json.loads(
                     Path(result["manifest"]).read_text(encoding="utf-8")
                 )
-                self.assertEqual(manifest["schema_version"], 4)
+                self.assertEqual(manifest["schema_version"], 5)
                 self.assertEqual(manifest["input_kind"], "raw")
                 self.assertEqual(
                     manifest["requested_operation_order"],
@@ -784,8 +786,67 @@ class PipelineTests(unittest.TestCase):
         manifest = json.loads((roots[0] / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "failed")
         self.assertEqual(manifest["failed_stage"], "resampling")
+        self.assertEqual(
+            manifest["resume"]["checkpoints"]["conversion"]["path"],
+            "source-crop.zarr",
+        )
         self.assertTrue((roots[0] / "source-crop.zarr" / "zarr.json").is_file())
         self.assertFalse(config.general.output.exists())
+
+    def test_failed_conversion_checkpoint_resumes_remaining_pipeline(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        temporary = ROOT / "resume-temporary"
+        base = self._config(ROOT / "resume-output.zarr")
+        config = replace(
+            base,
+            general=replace(
+                base.general,
+                temporary_dir=temporary,
+                cleanup_intermediate=True,
+            ),
+        )
+        with (
+            patch("fast_nc_zarr.pipeline.engine.validate_resampling_environment"),
+            patch(
+                "fast_nc_zarr.pipeline.engine.run_resample",
+                side_effect=RuntimeError("simulated worker failure"),
+            ),
+        ):
+            with self.assertRaisesRegex(PipelineExecutionError, "simulated worker failure"):
+                run_pipeline(inspection, config, progress=False)
+        original_job = next((temporary / "fast-nc-zarr-pipeline").iterdir())
+        legacy_manifest_path = original_job / "manifest.json"
+        legacy_payload = json.loads(legacy_manifest_path.read_text(encoding="utf-8"))
+        legacy_payload["source"] = "/old-machine/source"
+        legacy_payload["temporary_root"] = "/old-machine/temp/job"
+        legacy_payload["config"]["general"]["temporary_dir"] = "/old-machine/temp"
+        legacy_manifest_path.write_text(
+            json.dumps(legacy_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        recovered = inspect_temporary_pipeline(temporary)
+        self.assertEqual(recovered.kind, "temporary")
+        self.assertTrue(recovered.path.is_relative_to(temporary))
+        self.assertEqual(recovered.recovery.config.general.temporary_dir, temporary)
+        self.assertEqual(recovered.zarr_info.shape, (2, 6, 6))
+        self.assertTrue(recovered.recovery.config.operations.resample)
+        self.assertTrue(recovered.recovery.config.operations.rechunk)
+        self.assertTrue(recovered.recovery.config.operations.recompress)
+        result = run_pipeline_service(
+            recovered,
+            recovered.recovery.config,
+            progress=False,
+        )
+        self.assertTrue((Path(result["output"]) / "zarr.json").is_file())
+        self.assertGreater(result["mathematical_validation"]["comparisons"], 0)
+        original_manifest = json.loads(
+            recovered.recovery.manifest_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(original_manifest["status"], "resumed_succeeded")
+        self.assertTrue(original_manifest["retained_checkpoints_cleaned"])
+        self.assertFalse(recovered.recovery.checkpoint.exists())
 
 
 if __name__ == "__main__":

@@ -198,11 +198,11 @@ def _reference_grid(source, source_path: Path) -> GridInfo:
     )
 
 
-def _validation_pairs(plan: PipelinePlan, maximum: int) -> list[tuple[int, int]]:
+def _validation_pairs(target_grid, maximum: int) -> list[tuple[int, int]]:
     """Select deterministic windows across edges, centre and interior."""
 
-    lat_indices = _sample_indices(int(plan.target_grid.lat.size))
-    lon_indices = _sample_indices(int(plan.target_grid.lon.size))
+    lat_indices = _sample_indices(int(target_grid.lat.size))
+    lon_indices = _sample_indices(int(target_grid.lon.size))
     candidates = [(lat, lon) for lat in lat_indices for lon in lon_indices]
     if not candidates:
         return []
@@ -222,7 +222,7 @@ def _validation_time_indices(size: int) -> list[int]:
 def validate_resample_samples(
     source_path: Path,
     output_path: Path,
-    plan: PipelinePlan,
+    target_grid,
     config: PipelineConfig,
     inspection=None,
     *,
@@ -280,7 +280,7 @@ def validate_resample_samples(
     after_statistics = replacement_statistics.get("after", {})
     try:
         grid = _reference_grid(source, source_path)
-        pairs = _validation_pairs(plan, max_samples)
+        pairs = _validation_pairs(target_grid, max_samples)
         item_names = [
             name
             for name in output.data_vars
@@ -303,11 +303,11 @@ def validate_resample_samples(
                 if cancel_event is not None and cancel_event.is_set():
                     raise PipelineExecutionError("任务已取消。")
                 lat_start = max(0, lat_index - 1)
-                lat_stop = min(int(plan.target_grid.lat.size), lat_index + 2)
+                lat_stop = min(int(target_grid.lat.size), lat_index + 2)
                 lon_start = max(0, lon_index - 1)
-                lon_stop = min(int(plan.target_grid.lon.size), lon_index + 2)
+                lon_stop = min(int(target_grid.lon.size), lon_index + 2)
                 target_tile = _tile_target(
-                    plan.target_grid,
+                    target_grid,
                     lat_start,
                     lat_stop,
                     lon_start,
@@ -499,11 +499,11 @@ def _run_zarr_pipeline(
     if plan.finalization_required:
         physical_stages.append("finalization")
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "job_id": paths.root.name,
         "status": "running",
         "source": str(inspection.path),
-        "input_kind": "zarr",
+        "input_kind": getattr(inspection, "kind", "zarr"),
         "output": str(output),
         "temporary_root": str(paths.root),
         "cleanup_intermediate": bool(config.general.cleanup_intermediate),
@@ -526,18 +526,37 @@ def _run_zarr_pipeline(
             asdict(plan.final_compression) if plan.final_compression is not None else None
         ),
         "stages": {},
+        "resume": {"schema_version": 1, "checkpoints": {}},
     }
     _write_manifest(paths.manifest, manifest)
     started = time.perf_counter()
     current = Path(inspection.path).expanduser().resolve()
     resample_metrics = None
     finalization_metrics = None
+    validation_metrics = None
+    resuming = getattr(inspection, "kind", None) == "temporary"
+    current_stage = "preparation"
     try:
         if plan.needs_resample:
             options = config.resampling
-            resample_output = paths.resampled if plan.finalization_required else output
+            direct_resample_target = not plan.finalization_required
+            if resuming and direct_resample_target:
+                validate_publish_target(
+                    output,
+                    overwrite=config.general.overwrite,
+                    operation="临时产物续跑重采样",
+                    require_zarr_v3=True,
+                )
+            resample_output = (
+                paths.final_staging
+                if resuming and direct_resample_target
+                else paths.resampled
+                if plan.finalization_required
+                else output
+            )
             if progress:
                 print(f"统一流程阶段 1/{len(physical_stages)}：重采样现有 Zarr")
+            current_stage = "resampling"
             resample_metrics = run_resample(
                 ResampleConfig(
                     input=current,
@@ -552,7 +571,11 @@ def _run_zarr_pipeline(
                     target_lon_bounds=(config.general.lon_min, config.general.lon_max),
                     target_lat_descending=True,
                     target_lon_descending=False,
-                    overwrite=config.general.overwrite if not plan.finalization_required else False,
+                    overwrite=(
+                        config.general.overwrite
+                        if direct_resample_target and not resuming
+                        else False
+                    ),
                     validate=config.validate,
                     tile_size=options.tile_size,
                     time_block=options.time_block,
@@ -572,10 +595,46 @@ def _run_zarr_pipeline(
             )
             current = resample_output
             manifest["stages"]["resampling"] = {
-                "status": "validated" if plan.finalization_required else "published_as_final",
+                "status": "validating_math_samples" if resuming else "validated"
+                if plan.finalization_required
+                else "published_as_final",
                 "metrics": resample_metrics,
             }
             _write_manifest(paths.manifest, manifest)
+            if resuming:
+                if plan.resample_plan is None:
+                    raise PipelineExecutionError("恢复任务缺少重采样计划。")
+                current_stage = "mathematical_validation"
+                if progress:
+                    print("重采样主体完成，开始恢复任务数学验证……", flush=True)
+                validation_metrics = validate_resample_samples(
+                    Path(inspection.path),
+                    resample_output,
+                    plan.resample_plan.target,
+                    config,
+                    cancel_event=cancel_event,
+                    progress=progress,
+                    replacement_statistics=resample_metrics.get("replacement_statistics"),
+                )
+                manifest["stages"]["resampling"]["mathematical_validation"] = validation_metrics
+                manifest["stages"]["resampling"]["status"] = "validated"
+                if direct_resample_target:
+                    publish_staging(
+                        paths.final_staging,
+                        output,
+                        "pipeline-resume",
+                        overwrite=config.general.overwrite,
+                        require_zarr_v3=True,
+                    )
+                    manifest["stages"]["resampling"]["status"] = "published_as_final"
+                    current = output
+                else:
+                    manifest["resume"]["checkpoints"]["resampling"] = {
+                        "path": "resampled.zarr",
+                        "status": "validated",
+                        "dimensions": dict(plan.resample_plan.target.dimensions),
+                    }
+                _write_manifest(paths.manifest, manifest)
         if cancel_event is not None and cancel_event.is_set():
             raise PipelineExecutionError("任务已取消。")
         if plan.finalization_required:
@@ -585,6 +644,7 @@ def _run_zarr_pipeline(
                     f"统一流程阶段 {len(physical_stages)}/{len(physical_stages)}："
                     "应用最终 chunks/codec"
                 )
+            current_stage = "finalization"
             finalization_metrics = run_rechunk(
                 RechunkConfig(
                     input=current,
@@ -650,10 +710,12 @@ def _run_zarr_pipeline(
             "conversion": None,
             "resampling": resample_metrics,
             "finalization": finalization_metrics,
+            "mathematical_validation": validation_metrics,
             "logical_io": logical_io,
         }
     except Exception as exc:
         manifest["status"] = "failed"
+        manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started
         manifest["error"] = str(exc)
         _write_manifest(paths.manifest, manifest)
@@ -702,7 +764,7 @@ def run_pipeline(
     if plan.finalization_required:
         physical_stages.append("finalization")
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "job_id": paths.root.name,
         "status": "running",
         "source": str(inspection.path),
@@ -725,6 +787,7 @@ def run_pipeline(
         "target_extent": plan.target_grid.spatial_extent,
         "coverage_warning": plan.coverage_warning,
         "config": asdict(config),
+        "resume": {"schema_version": 1, "checkpoints": {}},
         "stages": {},
     }
     _write_manifest(paths.manifest, manifest)
@@ -790,6 +853,20 @@ def run_pipeline(
             "metrics": conversion_metrics,
             "plan": asdict(conversion_plan),
         }
+        if not conversion_is_final:
+            manifest["resume"]["checkpoints"]["conversion"] = {
+                "path": "source-crop.zarr",
+                "status": "validated",
+                "dimensions": {
+                    "time": plan.source_selection.shape[0],
+                    "lat": plan.source_read_window.lat_shape,
+                    "lon": plan.source_read_window.lon_shape,
+                },
+                "variables": [
+                    config.conversion.variable_names.get(name, name)
+                    for name in plan.source_selection.variables
+                ],
+            }
         _write_manifest(paths.manifest, manifest)
         if cancel_event is not None and cancel_event.is_set():
             raise PipelineExecutionError("任务已取消。")
@@ -861,7 +938,7 @@ def run_pipeline(
             validation_metrics = validate_resample_samples(
                 paths.converted,
                 resample_output,
-                plan,
+                plan.target_grid,
                 config,
                 inspection=inspection,
                 cancel_event=cancel_event,
@@ -873,6 +950,12 @@ def run_pipeline(
                 "metrics": resample_metrics,
                 "mathematical_validation": validation_metrics,
             }
+            if not resampling_is_final:
+                manifest["resume"]["checkpoints"]["resampling"] = {
+                    "path": "resampled.zarr",
+                    "status": "validated",
+                    "dimensions": dict(plan.target_grid.dimensions),
+                }
             if resampling_is_final:
                 publish_staging(
                     paths.final_staging,

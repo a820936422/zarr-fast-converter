@@ -53,6 +53,7 @@ from ..application.services import (
     SourceInspectionConfig,
     inspect_source,
     inspect_zarr,
+    inspect_temporary_pipeline,
     inspect_resample,
     preview_conversion,
     preview_rechunk,
@@ -63,10 +64,11 @@ from ..application.services import (
     format_resample_preview,
     save_inspection_snapshot,
     load_inspection_snapshot,
+    preview_pipeline,
+    run_pipeline,
 )
 from ..rechunking.planning import DEFAULT_TARGET_MIB, default_workers
 from ..models import VariableTransform
-from ..pipeline.engine import preview_pipeline, run_pipeline
 from ..pipeline.models import (
     PipelineChunkingOptions,
     PipelineCompressionOptions,
@@ -404,6 +406,7 @@ class InspectionPage(QWidget):
         self.input_kind = QComboBox()
         self.input_kind.addItem("原始 NC / HDF / TIFF", "raw")
         self.input_kind.addItem("现有 Zarr v3", "zarr")
+        self.input_kind.addItem("临时处理产物", "temporary")
         form.addRow("输入类型", self.input_kind)
         path_row, self.path = self._path_row("选择源目录", directory=True)
         form.addRow("输入目录", path_row)
@@ -469,14 +472,23 @@ class InspectionPage(QWidget):
         self.input_kind.currentIndexChanged.connect(self._input_kind_changed)
 
     def _input_kind_changed(self, *_args) -> None:
-        is_zarr = self.input_kind.currentData() == "zarr"
-        self.time_check_button.setText("检查现有 Zarr" if is_zarr else "检查文件时间维度信息")
-        self.engine.setEnabled(not is_zarr)
-        self.recursive.setEnabled(not is_zarr)
-        self.inspect_workers.setEnabled(not is_zarr)
-        self.time_panel.setVisible(not is_zarr)
-        self.mapping_group.setVisible(not is_zarr)
-        self.confirm_time_button.setVisible(not is_zarr)
+        kind = self.input_kind.currentData()
+        is_zarr = kind == "zarr"
+        is_temporary = kind == "temporary"
+        is_processed = is_zarr or is_temporary
+        self.time_check_button.setText(
+            "检查临时处理产物"
+            if is_temporary
+            else "检查现有 Zarr"
+            if is_zarr
+            else "检查文件时间维度信息"
+        )
+        self.engine.setEnabled(not is_processed)
+        self.recursive.setEnabled(not is_processed)
+        self.inspect_workers.setEnabled(not is_processed)
+        self.time_panel.setVisible(not is_processed)
+        self.mapping_group.setVisible(not is_processed)
+        self.confirm_time_button.setVisible(not is_processed)
 
     def _path_row(self, dialog_title: str, *, directory: bool) -> tuple[QWidget, Any]:
         row = QWidget()
@@ -509,6 +521,14 @@ class InspectionPage(QWidget):
         if not path:
             QMessageBox.warning(self, "缺少输入", "请选择源数据目录。")
             return
+        if self.input_kind.currentData() == "temporary":
+            self.status.setText("正在检查临时任务清单和已验证的中间 Zarr。")
+            self.task_requested.emit(
+                "检查临时处理产物",
+                lambda: inspect_temporary_pipeline(Path(path)),
+                self._temporary_inspection_done,
+            )
+            return
         if self.input_kind.currentData() == "zarr":
             self.status.setText("正在检查现有 Zarr 元数据。")
             self.task_requested.emit(
@@ -540,6 +560,13 @@ class InspectionPage(QWidget):
         self.result = result
         self.report.setPlainText(result.report)
         self.status.setText("Zarr 检查完成，请进入处理流程选择操作。")
+        self.save_button.setEnabled(False)
+        self.zarr_result_ready.emit(result)
+
+    def _temporary_inspection_done(self, result: InspectionResult) -> None:
+        self.result = result
+        self.report.setPlainText(result.report)
+        self.status.setText("临时处理产物可用，请进入处理流程继续执行。")
         self.save_button.setEnabled(False)
         self.zarr_result_ready.emit(result)
 
@@ -1565,6 +1592,7 @@ class PipelinePage(QWidget):
         super().__init__(parent)
         self.inspection: InspectionResult | None = None
         self.plan = None
+        self.recovery = None
         root = QVBoxLayout(self)
         title = QLabel("统一处理流程")
         title.setObjectName("pageTitle")
@@ -1877,14 +1905,78 @@ class PipelinePage(QWidget):
             widget.setEnabled(enabled)
         self._update_operation_state()
 
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, value: object) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _apply_recovery_config(self, config: PipelineConfig) -> None:
+        general = config.general
+        self.output.setText(str(general.output))
+        self.temporary_dir.setText(
+            str(general.temporary_dir) if general.temporary_dir is not None else ""
+        )
+        for widget, value in (
+            (self.time_start, general.time_start),
+            (self.time_end, general.time_end),
+        ):
+            date = QDate.fromString(str(value or ""), Qt.DateFormat.ISODate)
+            if date.isValid():
+                widget.setDate(date)
+        self.lat_min.setValue(general.lat_min)
+        self.lat_max.setValue(general.lat_max)
+        self.lon_min.setValue(general.lon_min)
+        self.lon_max.setValue(general.lon_max)
+        self.cleanup_intermediate.setChecked(general.cleanup_intermediate)
+        operations = config.operations
+        self.resample_checkbox.setChecked(operations.resample)
+        self.rechunk_checkbox.setChecked(operations.rechunk)
+        self.recompress_checkbox.setChecked(operations.recompress)
+        resampling = config.resampling
+        self.resolution.setValue(resampling.resolution)
+        self._set_combo_data(self.method, resampling.method)
+        self.skipna.setChecked(resampling.skipna)
+        self.na_thres.setValue(resampling.na_thres)
+        self._set_combo_data(self.compute_dtype, resampling.compute_dtype)
+        self.before_conditions.setText(resampling.before_conditions)
+        self.before_results.setText(resampling.before_results)
+        self.after_conditions.setText(resampling.after_conditions)
+        self.after_results.setText(resampling.after_results)
+        self._set_combo_data(self.statistics_policy, resampling.statistics_policy)
+        chunking = config.chunking
+        self._set_combo_data(self.strategy, chunking.strategy)
+        self.target_mib.setValue(chunking.target_mib)
+        self.final_workers.setValue(chunking.workers)
+        if chunking.custom_chunks is not None:
+            for box, value in zip(self.custom_chunks, chunking.custom_chunks):
+                box.setValue(value)
+        compression = config.compression
+        self._set_combo_data(self.compression, compression.codec)
+        if compression.level is not None:
+            self.compression_level.setValue(compression.level)
+        self._set_combo_data(self.compression_shuffle, compression.shuffle)
+
     def set_inspection(self, result: InspectionResult) -> None:
         self.inspection = result
-        if result.kind == "zarr":
+        self.recovery = result.recovery
+        self.plan = None
+        self.run_button.setText("开始处理")
+        self.run_button.setEnabled(False)
+        if result.kind in {"zarr", "temporary"}:
             self.variables.setRowCount(0)
             self.conversion_checkbox.setChecked(False)
             self.conversion_group.setVisible(False)
-            self.status.setText("现有 Zarr 检查结果已载入，请至少选择一项处理操作。")
             self._set_enabled(True)
+            if result.kind == "temporary" and result.recovery is not None:
+                self._apply_recovery_config(result.recovery.config)
+                self.plan = result.recovery
+                self.run_button.setText("继续执行")
+                self.run_button.setEnabled(True)
+                self.report.setPlainText(result.recovery.report)
+                self.status.setText("恢复计划已载入，可直接继续执行；修改参数后需重新生成计划。")
+            else:
+                self.status.setText("现有 Zarr 检查结果已载入，请至少选择一项处理操作。")
             return
         self.conversion_checkbox.setChecked(True)
         self.conversion_group.setVisible(True)
@@ -2001,21 +2093,25 @@ class PipelinePage(QWidget):
             raise ValueError("请选择最终输出目录。")
         strategy = self.strategy.currentData()
         custom = tuple(box.value() for box in self.custom_chunks) if strategy == "custom" else None
-        is_zarr = self.inspection.kind == "zarr"
+        is_processed = self.inspection.kind in {"zarr", "temporary"}
+        recovery_config = self.recovery.config if self.recovery is not None else None
         selected_variables = self._selected_variables()
-        if not is_zarr and not selected_variables:
+        if not is_processed and not selected_variables:
             raise ValueError("至少选择一个转换变量。")
-        if is_zarr and not any(
+        if is_processed and not any(
             (
                 self.resample_checkbox.isChecked(),
                 self.rechunk_checkbox.isChecked(),
                 self.recompress_checkbox.isChecked(),
             )
         ):
-            raise ValueError("现有 Zarr 输入至少需要选择一项处理操作。")
+            raise ValueError("现有 Zarr 或临时检查点至少需要选择一项处理操作。")
         variable_names, variable_transforms = self._variable_settings()
+        recovered_resampling = (
+            recovery_config.resampling if recovery_config is not None else None
+        )
         return PipelineConfig(
-            input=PipelineInput(kind="zarr" if is_zarr else "raw"),
+            input=PipelineInput(kind="zarr" if is_processed else "raw"),
             general=PipelineGeneralConfig(
                 output=Path(self.output.text().strip()),
                 temporary_dir=Path(self.temporary_dir.text().strip()) if self.temporary_dir.text().strip() else None,
@@ -2026,6 +2122,11 @@ class PipelinePage(QWidget):
                 lon_min=self.lon_min.value(),
                 lon_max=self.lon_max.value(),
                 cleanup_intermediate=self.cleanup_intermediate.isChecked(),
+                overwrite=(
+                    recovery_config.general.overwrite
+                    if recovery_config is not None
+                    else False
+                ),
             ),
             conversion=PipelineConversionOptions(
                 variables=selected_variables,
@@ -2046,6 +2147,26 @@ class PipelinePage(QWidget):
                 skipna=self.skipna.isChecked(),
                 na_thres=self.na_thres.value(),
                 compute_dtype=self.compute_dtype.currentData(),
+                tile_size=(
+                    recovered_resampling.tile_size
+                    if recovered_resampling is not None
+                    else "auto"
+                ),
+                time_block=(
+                    recovered_resampling.time_block
+                    if recovered_resampling is not None
+                    else "auto"
+                ),
+                compute_workers=(
+                    recovered_resampling.compute_workers
+                    if recovered_resampling is not None
+                    else 2
+                ),
+                space_workers=(
+                    recovered_resampling.space_workers
+                    if recovered_resampling is not None
+                    else "auto"
+                ),
                 before_conditions=self.before_conditions.text().strip(),
                 before_results=self.before_results.text().strip(),
                 after_conditions=self.after_conditions.text().strip(),
@@ -2059,11 +2180,16 @@ class PipelinePage(QWidget):
                 workers=self.final_workers.value(),
             ),
             compression=PipelineCompressionOptions(
-                profile="balanced",
+                profile=(
+                    recovery_config.compression.profile
+                    if recovery_config is not None
+                    else "balanced"
+                ),
                 codec=self.compression.currentData(),
                 level=self.compression_level.value(),
                 shuffle=self.compression_shuffle.currentData(),
             ),
+            validate=(recovery_config.validate if recovery_config is not None else True),
         )
 
     def _request_preview(self) -> None:

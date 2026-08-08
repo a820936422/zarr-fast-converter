@@ -544,8 +544,8 @@ def _replacement_rules(config: PipelineConfig):
 
 
 def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipelinePlan:
-    if getattr(inspection, "kind", None) != "zarr" or inspection.dataset_info is None:
-        raise ValueError("现有 Zarr 流程要求已完成 Zarr 输入检查。")
+    if getattr(inspection, "kind", None) not in {"zarr", "temporary"} or inspection.dataset_info is None:
+        raise ValueError("现有 Zarr 或临时检查点流程要求已完成输入检查。")
     operations = config.operations
     before_replacements, after_replacements = _replacement_rules(config)
     if not (operations.resample or operations.rechunk or operations.recompress):
@@ -653,7 +653,9 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
         raise ValueError("input_kind 必须是 auto、raw 或 zarr。")
     if requested_kind == "raw" and inspection_kind != "source":
         raise ValueError("input_kind=raw 要求已完成原始数据检查。")
-    if requested_kind == "zarr" or (requested_kind == "auto" and inspection_kind == "zarr"):
+    if requested_kind == "zarr" or (
+        requested_kind == "auto" and inspection_kind in {"zarr", "temporary"}
+    ):
         return build_zarr_pipeline_plan(inspection, config)
     if inspection_kind != "source" or inspection.inventory is None:
         raise ValueError("一条龙模块必须使用已完成的数据检查结果。")
