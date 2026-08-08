@@ -169,10 +169,59 @@ class Selection:
 
 @dataclass(frozen=True)
 class StorageProfile:
+    """Storage classification plus the evidence behind it.
+
+    The first four fields retain the original positional API.  ``rotational``
+    is the trusted value used by legacy callers, while ``reported_rotational``
+    preserves an untrusted kernel/sysfs report (notably for WSL virtual disks).
+    """
+
     path: Path
     device: str
     rotational: bool | None
     filesystem: str
+    medium: Literal["ssd", "hdd", "network", "unknown", "virtual_unknown"] = (
+        "unknown"
+    )
+    reported_rotational: bool | None = None
+    confidence: Literal["high", "medium", "low", "unknown"] = "unknown"
+    mountpoint: Path | None = None
+    evidence: tuple[str, ...] = ()
+    override: Literal["auto", "ssd", "hdd", "network"] = "auto"
+
+    def to_dict(self, *, redact_paths: bool = False) -> dict[str, Any]:
+        """Return a JSON-safe summary; runtime manifests can redact host paths."""
+
+        if redact_paths:
+            evidence = []
+            safe_values = {"classification", "filesystem", "override", "sysfs_rotational"}
+            for item in self.evidence:
+                parts = item.split(":")
+                evidence.append(
+                    ":".join(parts[:2])
+                    if parts[0] in safe_values and len(parts) > 1
+                    else parts[0]
+                )
+        else:
+            evidence = list(self.evidence)
+        return {
+            "path": "<redacted>" if redact_paths else str(self.path),
+            "device": "<redacted>" if redact_paths else self.device,
+            "rotational": self.rotational,
+            "filesystem": self.filesystem,
+            "medium": self.medium,
+            "reported_rotational": self.reported_rotational,
+            "confidence": self.confidence,
+            "mountpoint": (
+                "<redacted>"
+                if redact_paths and self.mountpoint is not None
+                else str(self.mountpoint)
+                if self.mountpoint is not None
+                else None
+            ),
+            "evidence": evidence,
+            "override": self.override,
+        }
 
 
 @dataclass(frozen=True)

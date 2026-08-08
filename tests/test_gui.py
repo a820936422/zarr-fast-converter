@@ -86,8 +86,8 @@ class VersionTests(unittest.TestCase):
     def test_window_title_displays_release_version(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = MainWindow()
-        self.assertEqual(__version__, "1.6.6")
-        self.assertIn("v1.6.6", window.windowTitle())
+        self.assertEqual(__version__, "1.6.7")
+        self.assertIn("v1.6.7", window.windowTitle())
         window.close()
         app.processEvents()
 
@@ -309,7 +309,7 @@ class GuiServiceTests(unittest.TestCase):
         window = MainWindow()
         self.assertEqual(window.navigation.count(), 6)
         self.assertEqual(window.stack.count(), 6)
-        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.6")
+        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.7")
         self.assertEqual(
             [
                 window.navigation.item(index).text()
@@ -431,9 +431,11 @@ class GuiServiceTests(unittest.TestCase):
         self.assertEqual(config.resampling.resolution, 0.1)
         self.assertEqual(config.resampling.before_conditions, "<0, >100")
         self.assertEqual(config.resampling.before_results, "0, 100")
-        self.assertEqual(config.compression.profile, "balanced")
-        self.assertEqual(config.compression.codec, "blosc-zstd")
-        self.assertEqual(config.compression.level, 4)
+        self.assertEqual(config.compression.profile, "auto")
+        self.assertIsNone(config.compression.codec)
+        self.assertIsNone(config.compression.level)
+        self.assertEqual(config.compression.objective, "balanced")
+        self.assertEqual(config.chunking.workers, "auto")
         self.assertTrue(page.resampling_group.isEnabled())
         self.assertTrue(page.chunking_group.isEnabled())
         self.assertTrue(page.compression_group.isEnabled())

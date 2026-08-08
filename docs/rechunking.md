@@ -24,7 +24,7 @@ python -m fast_nc_zarr.rechunking --help
 - `space`：提高单时间切片空间场读取连续性。
 - `custom`：使用 `--chunks '[time,lat,lon]'` 明确指定。
 
-自动策略以 `--target-chunk-mib` 为目标，默认 128 MiB，并根据实际 shape、dtype、worker 内存预算和安全上下限调整。
+自动策略以 `--target-chunk-mib` 为目标，默认 128 MiB，并根据实际 shape、dtype、当前进程 CPU/内存边界和安全上下限调整。`workers=auto` 会在真实临时/输出文件系统上分别实测两阶段候选；显式整数仍作为硬上限。
 
 ## 常用命令
 
@@ -70,13 +70,14 @@ pixi run rechunk -- --input /data/input.zarr --output /data/output.zarr --strate
 ## 工作流
 
 1. 读取 Zarr v3 根元数据、变量 shape、chunks、dtype、codec 和属性。
-2. 生成 `ChunkPlan` 与 `CompressionPlan`。
+2. 生成 `ChunkPlan`；自动压缩时以最终 chunk 形状抽取有界 begin/middle/end 真实数据，比较无损 Zstd/LZ4 候选的写入、fsync、冷热读取和体积。
 3. chunks、codec 和 metadata 等价时，将独立文件复制到 staging 后校验发布，不创建 hardlink。
 4. 数据物理 chunks 相同但 codec 不同时，逐源物理 chunk 单阶段解码并写最终 codec。
-5. chunks 不同时，阶段一按源 chunks 写入对齐中间布局，阶段二按最终 chunk 有界合并。
-6. 抽样逐值校验后原子发布。
+5. chunks 不同时，阶段一按真实源 chunks 实测并发后写入对齐中间布局；阶段二按最终物理 region 重新实测并发，再有界合并。
+6. 所有自动压缩候选逐值验证；从 Pareto 前沿按 speed、balanced 或 compact 目标选择。
+7. 抽样逐值校验后原子发布；worker 和压缩完整报告随 metrics 返回。
 
-所有进程池使用 `spawn`。worker 数受 CPU、未压缩块内存和源/目标磁盘关系限制；同一机械硬盘会主动降低并发，避免顺序 I/O 退化为随机寻道。
+所有进程池使用 `spawn`。worker 先受当前进程 affinity/cgroup CPU、有效可用内存和物理 chunk ownership 约束，再由真实样本吞吐选择；网络/9p/低置信存储只收敛候选，不替代实测。显式 worker 仍是硬上限。
 
 ## Python 入口
 

@@ -74,6 +74,10 @@ def _as_auto_int(value: Any) -> int | str:
     return "auto" if value == "auto" else int(value)
 
 
+def _as_auto_worker(value: Any) -> int | str:
+    return "auto" if value == "auto" else int(value)
+
+
 def _restore_config(
     payload: dict[str, Any], temporary_base: Path, checkpoint_stage: str
 ) -> PipelineConfig:
@@ -112,6 +116,9 @@ def _restore_config(
             lon_max=float(general.get("lon_max", 180.0)),
             cleanup_intermediate=bool(general.get("cleanup_intermediate", False)),
             overwrite=bool(general.get("overwrite", False)),
+            source_storage=str(general.get("source_storage", "auto")),
+            temporary_storage=str(general.get("temporary_storage", "auto")),
+            output_storage=str(general.get("output_storage", "auto")),
         ),
         conversion=PipelineConversionOptions(
             variables=tuple(str(item) for item in conversion.get("variables") or ()),
@@ -154,7 +161,7 @@ def _restore_config(
             strategy=str(chunking.get("strategy", "time")),
             target_mib=float(chunking.get("target_mib", 128.0)),
             custom_chunks=tuple(int(item) for item in custom) if custom else None,
-            workers=int(chunking.get("workers", 1)),
+            workers=_as_auto_worker(chunking.get("workers", "auto")),
         ),
         compression=PipelineCompressionOptions(
             profile=str(compression.get("profile", "balanced")),
@@ -165,6 +172,8 @@ def _restore_config(
                 else None
             ),
             shuffle=str(compression.get("shuffle", "auto")),
+            objective=str(compression.get("objective", "balanced")),
+            tune_budget=float(compression.get("tune_budget", 60.0)),
         ),
         validate=bool(data.get("validate", True)),
         semantic_constraints={

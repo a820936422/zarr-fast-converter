@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import sys
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,8 @@ from fast_nc_zarr.rechunking.engine import (  # noqa: E402
     RechunkExecutionError,
     _intermediate_shards,
     _parallel_workers,
+    _stage2_benchmark_regions,
+    _stage2_benchmark_tasks,
     _stage2_safe_workers,
     run_rechunk,
 )
@@ -208,6 +211,59 @@ class RechunkingTests(unittest.TestCase):
             )
             self.assertEqual(result.attrs["title"], "rechunk test")
 
+    def test_auto_compression_benchmarks_real_chunks_and_publishes_selection(self) -> None:
+        source = ROOT / "input.zarr"
+        output = ROOT / "auto-compression.zarr"
+        info = inspect_store(source)
+        plan = plan_chunks(info, "custom", custom_chunks=(2, 4, 5))
+
+        metrics = run_rechunk(
+            source,
+            output,
+            info,
+            plan,
+            make_compression_plan("auto"),
+            workers=1,
+            progress=False,
+            compression_objective="balanced",
+            compression_tune_budget_seconds=5,
+        )
+
+        self.assertIsNotNone(metrics["compression_tuning"])
+        self.assertNotEqual(metrics["selected_compression"]["profile"], "auto")
+        self.assertTrue(
+            all(item["sample_count"] >= 2 for item in metrics["compression_tuning"]["results"] if item["success"])
+        )
+        self.assertTrue(output.is_dir())
+        with xr.open_zarr(output, consolidated=False, chunks=None) as result:
+            np.testing.assert_array_equal(
+                result["integer_value"].values,
+                np.arange(6 * 8 * 10, dtype="int16").reshape(6, 8, 10),
+            )
+
+    def test_auto_compression_aborts_when_no_candidate_is_safe(self) -> None:
+        source = ROOT / "input.zarr"
+        output = ROOT / "unsafe-auto-compression.zarr"
+        info = inspect_store(source)
+        plan = plan_chunks(info, "custom", custom_chunks=(2, 4, 5))
+        failed_report = SimpleNamespace(selected=None, cancelled=False)
+
+        with patch(
+            "fast_nc_zarr.rechunking.engine.benchmark_compression_candidates",
+            return_value=failed_report,
+        ):
+            with self.assertRaisesRegex(RechunkExecutionError, "没有通过无损验证"):
+                run_rechunk(
+                    source,
+                    output,
+                    info,
+                    plan,
+                    make_compression_plan("auto"),
+                    workers=1,
+                    progress=False,
+                )
+        self.assertFalse(output.exists())
+
     def test_failed_equivalent_copy_preserves_existing_target(self) -> None:
         source = ROOT / "input.zarr"
         output = ROOT / "protected-target.zarr"
@@ -266,6 +322,49 @@ class RechunkingTests(unittest.TestCase):
         ):
             ssd_workers, _ = _parallel_workers(Path("/source"), Path("/target"), 8)
         self.assertEqual(ssd_workers, 8)
+        overridden_network = StorageProfile(
+            Path("/source"), "network-a", None, "ext4", medium="network", override="network"
+        )
+        overridden_ssd = StorageProfile(
+            Path("/target"), "ssd-b", False, "9p", medium="ssd", override="ssd"
+        )
+        with patch("fast_nc_zarr.rechunking.engine.os.cpu_count", return_value=16):
+            limited, _ = _parallel_workers(
+                Path("/source"),
+                Path("/target"),
+                8,
+                source_profile=overridden_network,
+                target_profile=overridden_ssd,
+            )
+            unrestricted, _ = _parallel_workers(
+                Path("/target"),
+                Path("/other"),
+                8,
+                source_profile=overridden_ssd,
+                target_profile=StorageProfile(
+                    Path("/other"), "ssd-c", False, "9p", medium="ssd", override="ssd"
+                ),
+            )
+        self.assertEqual(limited, 2)
+        self.assertEqual(unrestricted, 8)
+
+    def test_stage2_benchmark_uses_final_time_chunk_geometry(self) -> None:
+        info = inspect_store(ROOT / "input.zarr")
+        plan = plan_chunks(info, "custom", custom_chunks=(2, 4, 5))
+        regions = {
+            variable.name: tuple(1 if dim == "time" else chunk for dim, chunk in zip(variable.dims, variable.chunks))
+            for variable in info.data_variables
+        }
+        samples = _stage2_benchmark_regions(info, plan, regions)
+        tasks = _stage2_benchmark_tasks(info, plan, samples, 8)
+
+        for variable in info.data_variables:
+            time_axis = variable.dims.index("time")
+            self.assertEqual(samples[variable.name][time_axis], 2)
+        for variable_name, starts, _stops in tasks:
+            variable = next(item for item in info.data_variables if item.name == variable_name)
+            for dim, start in zip(variable.dims, starts):
+                self.assertEqual(start % plan.dim_chunks[dim], 0)
 
         info = inspect_store(ROOT / "input.zarr")
         plan = plan_chunks(info, "custom", custom_chunks=(2, 4, 5))

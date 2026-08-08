@@ -153,6 +153,28 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(plan.decision("rechunking").requested, rechunk)
                 self.assertEqual(plan.decision("recompression").requested, recompress)
 
+
+    def test_auto_compression_reserves_runtime_benchmark_finalization(self) -> None:
+        inspection = inspect_zarr(ROOT / "canonical-input.zarr")
+        base = self._config(ROOT / "zarr-auto-compression.zarr")
+        config = replace(
+            base,
+            input=PipelineInput(kind="zarr"),
+            operations=PipelineOperations(resample=True, recompress=True),
+            compression=PipelineCompressionOptions(
+                profile="auto", objective="balanced", tune_budget=5
+            ),
+        )
+
+        plan = preview_pipeline(inspection, config)
+
+        self.assertTrue(plan.finalization_required)
+        self.assertEqual(plan.final_compression.profile, "auto")
+        self.assertEqual(
+            plan.decision("recompression").disposition,
+            "executed_as_stage",
+        )
+        self.assertIn("真实代表性数据", plan.decision("recompression").reason)
     def test_zarr_pipeline_executes_rechunk_only(self) -> None:
         inspection = inspect_zarr(ROOT / "canonical-input.zarr")
         base = self._config(ROOT / "zarr-rechunked.zarr")

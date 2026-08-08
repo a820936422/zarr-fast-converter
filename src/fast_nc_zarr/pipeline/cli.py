@@ -18,6 +18,15 @@ from .models import (
 )
 
 
+
+def _parse_workers(value: str) -> int | str:
+    if value.strip().lower() == "auto":
+        return "auto"
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("workers 必须是正整数或 auto")
+    return parsed
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pixi run pipeline",
@@ -32,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, required=True, help="最终 Zarr 目录。")
     parser.add_argument("--temporary-dir", type=Path, help="临时处理根目录。")
+    for role in ("source", "temporary", "output"):
+        parser.add_argument(
+            f"--{role}-storage",
+            choices=("auto", "ssd", "hdd", "network"),
+            default="auto",
+        )
     parser.add_argument("--time", nargs=2, metavar=("START", "END"), help="时间起止日期。")
     parser.add_argument("--lat", nargs=2, type=float, metavar=("MIN", "MAX"), default=(-90.0, 90.0))
     parser.add_argument("--lon", nargs=2, type=float, metavar=("MIN", "MAX"), default=(-180.0, 180.0))
@@ -62,7 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy", choices=("time", "space", "custom"), default="time")
     parser.add_argument("--target-mib", type=float, default=128.0)
     parser.add_argument("--custom-chunks", nargs=3, type=int)
-    parser.add_argument("--compression", choices=("fast", "balanced", "maximum"), default="balanced")
+    parser.add_argument(
+        "--compression",
+        choices=("auto", "fast", "balanced", "maximum"),
+        default="auto",
+    )
     parser.add_argument(
         "--compression-codec",
         choices=("blosc-zstd", "blosc-lz4", "blosc-lz4hc", "blosc-zlib", "zstd", "gzip"),
@@ -74,7 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "noshuffle", "shuffle", "bitshuffle"),
         default="auto",
     )
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--compression-objective",
+        choices=("speed", "balanced", "compact"),
+        default="balanced",
+    )
+    parser.add_argument("--compression-tune-budget", type=float, default=60.0)
+    parser.add_argument("--workers", type=_parse_workers, default="auto")
     parser.add_argument("--mode", choices=("auto", "complete", "filename"), default="auto")
     parser.add_argument("--engine", default="auto")
     parser.add_argument("--recursive", action="store_true")
@@ -154,6 +179,9 @@ def main(argv: list[str] | None = None) -> int:
             lon_max=args.lon[1],
             cleanup_intermediate=args.cleanup_intermediate,
             overwrite=args.overwrite,
+            source_storage=args.source_storage,
+            temporary_storage=args.temporary_storage,
+            output_storage=args.output_storage,
         ),
         conversion=PipelineConversionOptions(
             variables=tuple(args.variables or ()),
@@ -190,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
             codec=args.compression_codec,
             level=args.compression_level,
             shuffle=args.compression_shuffle,
+            objective=args.compression_objective,
+            tune_budget=args.compression_tune_budget,
         ),
         validate=not args.no_validate,
     )

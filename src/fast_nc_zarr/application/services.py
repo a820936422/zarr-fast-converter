@@ -272,7 +272,7 @@ class RechunkConfig:
     target_mib: float = DEFAULT_TARGET_MIB
     custom_chunks: tuple[int, int, int] | None = None
     compression: str = "none"
-    workers: int = 1
+    workers: int | str = 1
     overwrite: bool = False
     validate: bool = True
     # ``compression_only`` is retained for callers of the previous two-page
@@ -285,6 +285,9 @@ class RechunkConfig:
     compression_codec: str | None = None
     compression_level: int | None = None
     compression_shuffle: str = "auto"
+    compression_objective: str = "balanced"
+    compression_tune_budget: float = 60.0
+    storage_overrides: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -747,7 +750,7 @@ def preview_rechunk(config: RechunkConfig, info: DatasetInfo | None = None) -> R
         info,
         strategy,  # type: ignore[arg-type]
         target_mib=config.target_mib,
-        workers=config.workers,
+        workers=(None if config.workers == "auto" else config.workers),
         custom_chunks=custom,
     )
     compression = make_compression_plan(
@@ -772,12 +775,15 @@ def run_rechunk(
         preview.info,
         preview.plan,
         preview.compression,
-        workers=max(1, int(config.workers)),
+        workers=config.workers,
         overwrite=config.overwrite,
         progress=True,
         validate=config.validate,
         cancel_event=cancel_event,
         temporary_dir=config.temporary_dir,
+        compression_objective=config.compression_objective,
+        compression_tune_budget_seconds=config.compression_tune_budget,
+        storage_overrides=config.storage_overrides,
     )
 
 

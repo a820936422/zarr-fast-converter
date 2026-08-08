@@ -23,6 +23,9 @@ class PipelineGeneralConfig:
     lon_max: float = 180.0
     cleanup_intermediate: bool = False
     overwrite: bool = False
+    source_storage: Literal["auto", "ssd", "hdd", "network"] = "auto"
+    temporary_storage: Literal["auto", "ssd", "hdd", "network"] = "auto"
+    output_storage: Literal["auto", "ssd", "hdd", "network"] = "auto"
 
 
 @dataclass(frozen=True)
@@ -79,12 +82,12 @@ class PipelineChunkingOptions:
     strategy: Literal["time", "space", "custom"] = "time"
     target_mib: float = 128.0
     custom_chunks: tuple[int, int, int] | None = None
-    workers: int = 1
+    workers: int | Literal["auto"] = "auto"
 
 
 @dataclass(frozen=True)
 class PipelineCompressionOptions:
-    profile: Literal["fast", "balanced", "maximum"] = "balanced"
+    profile: Literal["auto", "fast", "balanced", "maximum"] = "auto"
     codec: Literal[
         "blosc-zstd",
         "blosc-lz4",
@@ -95,6 +98,8 @@ class PipelineCompressionOptions:
     ] | None = None
     level: int | None = None
     shuffle: Literal["auto", "noshuffle", "shuffle", "bitshuffle"] = "auto"
+    objective: Literal["speed", "balanced", "compact"] = "balanced"
+    tune_budget: float = 60.0
 
 
 @dataclass(frozen=True)

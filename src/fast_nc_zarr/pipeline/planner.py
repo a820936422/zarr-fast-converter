@@ -355,7 +355,11 @@ def _final_layout(
             info,
             config.chunking.strategy,
             target_mib=config.chunking.target_mib,
-            workers=config.chunking.workers,
+            workers=(
+                None
+                if config.chunking.workers == "auto"
+                else config.chunking.workers
+            ),
             custom_chunks=config.chunking.custom_chunks,
         )
     else:
@@ -775,7 +779,11 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
             target_info,
             config.chunking.strategy,
             target_mib=config.chunking.target_mib,
-            workers=config.chunking.workers,
+            workers=(
+                None
+                if config.chunking.workers == "auto"
+                else config.chunking.workers
+            ),
             custom_chunks=config.chunking.custom_chunks,
         )
     else:
@@ -795,6 +803,9 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
             "none", None, "未请求重压缩，保持上游 codec。", codec="none"
         )
     )
+    compression_auto = bool(
+        operations.recompress and compression.profile == "auto"
+    )
     storage_requested = operations.rechunk or operations.recompress
     output_layout = (
         _zarr_output_layout(
@@ -806,7 +817,11 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
         if operations.resample
         else None
     )
-    if resample_plan is not None and output_layout is not None:
+    if (
+        resample_plan is not None
+        and output_layout is not None
+        and not compression_auto
+    ):
         resample_plan = replace(
             resample_plan,
             output_chunks={
@@ -814,11 +829,15 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
             },
             output_layout=output_layout,
         )
-    finalization_required = storage_requested and not operations.resample
-    storage_disposition = (
-        "fused_into_resampling" if operations.resample else "executed_as_stage"
+    finalization_required = storage_requested and (
+        not operations.resample or compression_auto
     )
-    storage_stage = "重采样阶段" if operations.resample else "最终化阶段"
+    storage_disposition = (
+        "executed_as_stage"
+        if finalization_required
+        else "fused_into_resampling"
+    )
+    storage_stage = "最终化阶段" if finalization_required else "重采样阶段"
     decisions = (
         OperationDecision("conversion", False, "not_requested", "现有 Zarr 输入跳过转换。"),
         OperationDecision(
@@ -837,7 +856,13 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
             "recompression",
             operations.recompress,
             storage_disposition if operations.recompress else "not_requested",
-            f"由{storage_stage}应用目标 codec。" if operations.recompress else "用户未请求重压缩。",
+            (
+                "在真实代表性数据和最终输出文件系统上实测无损 codec，由最终化阶段应用选择结果。"
+                if compression_auto
+                else f"由{storage_stage}应用目标 codec。"
+                if operations.recompress
+                else "用户未请求重压缩。"
+            ),
         ),
     )
     return ZarrPipelinePlan(
@@ -1077,15 +1102,22 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
         inventory.variables[name].direct_compatible for name in selected_names
     )
     storage_requested = operations.rechunk or operations.recompress
+    compression_auto = bool(
+        operations.recompress and final_compression.profile == "auto"
+    )
     chunk_ownership_safe = bool(
         needs_resample
         or not storage_requested
         or _conversion_tasks_own_physical_chunks(conversion_chunks, output_layout)
     )
     finalization_required = storage_requested and (
-        not direct_layout or not chunk_ownership_safe
+        compression_auto or not direct_layout or not chunk_ownership_safe
     )
-    if not direct_layout:
+    if compression_auto:
+        finalization_reason = (
+            "压缩方案需要在真实代表性数据和最终输出文件系统上实测，使用最终化阶段。"
+        )
+    elif not direct_layout:
         finalization_reason = "终端写入器无法直接满足目标存储布局，使用最终化阶段。"
     elif not chunk_ownership_safe:
         finalization_reason = (

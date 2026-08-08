@@ -86,6 +86,7 @@ from ..pipeline.models import (
 from ..selection import parse_list
 from ..time_mapping import TimeInspectionResult, TimeRule, TimeFieldOption, inspect_time_metadata
 from .workers import TaskWorker
+from .path_picker import PathPicker, PathPickerSettings
 
 try:
     import pyqtgraph as pg
@@ -513,8 +514,14 @@ class InspectionPage(QWidget):
     zarr_result_ready = Signal(object)
     result_invalidated = Signal()
 
-    def __init__(self, parent=None) -> None:
+    def __init__(
+        self,
+        parent=None,
+        *,
+        path_settings: PathPickerSettings | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.path_settings = path_settings or PathPickerSettings()
         self.result: InspectionResult | None = None
         self.time_result: TimeInspectionResult | None = None
         root = QVBoxLayout(self)
@@ -530,8 +537,14 @@ class InspectionPage(QWidget):
         self.input_kind.addItem("现有 Zarr v3", "zarr")
         self.input_kind.addItem("临时处理产物", "temporary")
         form.addRow("输入类型", self.input_kind)
-        path_row, self.path = self._path_row("选择源目录", directory=True)
-        form.addRow("输入目录", path_row)
+        self.path = PathPicker(
+            role="inspection_input",
+            dialog_title="选择源目录",
+            mode="directory",
+            accessible_name="检查输入目录路径",
+            settings=self.path_settings,
+        )
+        form.addRow("输入目录", self.path)
         self.engine = QComboBox()
         for label, value in (
             ("自动", "auto"),
@@ -620,31 +633,6 @@ class InspectionPage(QWidget):
         self.mapping_group.setVisible(not is_processed)
         self.confirm_time_button.setVisible(not is_processed)
 
-    def _path_row(self, dialog_title: str, *, directory: bool) -> tuple[QWidget, Any]:
-        row = QWidget()
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
-        edit = QLineEdit()
-        button = QPushButton("浏览…")
-        if directory:
-            button.clicked.connect(lambda: self._choose_directory(edit, dialog_title))
-        else:
-            button.clicked.connect(lambda: self._choose_file(edit, dialog_title))
-        layout.addWidget(edit, 1)
-        layout.addWidget(button)
-        return row, edit
-
-    @staticmethod
-    def _choose_directory(edit, title: str) -> None:
-        value = QFileDialog.getExistingDirectory(edit, title, edit.text() or str(Path.cwd()))
-        if value:
-            edit.setText(value)
-
-    @staticmethod
-    def _choose_file(edit, title: str) -> None:
-        value, _ = QFileDialog.getOpenFileName(edit, title, edit.text() or str(Path.cwd()))
-        if value:
-            edit.setText(value)
 
     def _request_time_inspection(self) -> None:
         path = self.path.text().strip()
@@ -784,14 +772,20 @@ class InspectionPage(QWidget):
     def _save_snapshot(self) -> None:
         if self.result is None:
             return
+        default_path = str(self.result.path / "inspection.json")
         value, _ = QFileDialog.getSaveFileName(
             self,
             "保存检查快照",
-            str(self.result.path / "inspection.json"),
+            self.path_settings.dialog_start(
+                "inspection_snapshot_save", default_path, "save_file"
+            ),
             "JSON 文件 (*.json)",
         )
         if not value:
             return
+        self.path_settings.remember_selection(
+            "inspection_snapshot_save", value, "save_file"
+        )
         try:
             save_inspection_snapshot(self.result, Path(value))
             self.status.setText(f"检查快照已保存：{value}")
@@ -802,11 +796,16 @@ class InspectionPage(QWidget):
         value, _ = QFileDialog.getOpenFileName(
             self,
             "导入检查快照",
-            str(Path.cwd()),
+            self.path_settings.dialog_start(
+                "inspection_snapshot_open", "", "open_file"
+            ),
             "检查快照 (*.json);;JSON 文件 (*.json)",
         )
         if not value:
             return
+        self.path_settings.remember_selection(
+            "inspection_snapshot_open", value, "open_file"
+        )
         try:
             result = load_inspection_snapshot(Path(value))
         except Exception as exc:  # noqa: BLE001
@@ -830,8 +829,14 @@ class ConversionPage(QWidget):
     task_requested = Signal(str, object, object)
     result_ready = Signal(object)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(
+        self,
+        parent=None,
+        *,
+        path_settings: PathPickerSettings | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.path_settings = path_settings or PathPickerSettings()
         self.inspection: InspectionResult | None = None
         self.preview: ConversionPreview | None = None
         root = QVBoxLayout(self)
@@ -863,13 +868,14 @@ class ConversionPage(QWidget):
         self.lon_max = self._number_box(180)
         form.addRow("经度范围", self._range_row(self.lon_min, self.lon_max))
 
-        self.output = QLineEdit()
-        output_row = QWidget()
-        output_layout = QHBoxLayout(output_row)
-        output_layout.setContentsMargins(0, 0, 0, 0)
-        output_layout.addWidget(self.output, 1)
-        output_layout.addWidget(_button("浏览…", self._choose_output))
-        form.addRow("输出 Zarr", output_row)
+        self.output = PathPicker(
+            role="conversion_output",
+            dialog_title="选择输出 Zarr 目录",
+            mode="save_file",
+            accessible_name="转换输出 Zarr 路径",
+            settings=self.path_settings,
+        )
+        form.addRow("输出 Zarr", self.output)
         root.addWidget(settings)
 
         variables_group = QGroupBox("变量选择与输出设置")
@@ -999,12 +1005,6 @@ class ConversionPage(QWidget):
             self.output.setText(str(result.path.parent / f"{result.path.name}.zarr"))
         self.status.setText("检查结果已载入，请选择范围并预览计划。")
 
-    def _choose_output(self) -> None:
-        value = QFileDialog.getSaveFileName(
-            self, "选择输出 Zarr 目录", self.output.text() or str(Path.cwd())
-        )[0]
-        if value:
-            self.output.setText(value)
 
     def _selected_variables(self) -> tuple[str, ...]:
         return tuple(
@@ -1154,8 +1154,15 @@ class RechunkPage(QWidget):
     task_requested = Signal(str, object, object)
     result_ready = Signal(object)
 
-    def __init__(self, *, compression_only: bool = False, parent=None) -> None:
+    def __init__(
+        self,
+        *,
+        compression_only: bool = False,
+        parent=None,
+        path_settings: PathPickerSettings | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.path_settings = path_settings or PathPickerSettings()
         self.info = None
         self.preview: RechunkPreview | None = None
         root = QVBoxLayout(self)
@@ -1171,12 +1178,17 @@ class RechunkPage(QWidget):
 
         input_group = QGroupBox("Zarr 输入")
         form = QFormLayout(input_group)
-        self.input = QLineEdit()
+        self.input = PathPicker(
+            role="rechunk_input",
+            dialog_title="选择输入 Zarr",
+            mode="directory",
+            accessible_name="优化输入 Zarr 路径",
+            settings=self.path_settings,
+        )
         input_row = QWidget()
         input_layout = QHBoxLayout(input_row)
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.addWidget(self.input, 1)
-        input_layout.addWidget(_button("浏览…", self._choose_input))
         input_layout.addWidget(_button("检查", self._request_inspection))
         form.addRow("输入 Zarr v3", input_row)
         self.input_status = QLabel("尚未检查输入。")
@@ -1227,18 +1239,19 @@ class RechunkPage(QWidget):
             self.compression.addItem(label, value)
         self.compression.setCurrentIndex(2)
         options_form.addRow("压缩方案", self.compression)
-        temporary_row = QWidget()
-        temporary_layout = QHBoxLayout(temporary_row)
-        temporary_layout.setContentsMargins(0, 0, 0, 0)
-        self.temporary_dir = QLineEdit()
+        self.temporary_dir = PathPicker(
+            role="rechunk_temporary",
+            dialog_title="选择临时处理目录（建议选择 SSD）",
+            mode="directory",
+            accessible_name="优化中间处理目录路径",
+            settings=self.path_settings,
+        )
         self.temporary_dir.setPlaceholderText("可选；同时勾选两项时建议选择 SSD 目录")
         self.temporary_dir.setToolTip(
             "仅用于阶段间反复读取的中间 Zarr；最终输出仍直接写入输出目录所在磁盘，"
             "任务完成后自动删除。"
         )
-        temporary_layout.addWidget(self.temporary_dir, 1)
-        temporary_layout.addWidget(_button("浏览…", self._choose_temporary_dir))
-        options_form.addRow("中间处理目录", temporary_row)
+        options_form.addRow("中间处理目录", self.temporary_dir)
         self.workers = QSpinBox()
         self.workers.setRange(1, 128)
         self.workers.setValue(default_workers())
@@ -1252,16 +1265,17 @@ class RechunkPage(QWidget):
 
         output_group = QGroupBox("输出")
         output_form = QFormLayout(output_group)
-        self.output = QLineEdit()
+        self.output = PathPicker(
+            role="rechunk_output",
+            dialog_title="选择输出 Zarr",
+            mode="save_file",
+            accessible_name="优化输出 Zarr 路径",
+            settings=self.path_settings,
+        )
         self._output_manually_set = False
         self._updating_output = False
         self.output.textChanged.connect(self._output_changed)
-        output_row = QWidget()
-        output_layout = QHBoxLayout(output_row)
-        output_layout.setContentsMargins(0, 0, 0, 0)
-        output_layout.addWidget(self.output, 1)
-        output_layout.addWidget(_button("浏览…", self._choose_output))
-        output_form.addRow("输出 Zarr", output_row)
+        output_form.addRow("输出 Zarr", self.output)
         root.addWidget(output_group)
 
         actions = QHBoxLayout()
@@ -1318,24 +1332,6 @@ class RechunkPage(QWidget):
             selected.append("重压缩")
         return " + ".join(selected) if selected else "未选择操作"
 
-    def _choose_input(self) -> None:
-        value = QFileDialog.getExistingDirectory(self, "选择输入 Zarr", self.input.text() or str(Path.cwd()))
-        if value:
-            self.input.setText(value)
-
-    def _choose_output(self) -> None:
-        value = QFileDialog.getSaveFileName(self, "选择输出 Zarr", self.output.text() or str(Path.cwd()))[0]
-        if value:
-            self.output.setText(value)
-
-    def _choose_temporary_dir(self) -> None:
-        value = QFileDialog.getExistingDirectory(
-            self,
-            "选择临时处理目录（建议选择 SSD）",
-            self.temporary_dir.text() or str(Path.cwd()),
-        )
-        if value:
-            self.temporary_dir.setText(value)
 
     def _request_inspection(self) -> None:
         if not self.input.text().strip():
@@ -1448,8 +1444,14 @@ class ResamplePage(QWidget):
 
     task_requested = Signal(str, object, object)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(
+        self,
+        parent=None,
+        *,
+        path_settings: PathPickerSettings | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.path_settings = path_settings or PathPickerSettings()
         self.inspection = None
         self.preview: ResamplePreview | None = None
         root = QVBoxLayout(self)
@@ -1466,12 +1468,17 @@ class ResamplePage(QWidget):
 
         input_group = QGroupBox("Zarr 输入")
         form = QFormLayout(input_group)
-        self.input = QLineEdit()
+        self.input = PathPicker(
+            role="resample_input",
+            dialog_title="选择输入 Zarr",
+            mode="directory",
+            accessible_name="重采样输入 Zarr 路径",
+            settings=self.path_settings,
+        )
         input_row = QWidget()
         input_layout = QHBoxLayout(input_row)
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.addWidget(self.input, 1)
-        input_layout.addWidget(_button("浏览…", self._choose_input))
         input_layout.addWidget(_button("检查", self._request_inspection))
         form.addRow("输入 Zarr v3", input_row)
         self.input_status = QLabel("尚未检查输入。")
@@ -1545,18 +1552,19 @@ class ResamplePage(QWidget):
         self.space_workers.setValue(6)
         self.space_workers.setEnabled(False)
         options_form.addRow("空间并行进程数", self.space_workers)
-        temporary_row = QWidget()
-        temporary_layout = QHBoxLayout(temporary_row)
-        temporary_layout.setContentsMargins(0, 0, 0, 0)
-        self.temporary_dir = QLineEdit()
+        self.temporary_dir = PathPicker(
+            role="resample_temporary",
+            dialog_title="选择重采样中间处理目录（建议 SSD）",
+            mode="directory",
+            accessible_name="重采样中间处理目录路径",
+            settings=self.path_settings,
+        )
         self.temporary_dir.setPlaceholderText("可选；建议选择 SSD 目录")
         self.temporary_dir.setToolTip(
             "大时间 chunk 的中转 Zarr 和 xESMF 权重写入此目录；成功后自动删除，"
             "失败时保留中间目录用于排查。"
         )
-        temporary_layout.addWidget(self.temporary_dir, 1)
-        temporary_layout.addWidget(_button("浏览…", self._choose_temporary_dir))
-        options_form.addRow("中间处理目录", temporary_row)
+        options_form.addRow("中间处理目录", self.temporary_dir)
         self.validate = QCheckBox("输出后执行结构和坐标校验")
         self.validate.setChecked(True)
         options_form.addRow("输出校验", self.validate)
@@ -1566,16 +1574,17 @@ class ResamplePage(QWidget):
 
         output_group = QGroupBox("输出")
         output_form = QFormLayout(output_group)
-        self.output = QLineEdit()
+        self.output = PathPicker(
+            role="resample_output",
+            dialog_title="选择输出 Zarr",
+            mode="save_file",
+            accessible_name="重采样输出 Zarr 路径",
+            settings=self.path_settings,
+        )
         self._output_manually_set = False
         self._updating_output = False
         self.output.textChanged.connect(self._output_changed)
-        output_row = QWidget()
-        output_layout = QHBoxLayout(output_row)
-        output_layout.setContentsMargins(0, 0, 0, 0)
-        output_layout.addWidget(self.output, 1)
-        output_layout.addWidget(_button("浏览…", self._choose_output))
-        output_form.addRow("输出 Zarr", output_row)
+        output_form.addRow("输出 Zarr", self.output)
         root.addWidget(output_group)
 
         actions = QHBoxLayout()
@@ -1613,28 +1622,6 @@ class ResamplePage(QWidget):
         finally:
             self._updating_output = False
 
-    def _choose_input(self) -> None:
-        value = QFileDialog.getExistingDirectory(
-            self, "选择输入 Zarr", self.input.text() or str(Path.cwd())
-        )
-        if value:
-            self.input.setText(value)
-
-    def _choose_output(self) -> None:
-        value = QFileDialog.getSaveFileName(
-            self, "选择输出 Zarr", self.output.text() or str(Path.cwd())
-        )[0]
-        if value:
-            self.output.setText(value)
-
-    def _choose_temporary_dir(self) -> None:
-        value = QFileDialog.getExistingDirectory(
-            self,
-            "选择重采样中间处理目录（建议 SSD）",
-            self.temporary_dir.text() or str(Path.cwd()),
-        )
-        if value:
-            self.temporary_dir.setText(value)
 
     def _request_inspection(self) -> None:
         if not self.input.text().strip():
@@ -1745,8 +1732,14 @@ class PipelinePage(QWidget):
 
     task_requested = Signal(str, object, object)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(
+        self,
+        parent=None,
+        *,
+        path_settings: PathPickerSettings | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.path_settings = path_settings or PathPickerSettings()
         self.inspection: InspectionResult | None = None
         self.plan = None
         self.recovery = None
@@ -1794,10 +1787,28 @@ class PipelinePage(QWidget):
         self.lon_min = self._double(-180, 180, -180)
         self.lon_max = self._double(-180, 180, 180)
         general_form.addRow("经度范围", self._pair(self.lon_min, self.lon_max))
-        temp_row, self.temporary_dir = self._path_row("选择临时处理目录", directory=True)
-        general_form.addRow("临时处理目录", temp_row)
-        output_row, self.output = self._path_row("选择最终输出目录", directory=False)
-        general_form.addRow("最终输出目录", output_row)
+        self.temporary_dir = PathPicker(
+            role="pipeline_temporary",
+            dialog_title="选择临时处理目录",
+            mode="directory",
+            accessible_name="流程临时处理目录路径",
+            settings=self.path_settings,
+        )
+        general_form.addRow("临时处理目录", self.temporary_dir)
+        self.output = PathPicker(
+            role="pipeline_output",
+            dialog_title="选择最终输出目录",
+            mode="save_file",
+            accessible_name="流程最终输出路径",
+            settings=self.path_settings,
+        )
+        general_form.addRow("最终输出目录", self.output)
+        self.source_storage = self._storage_combo()
+        self.temporary_storage = self._storage_combo()
+        self.output_storage = self._storage_combo()
+        general_form.addRow("源介质", self.source_storage)
+        general_form.addRow("临时介质", self.temporary_storage)
+        general_form.addRow("输出介质", self.output_storage)
         self.cleanup_intermediate = QCheckBox("下游验证通过后立即删除上游中间 Zarr")
         general_form.addRow("清理策略", self.cleanup_intermediate)
         settings_layout.addWidget(self.general_group)
@@ -1880,13 +1891,25 @@ class PipelinePage(QWidget):
             custom_row.addWidget(box)
         chunking_form.addRow("自定义 chunks", custom_row)
         self.final_workers = QSpinBox()
-        self.final_workers.setRange(1, 256)
-        self.final_workers.setValue(1)
+        self.final_workers.setRange(0, 256)
+        self.final_workers.setSpecialValueText("自动")
+        self.final_workers.setValue(0)
         chunking_form.addRow("兼容性最终化 worker", self.final_workers)
         settings_layout.addWidget(self.chunking_group)
 
         self.compression_group = QGroupBox("重压缩参数")
         compression_form = QFormLayout(self.compression_group)
+        self.compression_auto = QCheckBox("使用代表性数据自动选择无损压缩方案")
+        self.compression_auto.setChecked(True)
+        compression_form.addRow("压缩调优", self.compression_auto)
+        self.compression_objective = QComboBox()
+        self.compression_objective.addItem("速度优先", "speed")
+        self.compression_objective.addItem("读写与体积平衡", "balanced")
+        self.compression_objective.addItem("体积优先", "compact")
+        self.compression_objective.setCurrentIndex(1)
+        compression_form.addRow("优化目标", self.compression_objective)
+        self.compression_tune_budget = self._double(1, 3600, 60, decimals=1)
+        compression_form.addRow("压缩调优预算（秒）", self.compression_tune_budget)
         self.compression = QComboBox()
         for label, value in (
             ("Blosc / Zstd", "blosc-zstd"),
@@ -1909,6 +1932,8 @@ class PipelinePage(QWidget):
         self.compression_shuffle.addItem("bitshuffle", "bitshuffle")
         compression_form.addRow("Shuffle", self.compression_shuffle)
         self.compression.currentIndexChanged.connect(self._compression_codec_changed)
+        self.compression_auto.toggled.connect(self._compression_auto_changed)
+        self._compression_auto_changed(True)
         settings_layout.addWidget(self.compression_group)
 
         actions = QHBoxLayout()
@@ -1946,6 +1971,15 @@ class PipelinePage(QWidget):
         self._set_enabled(False)
 
     @staticmethod
+    def _storage_combo() -> QComboBox:
+        combo = QComboBox()
+        combo.addItem("自动检测", "auto")
+        combo.addItem("SSD", "ssd")
+        combo.addItem("机械硬盘", "hdd")
+        combo.addItem("网络/远程文件系统", "network")
+        return combo
+
+    @staticmethod
     def _double(minimum: float, maximum: float, value: float, *, decimals: int = 3) -> QDoubleSpinBox:
         box = QDoubleSpinBox()
         box.setRange(minimum, maximum)
@@ -1963,25 +1997,6 @@ class PipelinePage(QWidget):
         layout.addWidget(second)
         return row
 
-    def _path_row(self, title: str, *, directory: bool):
-        row = QWidget()
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
-        edit = QLineEdit()
-        button = QPushButton("浏览…")
-        if directory:
-            button.clicked.connect(lambda: self._choose_directory(edit, title))
-        else:
-            button.clicked.connect(lambda: self._choose_directory(edit, title))
-        layout.addWidget(edit, 1)
-        layout.addWidget(button)
-        return row, edit
-
-    @staticmethod
-    def _choose_directory(edit, title: str) -> None:
-        value = QFileDialog.getExistingDirectory(edit, title, edit.text() or str(Path.cwd()))
-        if value:
-            edit.setText(value)
 
     def _connect_plan_invalidation(self) -> None:
         for widget in (
@@ -2001,6 +2016,7 @@ class PipelinePage(QWidget):
             self.target_mib,
             self.final_workers,
             self.compression_level,
+            self.compression_tune_budget,
             *self.custom_chunks,
         ):
             widget.valueChanged.connect(self._invalidate_plan)
@@ -2011,9 +2027,18 @@ class PipelinePage(QWidget):
             self.strategy,
             self.compression,
             self.compression_shuffle,
+            self.compression_objective,
+            self.source_storage,
+            self.temporary_storage,
+            self.output_storage,
         ):
             widget.currentIndexChanged.connect(self._invalidate_plan)
-        for widget in (self.auto_tune, self.skipna, self.cleanup_intermediate):
+        for widget in (
+            self.auto_tune,
+            self.skipna,
+            self.cleanup_intermediate,
+            self.compression_auto,
+        ):
             widget.toggled.connect(self._invalidate_plan)
         for widget in (
             self.temporary_dir,
@@ -2024,6 +2049,14 @@ class PipelinePage(QWidget):
             self.after_results,
         ):
             widget.textChanged.connect(self._invalidate_plan)
+
+    def _compression_auto_changed(self, enabled: bool) -> None:
+        explicit = not enabled
+        self.compression.setEnabled(explicit)
+        self.compression_level.setEnabled(explicit)
+        self.compression_shuffle.setEnabled(explicit)
+        self.compression_objective.setEnabled(enabled)
+        self.compression_tune_budget.setEnabled(enabled)
 
     def _compression_codec_changed(self, *_args) -> None:
         codec = self.compression.currentData()
@@ -2086,6 +2119,9 @@ class PipelinePage(QWidget):
         self.lon_min.setValue(general.lon_min)
         self.lon_max.setValue(general.lon_max)
         self.cleanup_intermediate.setChecked(general.cleanup_intermediate)
+        self._set_combo_data(self.source_storage, general.source_storage)
+        self._set_combo_data(self.temporary_storage, general.temporary_storage)
+        self._set_combo_data(self.output_storage, general.output_storage)
         operations = config.operations
         self.resample_checkbox.setChecked(operations.resample)
         self.rechunk_checkbox.setChecked(operations.rechunk)
@@ -2104,15 +2140,22 @@ class PipelinePage(QWidget):
         chunking = config.chunking
         self._set_combo_data(self.strategy, chunking.strategy)
         self.target_mib.setValue(chunking.target_mib)
-        self.final_workers.setValue(chunking.workers)
+        self.final_workers.setValue(
+            0 if chunking.workers == "auto" else chunking.workers
+        )
         if chunking.custom_chunks is not None:
             for box, value in zip(self.custom_chunks, chunking.custom_chunks):
                 box.setValue(value)
         compression = config.compression
-        self._set_combo_data(self.compression, compression.codec)
+        self.compression_auto.setChecked(compression.profile == "auto")
+        if compression.codec is not None:
+            self._set_combo_data(self.compression, compression.codec)
         if compression.level is not None:
             self.compression_level.setValue(compression.level)
         self._set_combo_data(self.compression_shuffle, compression.shuffle)
+        self._set_combo_data(self.compression_objective, compression.objective)
+        self.compression_tune_budget.setValue(compression.tune_budget)
+        self._compression_auto_changed(self.compression_auto.isChecked())
 
     def set_inspection(self, result: InspectionResult) -> None:
         self.inspection = result
@@ -2293,6 +2336,9 @@ class PipelinePage(QWidget):
                     if recovery_config is not None
                     else False
                 ),
+                source_storage=self.source_storage.currentData(),
+                temporary_storage=self.temporary_storage.currentData(),
+                output_storage=self.output_storage.currentData(),
             ),
             conversion=PipelineConversionOptions(
                 variables=selected_variables,
@@ -2343,17 +2389,35 @@ class PipelinePage(QWidget):
                 strategy=strategy,
                 target_mib=self.target_mib.value(),
                 custom_chunks=custom,
-                workers=self.final_workers.value(),
+                workers=(
+                    "auto"
+                    if self.final_workers.value() == 0
+                    else self.final_workers.value()
+                ),
             ),
             compression=PipelineCompressionOptions(
                 profile=(
-                    recovery_config.compression.profile
-                    if recovery_config is not None
+                    "auto"
+                    if self.compression_auto.isChecked()
                     else "balanced"
                 ),
-                codec=self.compression.currentData(),
-                level=self.compression_level.value(),
-                shuffle=self.compression_shuffle.currentData(),
+                codec=(
+                    None
+                    if self.compression_auto.isChecked()
+                    else self.compression.currentData()
+                ),
+                level=(
+                    None
+                    if self.compression_auto.isChecked()
+                    else self.compression_level.value()
+                ),
+                shuffle=(
+                    "auto"
+                    if self.compression_auto.isChecked()
+                    else self.compression_shuffle.currentData()
+                ),
+                objective=self.compression_objective.currentData(),
+                tune_budget=self.compression_tune_budget.value(),
             ),
             validate=(recovery_config.validate if recovery_config is not None else True),
         )
@@ -2432,8 +2496,11 @@ class PipelinePage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(
+        self, *, path_settings: PathPickerSettings | None = None
+    ) -> None:
         super().__init__()
+        self.path_settings = path_settings or PathPickerSettings()
         self.setWindowTitle(f"快速 Zarr 转换器 v{__version__}")
         self.resize(1280, 820)
         self._apply_modern_theme()
@@ -2442,11 +2509,11 @@ class MainWindow(QMainWindow):
         self.zarr_result: InspectionResult | None = None
 
         self.task_page = TaskPage()
-        self.inspection_page = InspectionPage()
-        self.conversion_page = ConversionPage()
-        self.rechunk_page = RechunkPage()
-        self.resample_page = ResamplePage()
-        self.pipeline_page = PipelinePage()
+        self.inspection_page = InspectionPage(path_settings=self.path_settings)
+        self.conversion_page = ConversionPage(path_settings=self.path_settings)
+        self.rechunk_page = RechunkPage(path_settings=self.path_settings)
+        self.resample_page = ResamplePage(path_settings=self.path_settings)
+        self.pipeline_page = PipelinePage(path_settings=self.path_settings)
         pages = [
             ("数据检查", self.inspection_page),
             ("转换", self.conversion_page),
@@ -2525,6 +2592,10 @@ class MainWindow(QMainWindow):
             QPushButton { background: #1d63c6; color: #ffffff; border: 0; border-radius: 5px; padding: 7px 14px; }
             QPushButton:hover { background: #174fa0; }
             QPushButton:disabled { background: #cbd5e1; color: #374151; }
+            QPushButton#pathPickerAuxButton { background: #e8eef5; color: #193b5a; border: 1px solid #b8c5d3; }
+            QPushButton#pathPickerAuxButton:hover { background: #cbd5e1; }
+            QPushButton#pathPickerAuxButton:checked { background: #c7d2df; }
+            QPushButton#pathPickerAuxButton:focus, QLineEdit:focus { border: 2px solid #1d63c6; }
             QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QPlainTextEdit, QTextEdit, QTextBrowser, QTableWidget { border: 1px solid #b8c5d3; border-radius: 4px; background: #ffffff; color: #111827; padding: 4px; }
             QHeaderView::section { background: #e8eef5; color: #172033; border: 0; border-right: 1px solid #c7d2df; border-bottom: 1px solid #c7d2df; padding: 5px; }
             QToolTip { color: #111827; background: #fffbea; border: 1px solid #9aa8b8; }
@@ -2592,7 +2663,12 @@ class MainWindow(QMainWindow):
         paths: list[tuple[str, str]] = []
 
         def add(role: str, value: object) -> None:
-            text = value.text().strip() if isinstance(value, QLineEdit) else str(value or "").strip()
+            text_getter = getattr(value, "text", None)
+            text = (
+                str(text_getter()).strip()
+                if callable(text_getter)
+                else str(value or "").strip()
+            )
             if text:
                 paths.append((role, text))
 

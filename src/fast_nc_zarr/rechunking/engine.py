@@ -5,10 +5,11 @@ import gc
 import itertools
 import os
 import shutil
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator, Mapping
 from uuid import uuid4
 
 import dask.array as dask_array
@@ -18,12 +19,31 @@ import xarray as xr
 import zarr
 
 from ..metadata import sanitize_cf_references
-from .compression import codec_for, make_compression_plan
-from .inspection import inspect_store
-from .models import ChunkPlan, CompressionPlan, DatasetInfo
+from ..models import StorageProfile
 from ..publication import publish_staging
 from ..runtime import bounded_process_map
-from ..system import storage_profile
+from ..system import RuntimeResourceSnapshot, runtime_resource_snapshot, storage_profile
+from .autotune import (
+    WorkerTuneReport,
+    benchmark_worker_candidates,
+    explicit_worker_report,
+    skipped_worker_report,
+    worker_candidates,
+)
+from .compression import (
+    benchmark_compression_candidates,
+    codec_for,
+    generate_compression_candidates,
+    make_compression_plan,
+)
+from .inspection import inspect_store
+from .models import (
+    ChunkPlan,
+    CompressionPlan,
+    CompressionResourceBudget,
+    DatasetInfo,
+    VariableInfo,
+)
 
 
 class RechunkExecutionError(RuntimeError):
@@ -184,8 +204,14 @@ def _rechunk_limit_bytes(info: DatasetInfo, workers: int) -> int:
     return max(source_bytes, min(256 * 1024**2, max(64 * 1024**2, budget)))
 
 
-def _safe_workers(info: DatasetInfo, requested: int) -> int:
-    """Cap concurrent region tasks using the irreducible source chunk size."""
+def _safe_workers(
+    info: DatasetInfo,
+    requested: int,
+    *,
+    available_bytes: int | None = None,
+    cpu_cap: int | None = None,
+) -> int:
+    """Cap concurrent region tasks using source chunks and resource limits."""
 
     requested = max(1, int(requested))
     source_bytes = max(
@@ -196,14 +222,19 @@ def _safe_workers(info: DatasetInfo, requested: int) -> int:
         ),
         default=1,
     )
-    available = max(1, int(psutil.virtual_memory().available))
-    # Reserve most memory for the OS, xarray and compression buffers.  Eight
-    # workers is a practical upper bound on this threaded pipeline; the
-    # memory-derived cap additionally protects users who pass a very large
-    # --workers value on low-memory machines.
+    available = max(
+        1,
+        int(
+            psutil.virtual_memory().available
+            if available_bytes is None
+            else available_bytes
+        ),
+    )
+    # Reserve most available memory for the OS, xarray and codec buffers.
     memory_workers = max(1, int(available * 0.10 / source_bytes))
-    cpu_cap = min(os.cpu_count() or 1, 8)
-    return max(1, min(requested, cpu_cap, memory_workers))
+    detected_cpu = os.cpu_count() or 1 if cpu_cap is None else max(1, int(cpu_cap))
+    cpu_limit = min(detected_cpu, 8)
+    return max(1, min(requested, cpu_limit, memory_workers))
 
 
 _CONSERVATIVE_FILESYSTEMS = frozenset(
@@ -233,6 +264,9 @@ def _parallel_workers(
     source: Path,
     target_parent: Path,
     requested: int,
+    *,
+    source_profile: StorageProfile | None = None,
+    target_profile: StorageProfile | None = None,
 ) -> tuple[int, str]:
     """Choose a bounded process count from shared storage profiles.
 
@@ -243,8 +277,8 @@ def _parallel_workers(
     """
 
     requested = max(1, int(requested))
-    source_profile = storage_profile(source)
-    target_profile = storage_profile(target_parent)
+    source_profile = source_profile or storage_profile(source)
+    target_profile = target_profile or storage_profile(target_parent)
     same_device = (
         source_profile.device != "unknown"
         and target_profile.device != "unknown"
@@ -252,15 +286,17 @@ def _parallel_workers(
     )
     base = min(requested, 8, os.cpu_count() or 1)
     conservative = tuple(
-        profile.filesystem
+        profile.medium if profile.medium == "network" else profile.filesystem
         for profile in (source_profile, target_profile)
-        if _conservative_filesystem(profile.filesystem)
+        if profile.medium == "network"
+        or (
+            profile.override == "auto"
+            and _conservative_filesystem(profile.filesystem)
+        )
     )
     if conservative:
-        filesystems = ", ".join(dict.fromkeys(conservative))
-        return max(1, min(base, 2)), (
-            f"检测到保守文件系统（{filesystems}），限制为 2 个进程"
-        )
+        media = ", ".join(dict.fromkeys(conservative))
+        return max(1, min(base, 2)), f"检测到保守存储（{media}），限制为 2 个进程"
     if same_device and (
         source_profile.rotational is True or target_profile.rotational is True
     ):
@@ -401,6 +437,8 @@ def _stage2_safe_workers(
     region_chunks: dict[str, tuple[int, ...]],
     compression: CompressionPlan,
     requested: int,
+    *,
+    available_bytes: int | None = None,
 ) -> tuple[int, int]:
     """Bound stage-2 concurrency by decoded regions and codec peak buffers."""
 
@@ -431,7 +469,14 @@ def _stage2_safe_workers(
             2 * final_bytes * codec_workers if has_codec else final_bytes
         )
         peak_bytes = max(peak_bytes, 2 * region_bytes + codec_bytes)
-    available = max(1, int(psutil.virtual_memory().available))
+    available = max(
+        1,
+        int(
+            psutil.virtual_memory().available
+            if available_bytes is None
+            else available_bytes
+        ),
+    )
     memory_workers = max(1, int(available * 0.25) // peak_bytes)
     return max(1, min(requested, memory_workers)), peak_bytes
 
@@ -828,6 +873,79 @@ def _stage1_time_task(task: tuple[str, int]) -> dict[str, int | float | str]:
     }
 
 
+def _reset_stage1_worker_state() -> None:
+    """Release parent-process handles left by the one-worker benchmark path."""
+
+    global _STAGE1_SOURCE, _STAGE1_INTERMEDIATE, _STAGE1_ARRAYS
+    if _STAGE1_SOURCE is not None:
+        _STAGE1_SOURCE.close()
+    _STAGE1_SOURCE = None
+    _STAGE1_INTERMEDIATE = None
+    _STAGE1_ARRAYS = {}
+
+
+def _stage1_sample_task(
+    task: tuple[str, int, tuple[tuple[int, ...], ...]],
+) -> dict[str, int | float | str]:
+    """Measure real source chunks while preserving one time-owner per task."""
+
+    if _STAGE1_SOURCE is None or _STAGE1_INTERMEDIATE is None:
+        raise RuntimeError("阶段 1 worker 尚未初始化。")
+    variable_name, time_index, chunk_indices = task
+    variable = _STAGE1_SOURCE[variable_name]
+    chunks, starts = _chunk_layout(variable)
+    time_axis = variable.dims.index("time")
+    source_data = variable.data
+    started = time.perf_counter()
+    processed_bytes = 0
+    with zarr.config.set(
+        {
+            "codec_pipeline.path": _FUSED_CODEC_PIPELINE,
+            "codec_pipeline.max_workers": _STAGE1_CODEC_WORKERS,
+        }
+    ):
+        array = _STAGE1_ARRAYS.get(variable_name)
+        if array is None:
+            array = zarr.open_array(
+                store=_STAGE1_INTERMEDIATE,
+                path=variable_name,
+                mode="r+",
+            )
+            _STAGE1_ARRAYS[variable_name] = array
+        for indices in chunk_indices:
+            if int(indices[time_axis]) != int(time_index):
+                raise RuntimeError("阶段 1 样本跨越了 time owner 边界。")
+            region = _region_for_chunk_indices(
+                tuple(str(dim) for dim in variable.dims),
+                chunks,
+                starts,
+                indices,
+            )
+            block = source_data.blocks[indices]
+            if hasattr(block, "compute"):
+                block = block.compute(scheduler="synchronous")
+            block = np.asarray(block)
+            processed_bytes += int(block.nbytes)
+            selection = tuple(region[dim] for dim in variable.dims)
+            _STAGE1_ARRAYS[variable_name] = _set_array_region_with_fallback(
+                array,
+                _STAGE1_INTERMEDIATE,
+                variable_name,
+                selection,
+                block,
+                _STAGE1_ARRAYS,
+                _STAGE1_CODEC_WORKERS,
+            )
+            del block
+    return {
+        "variable": variable_name,
+        "time_index": int(time_index),
+        "source_chunks": len(chunk_indices),
+        "bytes": processed_bytes,
+        "elapsed": time.perf_counter() - started,
+    }
+
+
 _STAGE2_INTERMEDIATE: xr.Dataset | None = None
 _STAGE2_STAGING: Path | None = None
 _STAGE2_ARRAYS: dict[str, zarr.Array] = {}
@@ -898,6 +1016,17 @@ def _stage2_region_task(
         "bytes": processed_bytes,
         "elapsed": time.perf_counter() - started,
     }
+
+
+def _reset_stage2_worker_state() -> None:
+    """Release parent-process handles left by the one-worker benchmark path."""
+
+    global _STAGE2_INTERMEDIATE, _STAGE2_STAGING, _STAGE2_ARRAYS
+    if _STAGE2_INTERMEDIATE is not None:
+        _STAGE2_INTERMEDIATE.close()
+    _STAGE2_INTERMEDIATE = None
+    _STAGE2_STAGING = None
+    _STAGE2_ARRAYS = {}
 
 
 def _run_process_tasks(
@@ -1023,6 +1152,494 @@ def _stage2_tasks(
                 for dim, size in zip(variable.dims, variable.shape)
             )
             yield variable.name, starts, stops
+
+
+def _even_indices(total: int, count: int) -> list[int]:
+    total = max(0, int(total))
+    count = max(0, min(total, int(count)))
+    if count == 0:
+        return []
+    if count == 1:
+        return [0]
+    return [int(index * (total - 1) // (count - 1)) for index in range(count)]
+
+
+def _stage1_benchmark_tasks(
+    info: DatasetInfo,
+    max_tasks: int,
+) -> list[tuple[str, int, tuple[tuple[int, ...], ...]]]:
+    """Build disjoint source-chunk samples for stage 1.
+
+    A task owns one source ``time`` chunk and a bounded number of its spatial
+    chunks.  Distinct tasks therefore never update the same intermediate time
+    region, even when source and target spatial boundaries differ.
+    """
+
+    variables = [variable for variable in info.data_variables if variable.ndim == 3]
+    if not variables:
+        return []
+    max_tasks = max(1, int(max_tasks))
+    per_variable = max(1, (max_tasks + len(variables) - 1) // len(variables))
+    result: list[tuple[str, int, tuple[tuple[int, ...], ...]]] = []
+    chunk_budget = 16 * 1024**2
+    for variable in variables:
+        time_axis = variable.dims.index("time")
+        time_count = (
+            int(variable.shape[time_axis])
+            + int(variable.chunks[time_axis])
+            - 1
+        ) // int(variable.chunks[time_axis])
+        times = _even_indices(time_count, per_variable)
+        spatial_axes = [axis for axis in range(variable.ndim) if axis != time_axis]
+        spatial_counts = [
+            (int(variable.shape[axis]) + int(variable.chunks[axis]) - 1)
+            // int(variable.chunks[axis])
+            for axis in spatial_axes
+        ]
+        spatial_total = int(np.prod(spatial_counts, dtype=np.int64))
+        source_chunk_bytes = int(
+            np.prod(
+                [
+                    min(int(size), int(chunk))
+                    for size, chunk in zip(variable.shape, variable.chunks)
+                ],
+                dtype=np.int64,
+            )
+        ) * int(variable.dtype.itemsize)
+        spatial_per_task = max(1, min(spatial_total, chunk_budget // max(1, source_chunk_bytes)))
+        spatial_per_task = min(spatial_per_task, 16)
+        spatial_flats = _even_indices(spatial_total, spatial_per_task)
+        for time_index in times:
+            indices_list: list[tuple[int, ...]] = []
+            for flat in spatial_flats:
+                remainder = int(flat)
+                spatial_indices: list[int] = []
+                for count in reversed(spatial_counts):
+                    spatial_indices.append(remainder % max(1, count))
+                    remainder //= max(1, count)
+                spatial_indices.reverse()
+                indices = [0] * variable.ndim
+                indices[time_axis] = int(time_index)
+                for axis, index in zip(spatial_axes, spatial_indices):
+                    indices[axis] = int(index)
+                indices_list.append(tuple(indices))
+            result.append((variable.name, int(time_index), tuple(indices_list)))
+    return result[:max_tasks]
+
+
+def _stage2_benchmark_regions(
+    info: DatasetInfo,
+    plan: ChunkPlan,
+    region_chunks: dict[str, tuple[int, ...]],
+    *,
+    max_region_bytes: int = 64 * 1024**2,
+) -> dict[str, tuple[int, ...]]:
+    """Shrink grouped reads to bounded final-chunk-aligned sample regions."""
+
+    final_by_dim = dict(zip(("time", "lat", "lon"), plan.chunks))
+    result: dict[str, tuple[int, ...]] = {}
+    for variable in info.data_variables:
+        if variable.ndim != 3:
+            continue
+        source_region = region_chunks.get(variable.name, variable.chunks)
+        current = dict(zip(variable.dims, source_region))
+        final = {dim: int(final_by_dim[dim]) for dim in variable.dims}
+        current["time"] = final["time"]
+
+        def region_bytes() -> int:
+            return int(
+                np.prod(
+                    [
+                        min(int(size), int(current[dim]))
+                        for dim, size in zip(variable.dims, variable.shape)
+                    ],
+                    dtype=np.int64,
+                )
+            ) * int(variable.dtype.itemsize)
+
+        factors = {
+            dim: max(1, int(current[dim]) // max(1, int(final[dim])))
+            for dim in variable.dims
+        }
+        while region_bytes() > max_region_bytes and max(
+            factors.get("lat", 1), factors.get("lon", 1)
+        ) > 1:
+            dim = (
+                "lat"
+                if factors.get("lat", 1) >= factors.get("lon", 1)
+                and factors.get("lat", 1) > 1
+                else "lon"
+            )
+            factors[dim] = max(1, factors[dim] // 2)
+            current[dim] = int(final[dim]) * factors[dim]
+        result[variable.name] = tuple(int(current[dim]) for dim in variable.dims)
+    return result
+
+
+def _stage2_benchmark_tasks(
+    info: DatasetInfo,
+    plan: ChunkPlan,
+    region_chunks: dict[str, tuple[int, ...]],
+    max_tasks: int,
+) -> list[tuple[str, tuple[int, ...], tuple[int, ...]]]:
+    variables = [variable for variable in info.data_variables if variable.ndim == 3]
+    if not variables:
+        return []
+    max_tasks = max(1, int(max_tasks))
+    per_variable = max(1, (max_tasks + len(variables) - 1) // len(variables))
+    final_by_dim = dict(zip(("time", "lat", "lon"), plan.chunks))
+    result: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+    for variable in variables:
+        chunks = region_chunks.get(variable.name, variable.chunks)
+        by_dim = dict(zip(variable.dims, chunks))
+        counts = [
+            (int(size) + int(by_dim[dim]) - 1) // int(by_dim[dim])
+            for dim, size in zip(variable.dims, variable.shape)
+        ]
+        total = int(np.prod(counts, dtype=np.int64))
+        for flat in _even_indices(total, per_variable):
+            remainder = int(flat)
+            coordinates: list[int] = []
+            for count in reversed(counts):
+                coordinates.append(remainder % max(1, count))
+                remainder //= max(1, count)
+            coordinates.reverse()
+            starts = tuple(
+                int(coordinate) * int(by_dim[dim])
+                for coordinate, dim in zip(coordinates, variable.dims)
+            )
+            stops = tuple(
+                min(int(start) + int(by_dim[dim]), int(size))
+                for start, dim, size in zip(starts, variable.dims, variable.shape)
+            )
+            # Every edge begins on the final physical chunk grid; task-private
+            # benchmark stores therefore preserve formal single-writer geometry.
+            for dim, start in zip(variable.dims, starts):
+                if start % int(final_by_dim[dim]) != 0:
+                    raise RuntimeError("阶段 2 样本未对齐最终 chunk 网格。")
+            result.append((variable.name, starts, stops))
+    return result[:max_tasks]
+
+
+def _rss_bytes() -> int:
+    try:
+        process = psutil.Process()
+        processes = [process, *process.children(recursive=True)]
+        seen: set[int] = set()
+        total = 0
+        for item in processes:
+            if item.pid in seen:
+                continue
+            seen.add(item.pid)
+            try:
+                total += int(item.memory_info().rss)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return total
+    except (AttributeError, OSError, psutil.Error):
+        return 0
+
+
+def _measure_benchmark_tasks(
+    tasks: list[tuple],
+    *,
+    workers: int,
+    initializer: Callable[..., object],
+    initargs: tuple[object, ...],
+    task_function: Callable,
+    cancel_event=None,
+) -> Mapping[str, float | int]:
+    """Execute real sample tasks while observing parent and child RSS."""
+
+    stop = threading.Event()
+    rss_samples = [_rss_bytes()]
+
+    def monitor() -> None:
+        while not stop.wait(0.05):
+            rss_samples.append(_rss_bytes())
+
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    started = time.perf_counter()
+    monitor_thread.start()
+    logical_bytes = 0
+    try:
+        results = bounded_process_map(
+            task_function,
+            tasks,
+            workers=max(1, int(workers)),
+            initializer=initializer,
+            initargs=initargs,
+            cancel_event=cancel_event,
+        )
+        for result in results:
+            logical_bytes += int(result.get("bytes", 0))
+    finally:
+        stop.set()
+        monitor_thread.join(timeout=1.0)
+        rss_samples.append(_rss_bytes())
+    elapsed = max(time.perf_counter() - started, 1e-9)
+    return {
+        "elapsed_seconds": elapsed,
+        "logical_bytes": logical_bytes,
+        "throughput_mib_s": logical_bytes / 1024**2 / elapsed,
+        "peak_rss_bytes": max(rss_samples, default=0),
+    }
+
+
+def _drop_sample_page_cache(paths: Iterable[Path]) -> None:
+    advise = getattr(os, "posix_fadvise", None)
+    advice = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if advise is None or advice is None:
+        return
+    for root in paths:
+        try:
+            files = (item for item in root.rglob("*") if item.is_file())
+            for item in itertools.islice(files, 8192):
+                try:
+                    descriptor = os.open(item, os.O_RDONLY)
+                    try:
+                        advise(descriptor, 0, 0, advice)
+                    finally:
+                        os.close(descriptor)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+
+
+def _stage_resource_ceiling(
+    info: DatasetInfo,
+    requested: int | str,
+    resources: RuntimeResourceSnapshot,
+    *,
+    stage_peak_bytes: int,
+) -> int:
+    requested_limit = None if requested == "auto" else max(1, int(requested))
+    detected = resources.worker_ceiling(
+        max(1, int(stage_peak_bytes)),
+        requested=requested_limit,
+    )
+    return _safe_workers(
+        info,
+        detected,
+        available_bytes=resources.memory.effective_available_bytes,
+        cpu_cap=resources.cpu.worker_ceiling,
+    )
+
+
+def _tune_source_workers(
+    stage: str,
+    source_path: Path,
+    dataset: xr.Dataset,
+    info: DatasetInfo,
+    store_plan: ChunkPlan,
+    compression: CompressionPlan,
+    store_root: Path,
+    target_profile_path: Path,
+    resources: RuntimeResourceSnapshot,
+    requested: int | str,
+    budget_seconds: float,
+    *,
+    source_profile: StorageProfile | None = None,
+    target_profile: StorageProfile | None = None,
+    shards: dict[str, tuple[int, ...]] | None = None,
+    require_time_ownership: bool = True,
+    cancel_event=None,
+) -> tuple[int, WorkerTuneReport]:
+    source_bytes = max(
+        (
+            int(np.prod(variable.chunks, dtype=np.int64)) * int(variable.dtype.itemsize)
+            for variable in info.data_variables
+            if variable.ndim == 3
+        ),
+        default=1,
+    )
+    safe = _stage_resource_ceiling(
+        info,
+        requested,
+        resources,
+        stage_peak_bytes=max(64 * 1024**2, source_bytes * 4),
+    )
+    storage_workers, storage_reason = _parallel_workers(
+        source_path,
+        target_profile_path,
+        safe,
+        source_profile=source_profile,
+        target_profile=target_profile,
+    )
+    safe = min(safe, storage_workers)
+    if require_time_ownership is False:
+        safe = 1
+        storage_reason = "当前阶段采用串行 ownership，避免跨 time chunk 写入冲突"
+    owner_count = _stage1_time_task_count(info)
+    safe = min(safe, max(1, owner_count))
+    if requested != "auto":
+        selected = min(max(1, int(requested)), safe)
+        return selected, explicit_worker_report(
+            stage,
+            selected,
+            safe_ceiling=safe,
+            storage_reason=storage_reason,
+            selected_reason="显式 workers 是硬上限，未运行自动实测",
+        )
+
+    sample_count = min(max(1, owner_count), max(8, safe * 4), 32)
+    tasks = _stage1_benchmark_tasks(info, sample_count)
+    safe = min(safe, max(1, len(tasks)))
+    candidates = worker_candidates(safe)
+    tune_root = store_root / f".{source_path.stem}.{stage}-worker-tune-{uuid4().hex}.tmp"
+    tune_root.mkdir(parents=True, exist_ok=True)
+
+    def runner(candidate_workers: int) -> Mapping[str, float | int]:
+        trial = tune_root / f"trial-{candidate_workers}.zarr"
+        try:
+            _initialize_store(
+                dataset,
+                info,
+                store_plan,
+                compression,
+                trial,
+                shards=shards,
+            )
+            _drop_sample_page_cache(
+                source_path / variable.name
+                for variable in info.data_variables
+                if variable.ndim == 3
+            )
+            return _measure_benchmark_tasks(
+                tasks,
+                workers=candidate_workers,
+                initializer=_init_stage1_worker,
+                initargs=(str(source_path), str(trial), max(1, min(2, candidate_workers))),
+                task_function=_stage1_sample_task,
+                cancel_event=cancel_event,
+            )
+        finally:
+            _reset_stage1_worker_state()
+            shutil.rmtree(trial, ignore_errors=True)
+
+    try:
+        report = benchmark_worker_candidates(
+            stage,
+            candidates,
+            runner,
+            safe_ceiling=safe,
+            storage_reason=storage_reason,
+            sample_tasks=len(tasks),
+            sample_logical_bytes=0,
+            budget_seconds=budget_seconds,
+            cancel_event=cancel_event,
+        )
+    finally:
+        shutil.rmtree(tune_root, ignore_errors=True)
+    report = replace(
+        report,
+        sample_logical_bytes=max(
+            (trial.logical_bytes for trial in report.trials), default=0
+        ),
+    )
+    return report.selected_workers, report
+
+
+def _tune_stage2_workers(
+    intermediate: Path,
+    intermediate_dataset: xr.Dataset,
+    staging_parent: Path,
+    info: DatasetInfo,
+    plan: ChunkPlan,
+    compression: CompressionPlan,
+    region_chunks: dict[str, tuple[int, ...]],
+    resources: RuntimeResourceSnapshot,
+    requested: int | str,
+    budget_seconds: float,
+    cancel_event=None,
+    source_profile: StorageProfile | None = None,
+    target_profile: StorageProfile | None = None,
+) -> tuple[int, WorkerTuneReport, dict[str, tuple[int, ...]]]:
+    preliminary, peak_bytes = _stage2_safe_workers(
+        info,
+        plan,
+        region_chunks,
+        compression,
+        resources.cpu.worker_ceiling,
+        available_bytes=resources.memory.effective_available_bytes,
+    )
+    requested_limit = None if requested == "auto" else max(1, int(requested))
+    safe = resources.worker_ceiling(
+        max(1, peak_bytes),
+        requested=requested_limit,
+    )
+    storage_workers, storage_reason = _parallel_workers(
+        intermediate,
+        staging_parent,
+        safe,
+        source_profile=source_profile,
+        target_profile=target_profile,
+    )
+    safe = min(safe, preliminary, storage_workers)
+    sample_regions = _stage2_benchmark_regions(info, plan, region_chunks)
+    tasks = _stage2_benchmark_tasks(
+        info,
+        plan,
+        sample_regions,
+        max(1, min(8, max(2, safe))),
+    )
+    safe = min(safe, max(1, len(tasks)))
+    if requested != "auto":
+        selected = min(max(1, int(requested)), safe)
+        return selected, explicit_worker_report(
+            "stage2",
+            selected,
+            safe_ceiling=safe,
+            storage_reason=storage_reason,
+            selected_reason="显式 workers 是硬上限，未运行自动实测",
+        ), sample_regions
+    candidates = worker_candidates(safe)
+    tune_root = staging_parent / f".{staging_parent.name}.stage2-worker-tune-{uuid4().hex}.tmp"
+    tune_root.mkdir(parents=True, exist_ok=True)
+
+    def runner(candidate_workers: int) -> Mapping[str, float | int]:
+        trial = tune_root / f"trial-{candidate_workers}.zarr"
+        try:
+            _initialize_store(intermediate_dataset, info, plan, compression, trial)
+            _drop_sample_page_cache(
+                intermediate / variable.name
+                for variable in info.data_variables
+                if variable.ndim == 3
+            )
+            return _measure_benchmark_tasks(
+                tasks,
+                workers=candidate_workers,
+                initializer=_init_stage2_worker,
+                initargs=(str(intermediate), str(trial), max(1, min(2, candidate_workers))),
+                task_function=_stage2_region_task,
+                cancel_event=cancel_event,
+            )
+        finally:
+            _reset_stage2_worker_state()
+            shutil.rmtree(trial, ignore_errors=True)
+
+    try:
+        report = benchmark_worker_candidates(
+            "stage2",
+            candidates,
+            runner,
+            safe_ceiling=safe,
+            storage_reason=storage_reason,
+            sample_tasks=len(tasks),
+            sample_logical_bytes=0,
+            budget_seconds=budget_seconds,
+            cancel_event=cancel_event,
+        )
+    finally:
+        shutil.rmtree(tune_root, ignore_errors=True)
+    report = replace(
+        report,
+        sample_logical_bytes=max(
+            (trial.logical_bytes for trial in report.trials), default=0
+        ),
+    )
+    return report.selected_workers, report, sample_regions
 
 
 def _populate_intermediate_parallel(
@@ -1665,15 +2282,24 @@ def run_rechunk(
     info: DatasetInfo,
     plan: ChunkPlan,
     compression: CompressionPlan,
-    *,
-    workers: int = 1,
+    workers: int | str = 1,
     overwrite: bool = False,
     progress: bool = True,
     validate: bool = True,
     cancel_event=None,
     temporary_dir: str | Path | None = None,
-) -> dict[str, float | int | str]:
+    tune_budget_seconds: float = 60.0,
+    compression_objective: str = "balanced",
+    compression_tune_budget_seconds: float = 60.0,
+    storage_overrides: Mapping[str, str] | None = None,
+) -> dict[str, object]:
     """Rechunk and optionally recompress a complete Zarr v3 store."""
+
+    if workers != "auto":
+        try:
+            workers = max(1, int(workers))
+        except (TypeError, ValueError) as exc:
+            raise RechunkExecutionError("workers 必须是正整数或 auto。") from exc
 
     source_path = Path(source).expanduser().resolve()
     target = Path(output).expanduser().resolve()
@@ -1689,6 +2315,18 @@ def run_rechunk(
     # remains an atomic rename for every execution path, including byte copy.
     staging = target.parent / f".{target.name}.rechunk-{uuid4().hex}.tmp"
     intermediate = temporary_root / f".{target.name}.intermediate-{uuid4().hex}.tmp"
+    resources = runtime_resource_snapshot(
+        source=source_path,
+        temporary=temporary_root,
+        output=target.parent,
+        storage_overrides=storage_overrides,
+    )
+    worker_tuning: dict[str, dict[str, object]] = {}
+    compression_tuning: dict[str, object] | None = None
+    tune_budget = max(0.0, float(tune_budget_seconds))
+    # Apply the bounded budget independently so a slow stage 1 sample cannot
+    # starve the required stage 2 region measurement.
+    stage_budget = max(0.0, tune_budget)
     started = time.perf_counter()
     execution_path = "two_stage"
     dataset = None
@@ -1714,6 +2352,68 @@ def run_rechunk(
         if not data3d:
             raise RechunkExecutionError("没有可写入的三维数据变量。")
 
+        if compression.profile == "auto":
+            reference = max(data3d, key=lambda variable: variable.logical_bytes)
+            baseline = make_compression_plan(
+                "fast", codec="blosc-zstd", level=1, shuffle="auto"
+            )
+            compression_budget = CompressionResourceBudget(
+                memory_bytes=max(
+                    256 * 1024**2,
+                    resources.memory.effective_available_bytes // 4,
+                ),
+                disk_free_bytes=shutil.disk_usage(target.parent).free,
+                cpu_count=resources.cpu.worker_ceiling,
+            )
+            candidate_groups = tuple(
+                generate_compression_candidates(
+                    variable.dtype,
+                    plan.chunks_for(variable),
+                    resource_budget=compression_budget,
+                )
+                for variable in data3d
+            )
+            candidates: list[CompressionPlan] = []
+            for round_items in itertools.zip_longest(*candidate_groups):
+                for candidate in round_items:
+                    if candidate is not None and candidate not in candidates:
+                        candidates.append(candidate)
+                    if len(candidates) >= 8:
+                        break
+                if len(candidates) >= 8:
+                    break
+            report = benchmark_compression_candidates(
+                dataset[reference.name].data,
+                candidates,
+                chunk_shape=plan.chunks_for(reference),
+                output_dir=target.parent,
+                objective=compression_objective,
+                baseline=baseline,
+                budget_seconds=compression_tune_budget_seconds,
+                max_samples=1,
+                cancel_event=cancel_event,
+                resource_budget=compression_budget,
+                sample_sources=tuple(
+                    (dataset[variable.name].data, plan.chunks_for(variable))
+                    for variable in data3d
+                ),
+                progress=progress,
+            )
+            if report.selected is None:
+                reason = (
+                    "任务已取消。"
+                    if report.cancelled
+                    else "压缩自动调优没有通过无损验证且满足容量约束的候选。"
+                )
+                raise RechunkExecutionError(reason)
+            compression = report.selected
+            compression_tuning = report.to_dict()
+            if progress:
+                print(
+                    "压缩自动调优选择："
+                    f"{compression.label()}；{report.selection_reason}"
+                )
+
         copy_equivalent = (
             _chunks_match_plan(info, plan, data_only=False)
             and _compression_matches_source(info, compression)
@@ -1735,21 +2435,41 @@ def run_rechunk(
                 staging,
                 cancel_event=cancel_event,
             )
+            worker_tuning["stage1"] = skipped_worker_report(
+                "stage1", "等价复制路径不需要 worker"
+            ).to_dict()
+            worker_tuning["stage2"] = skipped_worker_report(
+                "stage2", "等价复制路径不需要 worker"
+            ).to_dict()
         elif direct_chunks:
             execution_path = "single_stage"
-            safe_workers = _safe_workers(info, workers)
-            effective_workers, device_reason = _parallel_workers(
+            effective_workers, direct_report = _tune_source_workers(
+                "direct",
                 source_path,
+                dataset,
+                info,
+                plan,
+                compression,
                 target.parent,
-                safe_workers,
+                target.parent,
+                resources,
+                workers,
+                tune_budget,
+                source_profile=resources.source_storage,
+                target_profile=resources.output_storage,
+                require_time_ownership=True,
+                cancel_event=cancel_event,
             )
+            worker_tuning["direct"] = direct_report.to_dict()
             effective_workers, worker_peak_bytes = _stage2_safe_workers(
                 info,
                 plan,
                 _direct_region_chunks(info),
                 compression,
                 effective_workers,
+                available_bytes=resources.memory.effective_available_bytes,
             )
+            device_reason = direct_report.storage_reason
             if progress:
                 print(
                     "源与目标物理 chunks 相同；使用单阶段逐 chunk "
@@ -1781,13 +2501,9 @@ def run_rechunk(
             dataset.close()
             dataset = None
         else:
-            safe_workers = _safe_workers(info, workers)
-            stage1_workers, stage1_reason = _parallel_workers(
-                source_path,
-                temporary_root,
-                safe_workers,
-            )
-            intermediate_chunks = _intermediate_chunks(info, plan, stage1_workers)
+            # Intermediate geometry is independent of worker count; ownership
+            # remains one source-time owner per task.
+            intermediate_chunks = _intermediate_chunks(info, plan, 1)
             intermediate_plan = replace(plan, chunks=intermediate_chunks)
             intermediate_count = _intermediate_chunk_count(info, intermediate_chunks)
             if intermediate_count >= _INTERMEDIATE_SHARD_THRESHOLD:
@@ -1797,29 +2513,40 @@ def run_rechunk(
                     plan.chunks,
                 )
             else:
-                # Grouped stage-2 reads remove call overhead for ordinary
-                # stores; reserve sharding for metadata-dominated grids.
                 intermediate_shards = {}
             stage2_region_chunks = _stage2_region_chunks(
                 info,
                 intermediate_chunks,
                 plan.chunks,
             )
-            stage2_storage_workers, stage2_reason = _parallel_workers(
-                temporary_root,
-                target.parent,
-                safe_workers,
-            )
-            stage2_workers, stage2_peak_bytes = _stage2_safe_workers(
-                info,
-                plan,
-                stage2_region_chunks,
-                compression,
-                stage2_storage_workers,
-            )
             intermediate_compression = (
                 make_compression_plan("fast") if compression.enabled else compression
             )
+            stage1_workers, stage1_report = _tune_source_workers(
+                "stage1",
+                source_path,
+                dataset,
+                info,
+                intermediate_plan,
+                intermediate_compression,
+                temporary_root,
+                temporary_root,
+                resources,
+                workers,
+                stage_budget,
+                source_profile=resources.source_storage,
+                target_profile=resources.temporary_storage,
+                shards=intermediate_shards,
+                require_time_ownership=plan.strategy == "time",
+                cancel_event=cancel_event,
+            )
+            worker_tuning["stage1"] = stage1_report.to_dict()
+            stage1_reason = stage1_report.storage_reason
+            # Stage 2 is tuned after stage 1 has produced a complete real
+            # intermediate store; this intentionally permits different counts.
+            stage2_workers = 1
+            stage2_reason = "阶段 1 完成后在真实 intermediate/output 上实测"
+            stage2_peak_bytes = 1
             if progress:
                 print(
                     "使用两阶段源 chunk 对齐重分块：源 chunk 读取一次；"
@@ -1915,9 +2642,55 @@ def run_rechunk(
                 )
             dataset.close()
             dataset = None
+            intermediate_dataset = xr.open_zarr(
+                intermediate,
+                consolidated=False,
+                chunks={},
+                decode_times=False,
+                mask_and_scale=False,
+            )
+            stage2_workers, stage2_report, _sample_regions = _tune_stage2_workers(
+                intermediate,
+                intermediate_dataset,
+                target.parent,
+                info,
+                plan,
+                compression,
+                stage2_region_chunks,
+                resources,
+                workers,
+                stage_budget,
+                source_profile=resources.temporary_storage,
+                target_profile=resources.output_storage,
+                cancel_event=cancel_event,
+            )
+            worker_tuning["stage2"] = stage2_report.to_dict()
+            stage2_reason = stage2_report.storage_reason
+            _stage2_workers_for_peak, stage2_peak_bytes = _stage2_safe_workers(
+                info,
+                plan,
+                stage2_region_chunks,
+                compression,
+                stage2_workers,
+                available_bytes=resources.memory.effective_available_bytes,
+            )
+            stage2_workers = min(stage2_workers, _stage2_workers_for_peak)
+            parallel_stage2 = (
+                stage2_workers > 1
+                and output_chunk_count >= max(8, stage2_workers * 4)
+            )
+            if progress:
+                print(
+                    f"阶段 2 I/O：{stage2_reason}；实际进程数={stage2_workers}；"
+                    f"估算每 worker 峰值={stage2_peak_bytes / 1024**2:.1f} MiB。"
+                )
+                if parallel_stage2:
+                    print("阶段 2 使用按最终物理 chunk 单 owner 的多进程合并。")
 
             stage2_started = time.perf_counter()
             if parallel_stage2:
+                intermediate_dataset.close()
+                intermediate_dataset = None
                 _populate_final_parallel(
                     intermediate,
                     staging,
@@ -1930,13 +2703,6 @@ def run_rechunk(
                     cancel_event=cancel_event,
                 )
             else:
-                intermediate_dataset = xr.open_zarr(
-                    intermediate,
-                    consolidated=False,
-                    chunks={},
-                    decode_times=False,
-                    mask_and_scale=False,
-                )
                 _populate_final_from_intermediate(
                     intermediate_dataset,
                     info,
@@ -1986,6 +2752,11 @@ def run_rechunk(
             "avoided_intermediate_bytes": (
                 info.logical_bytes if execution_path != "two_stage" else 0
             ),
+            "requested_workers": workers,
+            "worker_tuning": worker_tuning,
+            "resource_snapshot": resources.to_dict(),
+            "compression_tuning": compression_tuning,
+            "selected_compression": compression.to_dict(),
         }
     except Exception as exc:
         if dataset is not None:

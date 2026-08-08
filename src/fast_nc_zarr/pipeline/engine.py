@@ -21,6 +21,7 @@ from ..application.services import (
 )
 from ..publication import publish_staging, validate_publish_target
 from ..selection import selected_logical_bytes
+from ..system import runtime_resource_snapshot
 from ..resampling.engine import (
     _build_regridder,
     _mask_missing,
@@ -63,7 +64,73 @@ def _write_manifest(path: Path, payload: dict) -> None:
     )
     temporary.replace(path)
 
+def _apply_runtime_compression(
+    manifest: dict,
+    metrics: dict,
+) -> None:
+    selected = metrics.get("selected_compression")
+    if not isinstance(selected, dict):
+        return
+    manifest["resolved_compression"] = selected
+    layout = manifest.get("output_layout")
+    variables = layout.get("variables", []) if isinstance(layout, dict) else []
+    codec_name = str(selected.get("codec", ""))
+    level = int(selected.get("level") or 0)
+    requested_shuffle = str(selected.get("shuffle", "auto"))
+    for variable in variables:
+        if not isinstance(variable, dict) or variable.get("is_coord"):
+            continue
+        if codec_name.startswith("blosc-"):
+            dtype = np.dtype(variable["dtype"])
+            shuffle = requested_shuffle
+            if shuffle == "auto":
+                shuffle = (
+                    "bitshuffle"
+                    if np.issubdtype(dtype, np.integer)
+                    else "shuffle"
+                    if np.issubdtype(dtype, np.floating)
+                    else "noshuffle"
+                )
+            variable["codec"] = {
+                "kind": "blosc",
+                "level": level,
+                "cname": codec_name.removeprefix("blosc-"),
+                "shuffle": shuffle,
+            }
+        else:
+            variable["codec"] = {
+                "kind": codec_name,
+                "level": level,
+                "cname": None,
+                "shuffle": "noshuffle",
+            }
 
+
+
+def _pipeline_resource_snapshot(inspection, config: PipelineConfig, paths: PipelinePaths):
+    general = config.general
+    return runtime_resource_snapshot(
+        source=Path(inspection.path),
+        temporary=paths.root,
+        output=Path(general.output).expanduser().resolve().parent,
+        storage_overrides={
+            "source": general.source_storage,
+            "temporary": general.temporary_storage,
+            "output": general.output_storage,
+        },
+    )
+
+
+def _print_resource_snapshot(snapshot) -> None:
+    storage = snapshot.to_dict()["storage"]
+    print(
+        "运行资源："
+        f"CPU worker 上限={snapshot.cpu.worker_ceiling}；"
+        f"有效可用内存={snapshot.memory.effective_available_bytes / 1024**3:.1f} GiB；"
+        f"源/临时/输出介质="
+        f"{storage['source']['medium']}/{storage['temporary']['medium']}/"
+        f"{storage['output']['medium']}"
+    )
 def _logical_output_bytes(plan: PipelinePlan) -> int:
     if plan.output_layout is None:
         return 0
@@ -500,6 +567,9 @@ def _run_zarr_pipeline(
     paths = _paths(config)
     paths.root.mkdir(parents=True, exist_ok=False)
     output = Path(config.general.output).expanduser().resolve()
+    resources = _pipeline_resource_snapshot(inspection, config, paths)
+    if progress:
+        _print_resource_snapshot(resources)
     requested_operations = {
         "conversion": False,
         "resampling": bool(config.operations.resample),
@@ -522,6 +592,7 @@ def _run_zarr_pipeline(
         "input_kind": getattr(inspection, "kind", "zarr"),
         "output": str(output),
         "temporary_root": str(paths.root),
+        "resource_snapshot": resources.to_dict(),
         "cleanup_intermediate": bool(config.general.cleanup_intermediate),
         "needs_resample": bool(plan.needs_resample),
         "direct_finalization": bool(plan.direct_finalization),
@@ -683,7 +754,14 @@ def _run_zarr_pipeline(
                     temporary_dir=paths.root,
                     compression_codec=config.compression.codec,
                     compression_level=config.compression.level,
+                    storage_overrides={
+                        "source": config.general.source_storage,
+                        "temporary": config.general.temporary_storage,
+                        "output": config.general.output_storage,
+                    },
                     compression_shuffle=config.compression.shuffle,
+                    compression_objective=config.compression.objective,
+                    compression_tune_budget=config.compression.tune_budget,
                 ),
                 cancel_event=cancel_event,
             )
@@ -691,6 +769,7 @@ def _run_zarr_pipeline(
                 "status": "published_and_validated",
                 "metrics": finalization_metrics,
             }
+            _apply_runtime_compression(manifest, finalization_metrics)
             if plan.needs_resample and config.general.cleanup_intermediate:
                 shutil.rmtree(current)
                 manifest["stages"]["resampling"]["status"] = "validated_and_cleaned"
@@ -790,6 +869,9 @@ def run_pipeline(
     paths = _paths(config)
     _check_raw_storage_capacity(inspection, plan, paths)
     paths.root.mkdir(parents=True, exist_ok=False)
+    resources = _pipeline_resource_snapshot(inspection, config, paths)
+    if progress:
+        _print_resource_snapshot(resources)
     requested_operations = {
         "conversion": True,
         "resampling": bool(config.operations.resample),
@@ -812,6 +894,7 @@ def run_pipeline(
         "input_kind": "raw" if getattr(inspection, "kind", None) == "source" else getattr(inspection, "kind", "unknown"),
         "output": str(Path(config.general.output).expanduser().resolve()),
         "temporary_root": str(paths.root),
+        "resource_snapshot": resources.to_dict(),
         "cleanup_intermediate": bool(config.general.cleanup_intermediate),
         "needs_resample": bool(plan.needs_resample),
         "direct_finalization": bool(plan.direct_finalization),
@@ -1052,6 +1135,13 @@ def run_pipeline(
                 compression_codec=config.compression.codec,
                 compression_level=config.compression.level,
                 compression_shuffle=config.compression.shuffle,
+                compression_objective=config.compression.objective,
+                compression_tune_budget=config.compression.tune_budget,
+                storage_overrides={
+                    "source": config.general.source_storage,
+                    "temporary": config.general.temporary_storage,
+                    "output": config.general.output_storage,
+                },
             )
             if progress:
                 print(
@@ -1064,6 +1154,7 @@ def run_pipeline(
                 "status": "published_and_validated",
                 "metrics": rechunk_metrics,
             }
+            _apply_runtime_compression(manifest, rechunk_metrics)
             if config.general.cleanup_intermediate:
                 shutil.rmtree(current, ignore_errors=False)
                 manifest["stages"]["resampling" if plan.needs_resample else "conversion"]["status"] = "validated_and_cleaned"

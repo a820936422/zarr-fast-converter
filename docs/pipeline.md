@@ -16,7 +16,7 @@ python -m fast_nc_zarr.pipeline --help
 - 原始数据输入必定执行转换。
 - 现有 Zarr 输入跳过转换，并要求至少选择 `--resample`、`--rechunk` 或 `--recompress` 之一。
 - `--resample`、`--rechunk`、`--recompress` 表达最终产品意图，不保证各自形成独立物理阶段。
-- 最终 chunks 和 codec 会优先融合到转换器或重采样器；只有布局、变量或物理 chunk ownership 不兼容时才执行独立最终化。
+- 最终 chunks 和明确 codec 会优先融合到转换器或重采样器；只有布局、变量、物理 chunk ownership 不兼容，或请求真实样本自动压缩时才执行独立最终化。
 - 源网格与目标网格完全一致且没有替换规则时，重采样请求可作为 no-op 满足；float32 坐标使用受像元比例硬上限约束的 ULP-aware 比较，不把量化误差误判为新网格。
 
 ## 规划与执行流程
@@ -26,11 +26,13 @@ python -m fast_nc_zarr.pipeline --help
 3. 重采样时按方法计算带 halo 的连续源读取窗口，避免边界像元误差。
 4. 统一计算转换 chunks、最终 chunks、codec 和每项操作的 disposition。
 5. 在直接下推最终布局前验证任务边界不会切穿物理 Zarr chunk；不安全时自动保留最终化阶段。
-6. 创建任务目录和原子写入的 `manifest.json`。
-7. 执行转换；需要时执行 xESMF 重采样。
-8. 对重采样结果做有界局部数学抽样验证。
-9. 仅在必要时执行兼容性最终化。
-10. 执行语义抽样检查并发布最终 Zarr。
+6. `workers=auto` 时，最终化阶段 1 用互不重叠的真实源 chunk、阶段 2 用最终物理 chunk 对齐 region，在各自真实文件系统上独立实测安全候选。
+7. 自动压缩在代表性 begin/middle/end 数据上比较受控无损候选，校验逐值一致性并按 speed/balanced/compact 目标从 Pareto 前沿选择。
+8. 创建任务目录和原子写入的 `manifest.json`。
+9. 执行转换；需要时执行 xESMF 重采样。
+10. 对重采样结果做有界局部数学抽样验证。
+11. 仅在必要时执行兼容性最终化。
+12. 执行语义抽样检查并发布最终 Zarr。
 
 ## 常用命令
 
@@ -86,10 +88,11 @@ GUI 通常通过 `fast_nc_zarr.application.services.preview_pipeline` 和 `run_p
 每个任务目录包含 schema version 5 的 `manifest.json`，记录：
 
 - 请求操作、操作决策和实际物理阶段；
-- 源读取窗口、目标 shape、最终布局和压缩配置；
-- conversion/resampling 检查点；
-- 阶段状态、耗时、错误和恢复历史；
-- 最终逻辑字节、临时写入、写放大及避免的最终化 I/O。
+- CPU/内存/cgroup/WSL 与源、临时、输出存储证据及置信度；
+- 源读取窗口、目标 shape、最终布局和运行时选定压缩配置；
+- conversion/resampling 检查点、stage1/stage2 worker 候选、吞吐、RSS、失败与选择原因；
+- 压缩候选的写入、durable、冷热读取、体积、Pareto 与无损验证结果；
+- 阶段状态、耗时、错误、恢复历史、临时写入和写放大。
 
 失败或取消时保留临时目录。恢复模块验证 manifest、Zarr v3、维度、变量和检查点状态后，从最近的有效阶段继续；成功发布后才按清理策略删除上游临时 store。
 
