@@ -75,6 +75,8 @@ pixi run convert -- --input /data/source --output /data/result.zarr --dry-run
 
 关闭实测调优可用 `--no-tune`；限制物理核心数可用 `--max-workers`；通过 `--reserve-memory` 为系统保留内存。
 
+当一条龙规划器已固定转换 chunks 或最终 `OutputLayout` 时，自动调优仍会保持该布局不变，并只实测安全的 worker 数和任务批量。chunk 写入按变量和连续 time slab 分组；每个物理输出 chunk 只有一个 owner，源文件句柄缓存同时受时间块、worker、`RLIMIT_NOFILE` 和硬上限约束。
+
 ## Python 入口
 
 主要服务入口位于 `fast_nc_zarr.application.services`：

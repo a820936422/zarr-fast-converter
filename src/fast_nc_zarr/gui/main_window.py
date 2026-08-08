@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from pathlib import Path
 import time
 from typing import Any, Callable
+from uuid import uuid4
 
 import numpy as np
 from PySide6.QtCore import QDate, Qt, Signal
@@ -131,8 +133,16 @@ def _run_cancelable(cancel_event, operation: Callable[[], Any]) -> Any:
 
 
 class TaskPage(QWidget):
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, log_root: Path | None = None) -> None:
         super().__init__(parent)
+        self.log_root = log_root or (
+            Path.home() / ".cache" / "fast-nc-zarr" / "task-logs"
+        )
+        self.active_log_path: Path | None = None
+        self.active_events_path: Path | None = None
+        self.log_persistence_error: str | None = None
+        self._log_handle = None
+        self._events_handle = None
         self.history: list[dict[str, Any]] = []
         self._active_history: dict[str, Any] | None = None
         layout = QVBoxLayout(self)
@@ -213,11 +223,83 @@ class TaskPage(QWidget):
         layout.addWidget(self.history_table)
         self.cancel_callback: Callable[[], None] | None = None
 
+    def _disable_task_logs(self, exc: BaseException) -> None:
+        if self.log_persistence_error is None:
+            self.log_persistence_error = str(exc)
+        for name in ("_log_handle", "_events_handle"):
+            handle = getattr(self, name, None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    setattr(self, name, None)
+
     def append(self, message: str) -> None:
         self.log.appendPlainText(message)
+        if self._log_handle is not None:
+            try:
+                self._log_handle.write(message + "\n")
+                self._log_handle.flush()
+            except (OSError, ValueError) as exc:
+                self._disable_task_logs(exc)
+
+    def _event(self, kind: str, payload: dict[str, Any] | None = None) -> None:
+        if self._events_handle is None:
+            return
+        value = {
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "event": kind,
+            **(payload or {}),
+        }
+        try:
+            self._events_handle.write(
+                json.dumps(value, ensure_ascii=False, default=str) + "\n"
+            )
+            self._events_handle.flush()
+        except (OSError, ValueError) as exc:
+            self._disable_task_logs(exc)
+
+    def _open_task_logs(self, label: str) -> None:
+        self._close_task_logs()
+        self.log_persistence_error = None
+        try:
+            self.log_root.mkdir(parents=True, exist_ok=True)
+            stem = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex
+            self.active_log_path = self.log_root / f"{stem}.log"
+            self.active_events_path = self.log_root / f"{stem}.events.jsonl"
+            self._log_handle = self.active_log_path.open("a", encoding="utf-8")
+            self._events_handle = self.active_events_path.open("a", encoding="utf-8")
+            self._event(
+                "started",
+                {
+                    "label": label,
+                    "log_path": str(self.active_log_path),
+                    "events_path": str(self.active_events_path),
+                },
+            )
+        except OSError as exc:
+            self._close_task_logs()
+            self.active_log_path = None
+            self.active_events_path = None
+            self.log_persistence_error = str(exc)
+
+    def _close_task_logs(self) -> None:
+        for name in ("_log_handle", "_events_handle"):
+            handle = getattr(self, name, None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except (OSError, ValueError) as exc:
+                    if self.log_persistence_error is None:
+                        self.log_persistence_error = str(exc)
+                finally:
+                    setattr(self, name, None)
 
     def started(self, label: str, cancel: Callable[[], None]) -> None:
         self.status.setText(f"运行中：{label}")
+        self._open_task_logs(label)
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.progress.setFormat("等待可量化进度…")
@@ -238,6 +320,10 @@ class TaskPage(QWidget):
             self.cpu_curve.setData([], [])
             self.memory_curve.setData([], [])
         self.append(f"\n===== {label} =====")
+        if self.active_log_path is not None:
+            self.append(f"持久日志：{self.active_log_path}")
+        elif self.log_persistence_error is not None:
+            self.append(f"持久日志不可用，任务仍将继续：{self.log_persistence_error}")
 
 
     def update_progress(self, completed: int, total: int, detail: str) -> None:
@@ -247,6 +333,10 @@ class TaskPage(QWidget):
         self.progress.setRange(0, 1000)
         self.progress.setValue(value)
         self.progress.setFormat(f"%p%  {detail[:96]}")
+        self._event(
+            "progress",
+            {"completed": completed, "total": total, "detail": detail},
+        )
 
     def update_resource(self, sample: dict[str, Any]) -> None:
         elapsed = float(sample.get("elapsed", 0.0))
@@ -279,6 +369,7 @@ class TaskPage(QWidget):
             f"写入 {float(sample.get('write_mib_s', 0.0)):.1f} MiB/s；"
             f"磁盘 {len(disks)} 个"
         )
+        self._event("resource", sample)
         if self._active_history is not None:
             self._active_history["elapsed"] = elapsed
 
@@ -288,6 +379,10 @@ class TaskPage(QWidget):
         self._active_history["elapsed"] = max(
             float(self._active_history.get("elapsed", 0.0)),
             time.perf_counter() - float(self._active_history["started_monotonic"]),
+        )
+        self._event(
+            "finished",
+            {"status": status, "elapsed": self._active_history["elapsed"]},
         )
         self._active_history["status"] = status
         if self._active_history not in self.history:
@@ -310,6 +405,7 @@ class TaskPage(QWidget):
         self.cancel.setEnabled(False)
         self.cancel_callback = None
         self._finish_history("完成")
+        self._close_task_logs()
 
     def failed(self) -> None:
         self.status.setText("任务失败；请查看下方详细日志。")
@@ -317,6 +413,7 @@ class TaskPage(QWidget):
         self.cancel.setEnabled(False)
         self.cancel_callback = None
         self._finish_history("失败")
+        self._close_task_logs()
 
     def cancelled(self) -> None:
         self.status.setText("任务已取消。")
@@ -324,6 +421,7 @@ class TaskPage(QWidget):
         self.cancel.setEnabled(False)
         self.cancel_callback = None
         self._finish_history("已取消")
+        self._close_task_logs()
 
     def clear_history(self) -> None:
         self.history.clear()

@@ -10,7 +10,7 @@ from typing import Callable
 
 import numpy as np
 
-from .models import BenchmarkResult, ConversionPlan, Inventory, Selection
+from .models import BenchmarkResult, ConversionPlan, Inventory, OutputLayout, Selection
 from .selection import selected_logical_bytes
 from .writer import direct_write, fsync_tree
 
@@ -127,6 +127,28 @@ def representative_selections(
     return result or [sample]
 
 
+def _sample_output_layout(
+    layout: OutputLayout,
+    sample: Selection,
+) -> OutputLayout:
+    """Project full-product shapes onto a tune sample without changing storage choices."""
+
+    sizes = dict(zip(("time", "lat", "lon"), sample.shape))
+    return replace(
+        layout,
+        variables=tuple(
+            replace(
+                item,
+                shape=tuple(
+                    sizes.get(dim, size)
+                    for dim, size in zip(item.dims, item.shape)
+                ),
+            )
+            for item in layout.variables
+        ),
+    )
+
+
 def tune(
     inventory: Inventory,
     selection: Selection,
@@ -139,6 +161,8 @@ def tune(
     writer_kwargs: dict | None = None,
     logical_bytes_fn: Callable[[Inventory, Selection], int] = selected_logical_bytes,
     max_samples: int = 3,
+    fixed_layout: bool = False,
+    minimum_candidates: int = 1,
 ) -> tuple[ConversionPlan, list[BenchmarkResult]]:
     if len(candidates) == 1:
         return candidates[0], []
@@ -169,6 +193,9 @@ def tune(
         for index, plan in enumerate(candidates, 1)
     }
     writer_kwargs = writer_kwargs or {}
+    minimum_candidates = min(
+        len(candidates), max(1, int(minimum_candidates))
+    )
     tuning_started = time.perf_counter()
     if progress:
         print(
@@ -187,17 +214,30 @@ def tune(
             round_indices = active if sample_round > 1 else list(range(1, len(candidates) + 1))
             next_active: list[int] = []
             for index in round_indices:
-                if completed_any and time.perf_counter() - tuning_started >= budget_seconds:
+                if (
+                    completed_any
+                    and time.perf_counter() - tuning_started >= budget_seconds
+                    and (sample_round > 1 or index > minimum_candidates)
+                ):
                     stopped = True
                     break
                 plan = candidates[index - 1]
                 trial_output = tune_root / f"trial-{index}-{sample_round}.zarr"
-                adjusted = replace(
-                    plan,
-                    chunk_time=min(plan.chunk_time, sample.shape[0]),
-                    chunk_lat=min(plan.chunk_lat, sample.shape[1]),
-                    chunk_lon=min(plan.chunk_lon, sample.shape[2]),
-                )
+                adjusted = plan
+                if not fixed_layout:
+                    adjusted = replace(
+                        plan,
+                        chunk_time=min(plan.chunk_time, sample.shape[0]),
+                        chunk_lat=min(plan.chunk_lat, sample.shape[1]),
+                        chunk_lon=min(plan.chunk_lon, sample.shape[2]),
+                    )
+                trial_writer_kwargs = writer_kwargs
+                layout = writer_kwargs.get("output_layout")
+                if fixed_layout and isinstance(layout, OutputLayout):
+                    trial_writer_kwargs = dict(writer_kwargs)
+                    trial_writer_kwargs["output_layout"] = _sample_output_layout(
+                        layout, sample
+                    )
                 drop_source_page_cache(inventory, sample)
                 started = time.perf_counter()
                 try:
@@ -207,7 +247,7 @@ def tune(
                         trial_output,
                         adjusted,
                         progress=False,
-                        **writer_kwargs,
+                        **trial_writer_kwargs,
                     )
                     write_elapsed = float(metrics.get("elapsed", time.perf_counter() - started))
                     fsync_tree(trial_output)

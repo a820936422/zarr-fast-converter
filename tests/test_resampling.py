@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT / "src"))
 
 from fast_nc_zarr.resampling.engine import (  # noqa: E402
     ResampleExecutionError,
+    _owner_buffer,
     _mask_missing,
     _resolve_local_source_window,
     _tile_target,
@@ -214,6 +215,14 @@ class ResamplingTests(unittest.TestCase):
         self.assertEqual(plan.tile_size_requested, 1)
         self.assertIsNone(plan.auto_tile)
 
+    def test_owner_memmap_is_removed_when_task_fails(self) -> None:
+        temporary = ROOT / "failed-owner-buffer"
+        temporary.mkdir(parents=True, exist_ok=True)
+        with self.assertRaisesRegex(RuntimeError, "injected owner failure"):
+            with _owner_buffer((2, 2, 2), np.dtype("float32"), temporary, 0):
+                raise RuntimeError("injected owner failure")
+        self.assertEqual(list(temporary.glob(".resample-owner-*.bin")), [])
+
     def test_bilinear_resampling_preserves_chunks_codec_and_time(self) -> None:
         source = ROOT / "input.zarr"
         output = ROOT / "bilinear.zarr"
@@ -338,8 +347,9 @@ class ResamplingTests(unittest.TestCase):
             self.assertEqual(result.value.dtype, np.dtype("float32"))
             self.assertEqual(result.value.encoding["chunks"], (1, 2, 2))
 
-    def test_time_intermediate_is_merged_once_and_cleaned(self) -> None:
+    def test_large_time_chunk_uses_owner_buffer_without_intermediate_zarr(self) -> None:
         source = ROOT / "large-time-chunk.zarr"
+        reference_output = ROOT / "large-time-reference.zarr"
         output = ROOT / "large-time-output.zarr"
         temporary = ROOT / "resample-temporary"
         values = np.arange(4 * 4 * 4, dtype="float32").reshape(4, 4, 4)
@@ -356,9 +366,25 @@ class ResamplingTests(unittest.TestCase):
             mode="w",
             consolidated=False,
             zarr_format=3,
-            encoding={"value": {"chunks": (4, 2, 2)}},
+            encoding={
+                "value": {
+                    "chunks": (4, 2, 2),
+                    "compressors": [
+                        BloscCodec(cname="zstd", clevel=1, shuffle="shuffle")
+                    ],
+                }
+            },
         )
         dataset.close()
+        reference_config = ResampleConfig(
+            source,
+            reference_output,
+            resolution=2.0,
+            time_block=4,
+            space_workers=1,
+            temporary_dir=temporary,
+        )
+        run_resample(reference_config, progress=False)
         config = ResampleConfig(
             source,
             output,
@@ -367,18 +393,75 @@ class ResamplingTests(unittest.TestCase):
             space_workers=2,
             temporary_dir=temporary,
         )
-        metrics = run_resample(config, progress=False)
-        with xr.open_zarr(output, consolidated=False, chunks=None) as result:
-            self.assertEqual(result.value.encoding["chunks"], (4, 2, 2))
-            self.assertEqual(result.value.shape, (4, 2, 2))
-            self.assertTrue(np.isfinite(result.value.values).all())
+        plan = replace(plan_resample(config), owner_buffer_budget_bytes=0)
+        metrics = run_resample(config, plan, progress=False)
+        with (
+            xr.open_zarr(reference_output, consolidated=False, chunks=None) as expected,
+            xr.open_zarr(output, consolidated=False, chunks=None) as result,
+        ):
+            np.testing.assert_allclose(
+                result.value.values,
+                expected.value.values,
+                equal_nan=True,
+            )
+            self.assertEqual(
+                result.value.encoding["chunks"],
+                expected.value.encoding["chunks"],
+            )
+            actual_codec = result.value.encoding["compressors"][0]
+            expected_codec = expected.value.encoding["compressors"][0]
+            self.assertEqual(actual_codec.cname, expected_codec.cname)
+            self.assertEqual(actual_codec.clevel, expected_codec.clevel)
+            self.assertEqual(actual_codec.shuffle, expected_codec.shuffle)
+        self.assertFalse(metrics["used_intermediate"])
+        self.assertEqual(metrics["intermediate_logical_bytes"], 0)
+        self.assertGreater(metrics["avoided_intermediate_bytes"], 0)
+        self.assertEqual(metrics["logical_write_amplification"], 1.0)
+        self.assertIsNone(metrics["merge_timing"])
+        self.assertGreater(metrics["owner_buffer"]["memmap_bytes"], 0)
         self.assertTrue(temporary.is_dir())
         self.assertEqual(metrics["temporary_dir"], str(temporary.resolve()))
-        self.assertEqual(list(temporary.glob(".*.tmp")), [])
-        self.assertGreater(int(metrics["merge_timing"]["tasks"]), 0)
-        self.assertEqual(int(metrics["merge_timing"]["workers"]), 2)
-        self.assertGreater(float(metrics["merge_timing"]["elapsed_seconds"]), 0.0)
-        self.assertEqual(list(temporary.glob(".resample-buffer-*.bin")), [])
+        self.assertEqual(list(temporary.glob(".*.intermediate-*.tmp")), [])
+        self.assertEqual(list(temporary.rglob(".resample-owner-*.bin")), [])
+
+    def test_multiple_workers_have_disjoint_physical_chunk_ownership(self) -> None:
+        output = ROOT / "parallel-owner-output.zarr"
+        temporary = ROOT / "parallel-owner-temporary"
+        config = ResampleConfig(
+            ROOT / "input.zarr",
+            output,
+            resolution=1.0,
+            method="nearest_s2d",
+            time_block=1,
+            compute_workers=1,
+            space_workers=2,
+            temporary_dir=temporary,
+        )
+        plan = plan_resample(config)
+        final_chunks = dict(plan.output_chunks)
+        final_chunks["value"] = (2, 2, 2)
+        final_chunks["reordered"] = (2, 2, 2)
+        owner_plan = replace(
+            plan,
+            output_chunks=final_chunks,
+            owner_buffer_budget_bytes=0,
+        )
+        metrics = run_resample(config, owner_plan, progress=False)
+
+        self.assertEqual(metrics["space_workers"], 2)
+        self.assertEqual(int(metrics["tile_timing"]["tiles"]), 4)
+        self.assertEqual(metrics["owner_buffer"]["physical_chunks"], 8)
+        self.assertEqual(
+            int(metrics["tile_timing"]["time_batches"]),
+            int(metrics["tile_timing"]["total_time_batches"]),
+        )
+        self.assertFalse(metrics["used_intermediate"])
+        with xr.open_zarr(output, consolidated=False, chunks=None) as result:
+            self.assertEqual(result.value.encoding["chunks"], (2, 2, 2))
+            self.assertEqual(result.reordered.encoding["chunks"], (2, 2, 2))
+            self.assertTrue(np.isfinite(result.value.values).any())
+            self.assertTrue(np.isfinite(result.reordered.values).any())
+        self.assertEqual(list(temporary.rglob(".resample-owner-*.bin")), [])
 
     def test_spatial_compute_tiles_write_aligned_final_chunks_directly(self) -> None:
         source = ROOT / "input.zarr"
@@ -416,7 +499,7 @@ class ResamplingTests(unittest.TestCase):
             self.assertTrue(np.isfinite(result.value.values).any())
             self.assertTrue(np.isfinite(result.reordered.values).any())
         self.assertEqual(list(temporary.glob(".*.tmp")), [])
-        self.assertEqual(list(temporary.glob(".resample-buffer-*.bin")), [])
+        self.assertEqual(list(temporary.rglob(".resample-owner-*.bin")), [])
 
     def test_conservative_resampling_uses_derived_bounds(self) -> None:
         source = ROOT / "input.zarr"

@@ -40,7 +40,13 @@ from .models import (
     VariableSpec,
     VariableTransform,
 )
-from .planner import candidate_plans, resolve_conversion_plan
+from .planner import (
+    candidate_plans,
+    fixed_layout_candidate_plans,
+    output_layout_max_chunk_bytes,
+    output_layout_plan_chunks,
+    resolve_conversion_plan,
+)
 from .publication import make_staging_path, publish_staging, validate_publish_target
 from .runtime import bounded_process_map, spawn_context
 from .writer import _monitor, compressor_from_spec, make_compressor, progress_line
@@ -1702,24 +1708,51 @@ def convert_filename(
     if output == inventory.input_dir:
         raise ValueError("输入目录和输出目录不能相同。")
     transforms = transforms or {}
+    fixed_layout = chunks is not None or output_layout is not None
+    plan_chunks = chunks
+    if plan_chunks is None and output_layout is not None:
+        plan_chunks = output_layout_plan_chunks(selection, output_layout)
     plan = resolve_conversion_plan(
         inventory,
         selection,
         output,
         plan=plan,
-        chunks=chunks,
-        max_workers=max_workers if not auto_tune or chunks is not None else None,
+        chunks=plan_chunks,
+        max_workers=max_workers if not auto_tune or fixed_layout else None,
         reserve_gib=reserve_gib,
     )
     tuning_results = []
-    if auto_tune and chunks is None:
-        candidates = candidate_plans(
-            inventory,
-            selection,
-            output,
-            max_workers=max_workers,
-            reserve_gib=reserve_gib,
-        )
+    if auto_tune:
+        if fixed_layout:
+            candidates = fixed_layout_candidate_plans(
+                inventory,
+                selection,
+                plan,
+                max_workers=max_workers,
+                reserve_gib=reserve_gib,
+                worker_chunk_bytes=(
+                    output_layout_max_chunk_bytes(selection, output_layout)
+                    if output_layout is not None
+                    else None
+                ),
+            )
+            # Filename tasks advance along time. Keep each physical time chunk
+            # under one worker while tuning concurrency; splitting it would
+            # reintroduce concurrent read/modify/write of the same Zarr chunk.
+            candidates = list(
+                {
+                    item.workers: replace(item, task_batch=plan.chunk_time)
+                    for item in candidates
+                }.values()
+            )
+        else:
+            candidates = candidate_plans(
+                inventory,
+                selection,
+                output,
+                max_workers=max_workers,
+                reserve_gib=reserve_gib,
+            )
         plan, tuning_results = tune(
             inventory,
             selection,
@@ -1731,12 +1764,14 @@ def convert_filename(
             writer_kwargs={
                 "transforms": transforms,
                 "variable_names": variable_names or {},
+                "output_layout": output_layout,
                 "cancel_event": cancel_event,
                 "validate": False,
             },
             logical_bytes_fn=lambda info, chosen: filename_logical_bytes(
                 info, chosen, transforms
             ),
+            fixed_layout=fixed_layout,
         )
 
     if tuning_results:

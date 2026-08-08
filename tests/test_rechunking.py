@@ -4,6 +4,7 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import xarray as xr
@@ -11,9 +12,13 @@ import xarray as xr
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 
+from fast_nc_zarr.models import StorageProfile  # noqa: E402
 from fast_nc_zarr.rechunking.compression import make_compression_plan  # noqa: E402
 from fast_nc_zarr.rechunking.engine import (  # noqa: E402
+    RechunkExecutionError,
     _intermediate_shards,
+    _parallel_workers,
+    _stage2_safe_workers,
     run_rechunk,
 )
 from fast_nc_zarr.rechunking.inspection import (  # noqa: E402
@@ -60,6 +65,9 @@ class RechunkingTests(unittest.TestCase):
             encoding={
                 "float_value": {"chunks": (2, 4, 5)},
                 "integer_value": {"chunks": (2, 4, 5)},
+                "time": {"chunks": (2,)},
+                "lat": {"chunks": (4,)},
+                "lon": {"chunks": (5,)},
             },
         )
         dataset.close()
@@ -85,6 +93,201 @@ class RechunkingTests(unittest.TestCase):
         self.assertEqual(shards["float_value"], (2, 8, 10))
         self.assertEqual(shards["integer_value"], (2, 8, 10))
 
+    def test_equivalent_store_uses_independent_chunk_copy(self) -> None:
+        source = ROOT / "input.zarr"
+        output = ROOT / "equivalent-copy.zarr"
+        info = inspect_store(source)
+        plan = plan_chunks(
+            info,
+            "custom",
+            custom_chunks=(2, 4, 5),
+            target_mib=32,
+        )
+
+        metrics = run_rechunk(
+            source,
+            output,
+            info,
+            plan,
+            make_compression_plan("none"),
+            workers=4,
+            progress=False,
+        )
+
+        self.assertEqual(metrics["execution_path"], "copy")
+        self.assertEqual(metrics["avoided_intermediate_bytes"], info.logical_bytes)
+        source_metadata = {
+            path.relative_to(source): path.read_bytes()
+            for path in source.rglob("zarr.json")
+        }
+        output_metadata = {
+            path.relative_to(output): path.read_bytes()
+            for path in output.rglob("zarr.json")
+        }
+        self.assertEqual(output_metadata, source_metadata)
+        source_chunks = [
+            path
+            for path in (source / "float_value").rglob("*")
+            if path.is_file() and path.name != "zarr.json"
+        ]
+        self.assertTrue(source_chunks)
+        for source_chunk in source_chunks:
+            output_chunk = output / source_chunk.relative_to(source)
+            self.assertTrue(output_chunk.is_file())
+            self.assertNotEqual(
+                (source_chunk.stat().st_dev, source_chunk.stat().st_ino),
+                (output_chunk.stat().st_dev, output_chunk.stat().st_ino),
+            )
+        with xr.open_zarr(output, consolidated=False, chunks=None) as result:
+            np.testing.assert_array_equal(
+                result["float_value"].values,
+                np.arange(6 * 8 * 10, dtype="float32").reshape(6, 8, 10),
+            )
+            self.assertEqual(result.attrs["title"], "rechunk test")
+
+    def test_equivalent_copy_rejects_source_symlinks(self) -> None:
+        source = ROOT / "input.zarr"
+        output = ROOT / "symlink-copy.zarr"
+        info = inspect_store(source)
+        plan = plan_chunks(
+            info,
+            "custom",
+            custom_chunks=(2, 4, 5),
+            target_mib=32,
+        )
+        link = source / "external-link"
+        link.symlink_to(source / "zarr.json")
+        self.addCleanup(link.unlink, missing_ok=True)
+
+        with self.assertRaisesRegex(RechunkExecutionError, "符号链接"):
+            run_rechunk(
+                source,
+                output,
+                info,
+                plan,
+                make_compression_plan("none"),
+                workers=1,
+                progress=False,
+            )
+
+        self.assertFalse(output.exists())
+
+    def test_codec_change_uses_single_stage_physical_chunks(self) -> None:
+        source = ROOT / "input.zarr"
+        output = ROOT / "codec-only.zarr"
+        info = inspect_store(source)
+        plan = plan_chunks(
+            info,
+            "custom",
+            custom_chunks=(2, 4, 5),
+            target_mib=32,
+        )
+
+        metrics = run_rechunk(
+            source,
+            output,
+            info,
+            plan,
+            make_compression_plan("fast"),
+            workers=2,
+            progress=False,
+        )
+
+        self.assertEqual(metrics["execution_path"], "single_stage")
+        self.assertEqual(metrics["avoided_intermediate_bytes"], info.logical_bytes)
+        result_info = inspect_store(output)
+        for variable in result_info.variables:
+            self.assertEqual(variable.chunks, plan.chunks_for(variable))
+        with xr.open_zarr(output, consolidated=False, chunks=None) as result:
+            codec = result["float_value"].encoding["compressors"][0]
+            self.assertEqual(codec.cname, "zstd")
+            self.assertEqual(codec.clevel, 1)
+            np.testing.assert_array_equal(
+                result["integer_value"].values,
+                np.arange(6 * 8 * 10, dtype="int16").reshape(6, 8, 10),
+            )
+            self.assertEqual(result.attrs["title"], "rechunk test")
+
+    def test_failed_equivalent_copy_preserves_existing_target(self) -> None:
+        source = ROOT / "input.zarr"
+        output = ROOT / "protected-target.zarr"
+        shutil.copytree(source, output)
+        before = (output / "zarr.json").read_bytes()
+        info = inspect_store(source)
+        plan = plan_chunks(info, "custom", custom_chunks=(2, 4, 5))
+
+        with patch(
+            "fast_nc_zarr.rechunking.engine._copy_equivalent_store",
+            side_effect=OSError("simulated copy failure"),
+        ):
+            with self.assertRaises(RechunkExecutionError):
+                run_rechunk(
+                    source,
+                    output,
+                    info,
+                    plan,
+                    make_compression_plan("none"),
+                    overwrite=True,
+                    workers=1,
+                    progress=False,
+                )
+
+        self.assertEqual((output / "zarr.json").read_bytes(), before)
+        with xr.open_zarr(output, consolidated=False, chunks=None) as result:
+            np.testing.assert_array_equal(
+                result["integer_value"].values,
+                np.arange(6 * 8 * 10, dtype="int16").reshape(6, 8, 10),
+            )
+
+    def test_worker_caps_use_filesystem_and_stage2_peak_memory(self) -> None:
+        network_source = StorageProfile(Path("/source"), "network-a", False, "9p")
+        network_target = StorageProfile(Path("/target"), "network-b", False, "ext4")
+        with (
+            patch(
+                "fast_nc_zarr.rechunking.engine.storage_profile",
+                side_effect=[network_source, network_target],
+            ),
+            patch("fast_nc_zarr.rechunking.engine.os.cpu_count", return_value=16),
+        ):
+            network_workers, reason = _parallel_workers(
+                Path("/source"), Path("/target"), 8
+            )
+        self.assertEqual(network_workers, 2)
+        self.assertIn("9p", reason)
+
+        ssd_source = StorageProfile(Path("/source"), "ssd-a", False, "ext4")
+        ssd_target = StorageProfile(Path("/target"), "ssd-b", False, "ext4")
+        with (
+            patch(
+                "fast_nc_zarr.rechunking.engine.storage_profile",
+                side_effect=[ssd_source, ssd_target],
+            ),
+            patch("fast_nc_zarr.rechunking.engine.os.cpu_count", return_value=16),
+        ):
+            ssd_workers, _ = _parallel_workers(Path("/source"), Path("/target"), 8)
+        self.assertEqual(ssd_workers, 8)
+
+        info = inspect_store(ROOT / "input.zarr")
+        plan = plan_chunks(info, "custom", custom_chunks=(2, 4, 5))
+        regions = {
+            variable.name: variable.chunks
+            for variable in info.data_variables
+            if variable.ndim == 3
+        }
+        with patch(
+            "fast_nc_zarr.rechunking.engine.psutil.virtual_memory"
+        ) as virtual_memory:
+            virtual_memory.return_value.available = 1
+            memory_workers, peak_bytes = _stage2_safe_workers(
+                info,
+                plan,
+                regions,
+                make_compression_plan("fast"),
+                8,
+            )
+        self.assertEqual(memory_workers, 1)
+        self.assertGreater(peak_bytes, 0)
+
     def test_rechunk_and_type_specific_lossless_compression(self) -> None:
         source = ROOT / "input.zarr"
         output = ROOT / "balanced.zarr"
@@ -100,6 +303,8 @@ class RechunkingTests(unittest.TestCase):
             progress=False,
         )
         self.assertGreater(metrics["physical_bytes"], 0)
+        self.assertEqual(metrics["execution_path"], "two_stage")
+        self.assertEqual(metrics["avoided_intermediate_bytes"], 0)
         result = inspect_store(output)
         self.assertEqual(result.dimensions, info.dimensions)
         for variable in result.data_variables:

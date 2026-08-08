@@ -23,7 +23,12 @@ from fast_nc_zarr.benchmark import representative_selection, tune  # noqa: E402
 from fast_nc_zarr.models import CodecSpec, ConversionPlan, OutputLayout, Selection, VariableOutputLayout
 from fast_nc_zarr.selection import make_selection, parse_list  # noqa: E402
 from fast_nc_zarr.validation import validate_output  # noqa: E402
-from fast_nc_zarr.writer import direct_write  # noqa: E402
+from fast_nc_zarr.writer import (  # noqa: E402
+    SOURCE_CACHE_HARD_LIMIT,
+    chunk_tasks,
+    direct_write,
+    source_cache_limit,
+)
 
 
 ROOT = Path("/tmp/codex_test/fast_nc_zarr_tests")
@@ -128,13 +133,157 @@ class EndToEndTests(unittest.TestCase):
             inventory, variables=["temperature", "quality", "permuted"]
         )
         output = ROOT / "large-output.zarr"
-        plan = ConversionPlan("chunk", 2, 4, 6, 8)
-        direct_write(inventory, selection, output, plan, progress=False)
+        plan = ConversionPlan("chunk", 2, 4, 6, 8, task_batch=4)
+        metrics = direct_write(inventory, selection, output, plan, progress=False)
+        planned = list(chunk_tasks(inventory, selection, plan))
+        owners = {
+            (task.output_variable or task.variable, task.output_ranges)
+            for task in planned
+        }
+        self.assertEqual(len(owners), len(planned))
+        self.assertEqual(metrics["chunks_written"], len(planned))
+        self.assertEqual(metrics["planned_chunks"], len(planned))
+        self.assertLess(metrics["task_batches"], metrics["planned_chunks"])
+        self.assertEqual(metrics["workers"], 2)
+        self.assertGreater(metrics["source_opens"], 0)
+        self.assertGreater(metrics["source_cache_hits"], 0)
+        self.assertLessEqual(metrics["source_cache_limit"], SOURCE_CACHE_HARD_LIMIT)
+        self.assertEqual(
+            source_cache_limit(10_000, 8, open_file_limit=64),
+            4,
+        )
         validate_output(inventory, selection, output, points=5)
-        with xr.open_zarr(output, chunks=None, mask_and_scale=False, consolidated=False) as actual:
+        with xr.open_zarr(
+            output, chunks=None, mask_and_scale=False, consolidated=False
+        ) as actual:
             self.assertEqual(actual.sizes["time"], 12)
             self.assertEqual(
                 set(actual.data_vars), {"temperature", "quality", "permuted"}
+            )
+
+    def test_fixed_chunks_autotune_preserves_complete_layout(self) -> None:
+        inventory = inspect_dataset(ROOT / "large", workers=1, progress=False)
+        selection = make_selection(inventory, variables=["temperature"])
+        shape = selection.shape
+        forced_chunks = (3, 6, 8)
+        codec = CodecSpec("blosc", level=1, cname="zstd", shuffle="shuffle")
+        layout = OutputLayout(
+            variables=(
+                VariableOutputLayout(
+                    "temperature",
+                    "temperature",
+                    ("time", "lat", "lon"),
+                    shape,
+                    "float32",
+                    forced_chunks,
+                    codec=codec,
+                ),
+                VariableOutputLayout(
+                    "time",
+                    "time",
+                    ("time",),
+                    (shape[0],),
+                    str(inventory.times.dtype),
+                    (shape[0],),
+                    codec=codec,
+                    is_coord=True,
+                ),
+                VariableOutputLayout(
+                    "lat",
+                    "lat",
+                    ("lat",),
+                    (shape[1],),
+                    str(inventory.lat_values.dtype),
+                    (shape[1],),
+                    codec=codec,
+                    is_coord=True,
+                ),
+                VariableOutputLayout(
+                    "lon",
+                    "lon",
+                    ("lon",),
+                    (shape[2],),
+                    str(inventory.lon_values.dtype),
+                    (shape[2],),
+                    codec=codec,
+                    is_coord=True,
+                ),
+            )
+        )
+        observed = {}
+
+        def capture_tune(*args, **kwargs):
+            observed["candidates"] = args[3]
+            observed["kwargs"] = kwargs
+            return tune(*args, **kwargs)
+
+        tuned_output = ROOT / "fixed-layout-tuned.zarr"
+        with (
+            patch("fast_nc_zarr.planner.physical_cpu_count", return_value=4),
+            patch("fast_nc_zarr.planner.available_memory", return_value=8 * 1024**3),
+            patch("fast_nc_zarr.engine.tune", side_effect=capture_tune),
+        ):
+            chosen, metrics = convert(
+                inventory,
+                selection,
+                tuned_output,
+                chunks=forced_chunks,
+                output_layout=layout,
+                auto_tune=True,
+                tune_budget=5,
+                max_workers=3,
+                progress=False,
+            )
+
+        candidates = observed["candidates"]
+        self.assertGreater(len({item.workers for item in candidates}), 2)
+        self.assertTrue(all(item.workers <= 3 for item in candidates))
+        invariant_layouts = {
+            (
+                item.strategy,
+                item.chunks,
+                item.compression,
+                item.compression_level,
+                item.shuffle,
+                item.rationale,
+            )
+            for item in candidates
+        }
+        self.assertEqual(len(invariant_layouts), 1)
+        self.assertEqual(observed["kwargs"]["writer_kwargs"]["output_layout"], layout)
+        self.assertTrue(observed["kwargs"]["fixed_layout"])
+        self.assertEqual(chosen.chunks, forced_chunks)
+        self.assertEqual(metrics["chunks_written"], metrics["planned_chunks"])
+
+        reference_output = ROOT / "fixed-layout-reference.zarr"
+        convert(
+            inventory,
+            selection,
+            reference_output,
+            chunks=forced_chunks,
+            output_layout=layout,
+            auto_tune=False,
+            max_workers=1,
+            progress=False,
+        )
+        with (
+            xr.open_zarr(
+                tuned_output,
+                chunks=None,
+                mask_and_scale=False,
+                consolidated=False,
+            ) as tuned,
+            xr.open_zarr(
+                reference_output,
+                chunks=None,
+                mask_and_scale=False,
+                consolidated=False,
+            ) as reference,
+        ):
+            self.assertEqual(tuned.temperature.encoding["chunks"], forced_chunks)
+            np.testing.assert_array_equal(
+                tuned.temperature.values,
+                reference.temperature.values,
             )
 
     def test_tuner_measures_and_cleans_trials(self) -> None:

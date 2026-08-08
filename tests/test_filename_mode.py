@@ -247,13 +247,28 @@ class FilenameModeTests(unittest.TestCase):
         scan = scan_filename_times(folder)
         inventory = inspect_filename_inventory(scan, workers=1, progress=False)
         output = ROOT / "linked-chunks-output.zarr"
-        plan, _ = convert_filename(
-            inventory,
-            make_selection(inventory),
-            output,
-            chunks=(2, 2, 3),
-            auto_tune=True,
-            progress=False,
+        with (
+            patch(
+                "fast_nc_zarr.filename_mode.tune",
+                side_effect=lambda *args, **kwargs: (args[3][0], []),
+            ) as tune_mock,
+            patch("fast_nc_zarr.planner.physical_cpu_count", return_value=4),
+            patch("fast_nc_zarr.planner.available_memory", return_value=8 * 1024**3),
+        ):
+            plan, _ = convert_filename(
+                inventory,
+                make_selection(inventory),
+                output,
+                chunks=(2, 2, 3),
+                auto_tune=True,
+                progress=False,
+            )
+        candidates = tune_mock.call_args.args[3]
+        self.assertTrue(tune_mock.call_args.kwargs["fixed_layout"])
+        self.assertGreater(len({item.workers for item in candidates}), 1)
+        self.assertTrue(all(item.chunks == (2, 2, 3) for item in candidates))
+        self.assertTrue(
+            all(item.task_batch == item.chunk_time for item in candidates)
         )
         self.assertEqual(plan.chunks, (2, 2, 3))
         with xr.open_zarr(output, consolidated=False, chunks=None, decode_times=False) as dataset:

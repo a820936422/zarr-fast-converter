@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import math
 import threading
@@ -37,7 +38,7 @@ from fast_nc_zarr.application.services import (  # noqa: E402
 from fast_nc_zarr.models import VariableSpec, VariableTransform
 from fast_nc_zarr.gui import fonts  # noqa: E402
 from fast_nc_zarr.gui.fonts import configure_application_font  # noqa: E402
-from fast_nc_zarr.gui.main_window import MainWindow, _run_cancelable  # noqa: E402
+from fast_nc_zarr.gui.main_window import MainWindow, TaskPage, _run_cancelable  # noqa: E402
 from fast_nc_zarr.gui.workers import parse_progress_message, resolve_storage_targets  # noqa: E402
 from fast_nc_zarr.time_mapping import inspect_time_metadata  # noqa: E402
 from fast_nc_zarr.pipeline.models import (  # noqa: E402
@@ -85,8 +86,8 @@ class VersionTests(unittest.TestCase):
     def test_window_title_displays_release_version(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = MainWindow()
-        self.assertEqual(__version__, "1.6.5")
-        self.assertIn("v1.6.5", window.windowTitle())
+        self.assertEqual(__version__, "1.6.6")
+        self.assertIn("v1.6.6", window.windowTitle())
         window.close()
         app.processEvents()
 
@@ -115,6 +116,68 @@ class TaskFeedbackTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "任务已取消"):
             _run_cancelable(cancelled, lambda: "stale result")
+
+    def test_task_log_and_resource_events_are_persisted(self) -> None:
+        root = ROOT / "task-logs"
+        shutil.rmtree(root, ignore_errors=True)
+        app = QApplication.instance() or QApplication([])
+        page = TaskPage(log_root=root)
+        page.started("持久日志测试", lambda: None)
+        page.append("worker message")
+        page.update_progress(1, 2, "进度：1/2")
+        page.update_resource({"elapsed": 1.0, "cpu": 25.0, "rss_gib": 0.5})
+        page.completed()
+
+        self.assertIsNotNone(page.active_log_path)
+        self.assertIsNotNone(page.active_events_path)
+        self.assertIn("worker message", page.active_log_path.read_text(encoding="utf-8"))
+        events = [
+            json.loads(line)
+            for line in page.active_events_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(
+            [event["event"] for event in events],
+            ["started", "progress", "resource", "finished"],
+        )
+        page.close()
+        app.processEvents()
+
+
+    def test_event_write_failure_does_not_break_task_completion(self) -> None:
+        class FailingHandle:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def write(self, _value: str) -> None:
+                raise OSError("disk full")
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        root = ROOT / "failing-task-logs"
+        shutil.rmtree(root, ignore_errors=True)
+        app = QApplication.instance() or QApplication([])
+        page = TaskPage(log_root=root)
+        page.started("日志容错测试", lambda: None)
+        page._close_task_logs()
+        failing_log = FailingHandle()
+        failing_events = FailingHandle()
+        page._log_handle = failing_log
+        page._events_handle = failing_events
+
+        page._finish_history("完成")
+
+        self.assertEqual(page.history[-1]["status"], "完成")
+        self.assertEqual(page.log_persistence_error, "disk full")
+        self.assertTrue(failing_log.closed)
+        self.assertTrue(failing_events.closed)
+        self.assertIsNone(page._log_handle)
+        self.assertIsNone(page._events_handle)
+        page.close()
+        app.processEvents()
 
 
 class GuiServiceTests(unittest.TestCase):
@@ -246,7 +309,7 @@ class GuiServiceTests(unittest.TestCase):
         window = MainWindow()
         self.assertEqual(window.navigation.count(), 6)
         self.assertEqual(window.stack.count(), 6)
-        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.5")
+        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.6")
         self.assertEqual(
             [
                 window.navigation.item(index).text()

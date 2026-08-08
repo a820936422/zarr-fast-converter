@@ -64,6 +64,37 @@ def _memory_budget(available: int, total: int) -> int:
     budget = min(int(available * 0.60), int(total * 0.50))
     return max(256 * MIB, budget)
 
+def resolve_owner_buffer_budget(
+    *,
+    space_workers: int,
+    reserved_bytes: int | None = None,
+    available_bytes: int | None = None,
+    total_bytes: int | None = None,
+) -> int:
+    """Return a conservative per-worker heap budget for final-chunk buffers.
+
+    A buffer larger than this limit is backed by a temporary memmap instead of
+    allocating more resident memory.  ``reserved_bytes`` is the aggregate
+    peak already estimated for all regridding workers; manual plans reserve
+    the native ESMF baseline because they do not carry an automatic estimate.
+    """
+
+    detected_available, detected_total = _memory_limits()
+    available = max(
+        256 * MIB,
+        int(detected_available if available_bytes is None else available_bytes),
+    )
+    total = max(256 * MIB, int(detected_total if total_bytes is None else total_bytes))
+    workers = max(1, int(space_workers))
+    reserved = (
+        ESMF_WORKER_BASELINE_BYTES * workers
+        if reserved_bytes is None
+        else max(0, int(reserved_bytes))
+    )
+    remaining = max(0, _memory_budget(available, total) - reserved)
+    pressure_cap = min(int(available * 0.05), int(total * 0.025))
+    return max(0, min(256 * MIB, remaining // workers, pressure_cap // workers))
+
 
 def resolve_auto_space_workers(
     *,

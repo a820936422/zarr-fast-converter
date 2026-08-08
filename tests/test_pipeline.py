@@ -43,7 +43,7 @@ from fast_nc_zarr.pipeline.models import (  # noqa: E402
     PipelineResamplingOptions,
 )
 from fast_nc_zarr.pipeline.planner import build_pipeline_plan  # noqa: E402
-from fast_nc_zarr.models import VariableSpec  # noqa: E402
+from fast_nc_zarr.models import ConversionPlan, VariableSpec  # noqa: E402
 from fast_nc_zarr.resampling.environment import ResamplingEnvironmentError  # noqa: E402
 
 
@@ -662,6 +662,156 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["logical_io"]["temporary_write_bytes"], 0)
         self.assertEqual(result["logical_io"]["write_amplification"], 1.0)
         self.assertGreater(result["logical_io"]["avoided_finalization_read_bytes"], 0)
+
+    def test_float32_quantized_regular_grid_is_resampling_noop(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(
+                ROOT / "canonical", mode="complete", engine="h5netcdf", workers=1
+            )
+        )
+        inspection.source_inventory.lat_values = np.asarray(
+            [60.25, 60.15, 60.05], dtype="float32"
+        )
+        # Cross zero to cover origin/step quantization where the local ULP is
+        # much smaller than the accumulated float32 coordinate error.
+        inspection.source_inventory.lon_values = np.asarray(
+            [-0.15, -0.05, 0.05, 0.15], dtype="float32"
+        )
+        base = self._config(ROOT / "float32-grid-noop.zarr")
+        config = replace(
+            base,
+            general=replace(
+                base.general,
+                lat_min=60.0,
+                lat_max=60.3,
+                lon_min=-0.2,
+                lon_max=0.2,
+            ),
+            operations=PipelineOperations(resample=True),
+        )
+
+        plan = preview_pipeline(inspection, config)
+
+        self.assertFalse(plan.needs_resample)
+        self.assertIsNone(plan.coverage_warning)
+        self.assertEqual(
+            plan.decision("resampling").disposition,
+            "satisfied_as_noop",
+        )
+        self.assertEqual(
+            np.dtype(plan.output_layout.for_output("lat").dtype),
+            np.dtype("float32"),
+        )
+
+    def test_real_and_half_pixel_grid_offsets_still_resample(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(
+                ROOT / "canonical", mode="complete", engine="h5netcdf", workers=1
+            )
+        )
+        inspection.source_inventory.lat_values = np.asarray(
+            [60.25, 60.15, 60.05], dtype="float32"
+        )
+        inspection.source_inventory.lon_values = np.asarray(
+            [120.05, 120.15, 120.25, 120.35], dtype="float32"
+        )
+        base = self._config(ROOT / "shifted-grid.zarr")
+
+        for offset in (0.01, 0.05):
+            with self.subTest(offset=offset):
+                config = replace(
+                    base,
+                    general=replace(
+                        base.general,
+                        lat_min=60.0 + offset,
+                        lat_max=60.3 + offset,
+                        lon_min=120.0,
+                        lon_max=120.4,
+                    ),
+                    operations=PipelineOperations(resample=True),
+                )
+                plan = preview_pipeline(inspection, config)
+                self.assertTrue(plan.needs_resample)
+                self.assertEqual(
+                    plan.decision("resampling").disposition,
+                    "executed_as_stage",
+                )
+
+    def test_smaller_conversion_tasks_force_storage_finalization(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(
+                ROOT / "canonical", mode="complete", engine="h5netcdf", workers=1
+            )
+        )
+        base = self._config(ROOT / "unsafe-direct-layout.zarr")
+        config = replace(
+            base,
+            operations=PipelineOperations(rechunk=True),
+            chunking=PipelineChunkingOptions(
+                strategy="custom",
+                custom_chunks=(2, 2, 2),
+                workers=2,
+            ),
+        )
+        conversion_plan = ConversionPlan(
+            strategy="chunk",
+            workers=2,
+            chunk_time=1,
+            chunk_lat=1,
+            chunk_lon=1,
+        )
+
+        with patch(
+            "fast_nc_zarr.pipeline.planner.resolve_conversion_plan",
+            return_value=conversion_plan,
+        ):
+            plan = preview_pipeline(inspection, config)
+
+        self.assertEqual(plan.conversion_chunks, (1, 1, 1))
+        self.assertEqual(plan.final_chunks, (2, 2, 2))
+        self.assertTrue(plan.finalization_required)
+        self.assertFalse(plan.direct_finalization)
+        self.assertEqual(plan.decision("rechunking").disposition, "executed_as_stage")
+        self.assertIn("每个物理 chunk 仅由一个并行任务写入", plan.decision("rechunking").reason)
+
+    def test_aligned_conversion_tasks_still_fuse_storage_layout(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(
+                ROOT / "canonical", mode="complete", engine="h5netcdf", workers=1
+            )
+        )
+        base = self._config(ROOT / "safe-direct-layout.zarr")
+        config = replace(
+            base,
+            operations=PipelineOperations(rechunk=True),
+            chunking=PipelineChunkingOptions(
+                strategy="custom",
+                custom_chunks=(1, 1, 1),
+                workers=2,
+            ),
+        )
+        conversion_plan = ConversionPlan(
+            strategy="chunk",
+            workers=2,
+            chunk_time=2,
+            chunk_lat=2,
+            chunk_lon=2,
+        )
+
+        with patch(
+            "fast_nc_zarr.pipeline.planner.resolve_conversion_plan",
+            return_value=conversion_plan,
+        ):
+            plan = preview_pipeline(inspection, config)
+
+        self.assertEqual(plan.conversion_chunks, (2, 2, 2))
+        self.assertEqual(plan.final_chunks, (1, 1, 1))
+        self.assertFalse(plan.finalization_required)
+        self.assertTrue(plan.direct_finalization)
+        self.assertEqual(
+            plan.decision("rechunking").disposition,
+            "fused_into_conversion",
+        )
 
     def test_cleanup_removes_only_validated_intermediate_stores(self) -> None:
         inspection = inspect_source(

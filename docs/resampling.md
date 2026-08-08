@@ -73,11 +73,11 @@ pixi run resample -- --input /data/input.zarr --output /data/output.zarr --resol
 
 `--before-conditions` 和 `--before-results` 在采样前执行；`--after-conditions` 和 `--after-results` 在采样后执行。规则按声明顺序匹配。统计表达式支持 `auto`、`sample` 和 `exact` 策略；`exact` 可能扫描完整变量，应根据数据规模选择。
 
-## 中转层与输出
+## 最终 chunk owner 与输出
 
-当计算时间 block 小于最终 time chunk，且多个批次会更新同一最终 chunk 时，模块建立时间中转 Zarr，全部完成后受控合并一次。空间 tile 则直接对齐最终 chunk 边界。中转 store 和权重文件写入 `--temporary-dir`；成功发布后清理，失败时保留。
+当计算 time block 小于最终 time chunk 时，每个空间任务独占一个或一组完整的最终物理 chunk，并将各时间批次填入受内存预算约束的堆缓冲或任务专属 memmap；填满后每个物理 chunk 只编码写入一次。这样不需要完整的时间中转 Zarr，也不会让多个进程并发读改写同一 chunk。memmap 在成功、取消和异常路径都会清理。
 
-输入属性、时间坐标和可兼容 codec 会被保留；显式最终布局由一条龙规划器下推时，重采样器直接写目标 chunks/codec。
+输入属性、时间坐标和可兼容 codec 会被保留；显式最终布局由一条龙规划器下推时，重采样器直接写目标 chunks/codec。指标会记录 owner buffer、memmap 使用和避免的中转逻辑字节。
 
 ## Python 入口
 

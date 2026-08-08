@@ -24,17 +24,48 @@ from .runtime import bounded_process_map
 _OUTPUT_GROUP = None
 _SOURCE_CACHE = None
 _SOURCE_CACHE_LIMIT = 4
+_SOURCE_CACHE_HITS = 0
+_SOURCE_OPENS = 0
+_SOURCE_FINALIZER = None
 _SOURCE_ENGINE = "netcdf4"
 
-def _worker_init(output: str, source_engine: str = "netcdf4") -> None:
-    global _OUTPUT_GROUP, _SOURCE_CACHE, _SOURCE_ENGINE
-    from collections import OrderedDict
+SOURCE_CACHE_HARD_LIMIT = 64
+_SOURCE_FD_RESERVE = 32
+TASK_BATCH_HARD_LIMIT = 64
 
-    import zarr
 
-    _OUTPUT_GROUP = zarr.open_group(output, mode="r+")
-    _SOURCE_CACHE = OrderedDict()
-    _SOURCE_ENGINE = source_engine
+def _effective_task_batch(value: int) -> int:
+    return max(1, min(TASK_BATCH_HARD_LIMIT, int(value)))
+
+
+
+def source_cache_limit(
+    chunk_time: int,
+    workers: int,
+    *,
+    task_batch: int = 1,
+    hard_limit: int = SOURCE_CACHE_HARD_LIMIT,
+    open_file_limit: int | None = None,
+) -> int:
+    """Choose a conservative per-worker source-handle LRU capacity."""
+
+    worker_count = max(1, int(workers))
+    hard_limit = max(1, int(hard_limit))
+    desired = max(1, int(chunk_time)) * max(1, int(task_batch))
+    if open_file_limit is None:
+        try:
+            import resource
+
+            soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft_limit != resource.RLIM_INFINITY and int(soft_limit) >= 0:
+                open_file_limit = int(soft_limit)
+        except (ImportError, OSError, ValueError):
+            open_file_limit = None
+    descriptor_limit = hard_limit
+    if open_file_limit is not None:
+        shared_budget = max(1, int(open_file_limit) - _SOURCE_FD_RESERVE)
+        descriptor_limit = max(1, shared_budget // worker_count)
+    return max(1, min(hard_limit, desired, descriptor_limit))
 
 
 def _close_source(source) -> None:
@@ -43,10 +74,55 @@ def _close_source(source) -> None:
         close()
 
 
+def _close_worker_sources() -> None:
+    """Close every retained source handle before a worker exits or is reused."""
+
+    global _OUTPUT_GROUP, _SOURCE_CACHE
+    cache = _SOURCE_CACHE
+    _SOURCE_CACHE = None
+    if cache is not None:
+        while cache:
+            _, source = cache.popitem(last=False)
+            try:
+                _close_source(source)
+            except Exception:
+                # Descriptor cleanup is best effort during process teardown;
+                # continue closing the remaining retained sources.
+                pass
+    _OUTPUT_GROUP = None
+
+
+def _worker_init(
+    output: str,
+    source_engine: str = "netcdf4",
+    cache_limit: int = 4,
+) -> None:
+    global _OUTPUT_GROUP, _SOURCE_CACHE, _SOURCE_CACHE_LIMIT
+    global _SOURCE_CACHE_HITS, _SOURCE_OPENS, _SOURCE_FINALIZER, _SOURCE_ENGINE
+    from collections import OrderedDict
+    from multiprocessing.util import Finalize
+
+    import zarr
+
+    if _SOURCE_FINALIZER is not None:
+        _SOURCE_FINALIZER.cancel()
+    _close_worker_sources()
+    _OUTPUT_GROUP = zarr.open_group(output, mode="r+")
+    _SOURCE_CACHE = OrderedDict()
+    _SOURCE_CACHE_LIMIT = max(1, min(SOURCE_CACHE_HARD_LIMIT, int(cache_limit)))
+    _SOURCE_CACHE_HITS = 0
+    _SOURCE_OPENS = 0
+    _SOURCE_ENGINE = source_engine
+    _SOURCE_FINALIZER = Finalize(
+        None, _close_worker_sources, exitpriority=10
+    )
+
+
 def _source(path: str):
-    global _SOURCE_CACHE
+    global _SOURCE_CACHE, _SOURCE_CACHE_HITS, _SOURCE_OPENS
     existing = _SOURCE_CACHE.get(path)
     if existing is not None:
+        _SOURCE_CACHE_HITS += 1
         _SOURCE_CACHE.move_to_end(path)
         return existing
     if _SOURCE_ENGINE == "netcdf4":
@@ -65,6 +141,7 @@ def _source(path: str):
             decode_times=False,
             mask_and_scale=False,
         )
+    _SOURCE_OPENS += 1
     _SOURCE_CACHE[path] = source
     while len(_SOURCE_CACHE) > _SOURCE_CACHE_LIMIT:
         _, stale = _SOURCE_CACHE.popitem(last=False)
@@ -175,6 +252,14 @@ class ChunkTask:
     output_variable: str | None = None
     reverse_lat: bool = False
     reverse_lon: bool = False
+
+
+@dataclass(frozen=True)
+class WriteBatchResult:
+    logical_bytes: int
+    chunks: int
+    source_opens: int
+    source_cache_hits: int
 
 
 def make_compressor(name: str, level: int, shuffle: str):
@@ -419,8 +504,16 @@ def _write_chunk(task: ChunkTask) -> int:
     return int(data.nbytes)
 
 
-def _write_batch(tasks: tuple[ChunkTask, ...]) -> int:
-    return sum(_write_chunk(task) for task in tasks)
+def _write_batch(tasks: tuple[ChunkTask, ...]) -> WriteBatchResult:
+    opens_before = _SOURCE_OPENS
+    hits_before = _SOURCE_CACHE_HITS
+    logical_bytes = sum(_write_chunk(task) for task in tasks)
+    return WriteBatchResult(
+        logical_bytes=logical_bytes,
+        chunks=len(tasks),
+        source_opens=_SOURCE_OPENS - opens_before,
+        source_cache_hits=_SOURCE_CACHE_HITS - hits_before,
+    )
 
 
 def _time_lookup(inventory: Inventory, selection: Selection) -> list[tuple[str, int]]:
@@ -523,6 +616,87 @@ def _chunk_task(
     )
 
 
+def _variable_chunks(
+    inventory: Inventory,
+    selection: Selection,
+    plan: ConversionPlan,
+    name: str,
+    output_layout: OutputLayout | None,
+) -> tuple[int, int, int]:
+    if output_layout is None:
+        chunks_by_dim = {
+            "time": plan.chunk_time,
+            "lat": plan.chunk_lat,
+            "lon": plan.chunk_lon,
+        }
+    else:
+        item = output_layout.for_source(name)
+        chunks_by_dim = dict(zip(item.dims, item.chunks))
+    try:
+        chunks = tuple(
+            min(size, max(1, int(chunks_by_dim[dim])))
+            for dim, size in zip(("time", "lat", "lon"), selection.shape)
+        )
+    except KeyError as exc:
+        raise ValueError(
+            f"变量 {name} 的直接写入布局缺少 {exc.args[0]} 维度。"
+        ) from exc
+    return chunks
+
+
+def _task_batches(
+    inventory: Inventory,
+    selection: Selection,
+    plan: ConversionPlan,
+    variable_transforms: dict[str, VariableTransform] | None = None,
+    variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
+    *,
+    batch_size: int | None = None,
+) -> Iterator[tuple[ChunkTask, ...]]:
+    """Keep one variable/time slab local while assigning whole physical chunks."""
+
+    nt, ny, nx = selection.shape
+    lookup = _time_lookup(inventory, selection)
+    limit = _effective_task_batch(
+        plan.task_batch if batch_size is None else batch_size
+    )
+    for name in selection.variables:
+        chunk_time, chunk_lat, chunk_lon = _variable_chunks(
+            inventory, selection, plan, name, output_layout
+        )
+        for t0 in range(0, nt, chunk_time):
+            t1 = min(nt, t0 + chunk_time)
+            grouped: list[ChunkTask] = []
+            for y0 in range(0, ny, chunk_lat):
+                y1 = min(ny, y0 + chunk_lat)
+                for x0 in range(0, nx, chunk_lon):
+                    x1 = min(nx, x0 + chunk_lon)
+                    grouped.append(
+                        _chunk_task(
+                            inventory,
+                            selection,
+                            plan,
+                            lookup,
+                            name,
+                            t0,
+                            t1,
+                            y0,
+                            y1,
+                            x0,
+                            x1,
+                            variable_transforms,
+                            variable_names,
+                            output_layout,
+                        )
+                    )
+                    if len(grouped) == limit:
+                        yield tuple(grouped)
+                        grouped.clear()
+            if grouped:
+                yield tuple(grouped)
+
+
 def chunk_tasks(
     inventory: Inventory,
     selection: Selection,
@@ -531,20 +705,34 @@ def chunk_tasks(
     variable_names: dict[str, str] | None = None,
     output_layout: OutputLayout | None = None,
 ) -> Iterator[ChunkTask]:
-    nt, ny, nx = selection.shape
-    lookup = _time_lookup(inventory, selection)
-    for t0 in range(0, nt, plan.chunk_time):
-        t1 = min(nt, t0 + plan.chunk_time)
-        for name in selection.variables:
-            for y0 in range(0, ny, plan.chunk_lat):
-                y1 = min(ny, y0 + plan.chunk_lat)
-                for x0 in range(0, nx, plan.chunk_lon):
-                    x1 = min(nx, x0 + plan.chunk_lon)
-                    yield _chunk_task(
-                        inventory, selection, plan, lookup, name,
-                        t0, t1, y0, y1, x0, x1,
-                        variable_transforms, variable_names, output_layout,
-                    )
+    for batch in _task_batches(
+        inventory,
+        selection,
+        plan,
+        variable_transforms,
+        variable_names,
+        output_layout,
+        batch_size=1,
+    ):
+        yield batch[0]
+
+
+def chunk_task_batches(
+    inventory: Inventory,
+    selection: Selection,
+    plan: ConversionPlan,
+    variable_transforms: dict[str, VariableTransform] | None = None,
+    variable_names: dict[str, str] | None = None,
+    output_layout: OutputLayout | None = None,
+) -> Iterator[tuple[ChunkTask, ...]]:
+    yield from _task_batches(
+        inventory,
+        selection,
+        plan,
+        variable_transforms,
+        variable_names,
+        output_layout,
+    )
 
 
 def file_tasks(
@@ -555,29 +743,52 @@ def file_tasks(
     variable_names: dict[str, str] | None = None,
     output_layout: OutputLayout | None = None,
 ) -> Iterator[tuple[ChunkTask, ...]]:
-    if plan.chunk_time != 1:
-        raise ValueError("文件优先策略当前要求 chunk_time=1。")
+    yield from _task_batches(
+        inventory,
+        selection,
+        plan,
+        variable_transforms,
+        variable_names,
+        output_layout,
+    )
+
+
+def _physical_chunk_count(
+    inventory: Inventory,
+    selection: Selection,
+    plan: ConversionPlan,
+    output_layout: OutputLayout | None,
+) -> int:
     nt, ny, nx = selection.shape
-    lookup = _time_lookup(inventory, selection)
-    grouped: list[ChunkTask] = []
-    for t0 in range(nt):
-        for name in selection.variables:
-            for y0 in range(0, ny, plan.chunk_lat):
-                y1 = min(ny, y0 + plan.chunk_lat)
-                for x0 in range(0, nx, plan.chunk_lon):
-                    x1 = min(nx, x0 + plan.chunk_lon)
-                    grouped.append(
-                        _chunk_task(
-                            inventory, selection, plan, lookup, name,
-                            t0, t0 + 1, y0, y1, x0, x1,
-                            variable_transforms, variable_names, output_layout,
-                        )
-                    )
-        if (t0 + 1) % max(1, plan.task_batch) == 0:
-            yield tuple(grouped)
-            grouped.clear()
-    if grouped:
-        yield tuple(grouped)
+    total = 0
+    for name in selection.variables:
+        chunk_time, chunk_lat, chunk_lon = _variable_chunks(
+            inventory, selection, plan, name, output_layout
+        )
+        total += (
+            ceil(nt / chunk_time)
+            * ceil(ny / chunk_lat)
+            * ceil(nx / chunk_lon)
+        )
+    return total
+
+
+def _batch_count(
+    inventory: Inventory,
+    selection: Selection,
+    plan: ConversionPlan,
+    output_layout: OutputLayout | None,
+) -> int:
+    nt, ny, nx = selection.shape
+    batch_size = _effective_task_batch(plan.task_batch)
+    total = 0
+    for name in selection.variables:
+        chunk_time, chunk_lat, chunk_lon = _variable_chunks(
+            inventory, selection, plan, name, output_layout
+        )
+        spatial = ceil(ny / chunk_lat) * ceil(nx / chunk_lon)
+        total += ceil(nt / chunk_time) * ceil(spatial / batch_size)
+    return total
 
 
 def _task_count(
@@ -647,41 +858,63 @@ def direct_write(
             inventory, selection, plan, variable_transforms, variable_names, output_layout
         )
     elif plan.strategy == "chunk":
-        tasks = chunk_tasks(
+        tasks = chunk_task_batches(
             inventory, selection, plan, variable_transforms, variable_names, output_layout
         )
     else:
         raise ValueError(f"direct_write 不支持策略 {plan.strategy}")
     total_tasks = _task_count(selection, plan)
+    total_batches = _batch_count(inventory, selection, plan, output_layout)
+    total_chunks = _physical_chunk_count(inventory, selection, plan, output_layout)
+    effective_batch = _effective_task_batch(plan.task_batch)
+    worker_count = max(1, min(plan.workers, total_batches))
+    cache_chunk_time = max(
+        _variable_chunks(inventory, selection, plan, name, output_layout)[0]
+        for name in selection.variables
+    )
+    cache_limit = source_cache_limit(
+        cache_chunk_time,
+        worker_count,
+        task_batch=effective_batch if plan.strategy == "file" else 1,
+    )
+    pending_limit = worker_count
 
     stop = threading.Event()
     samples: list[tuple[float, int]] = []
     monitor = threading.Thread(target=_monitor, args=(stop, samples), daemon=True)
     logical_bytes = 0
+    chunks_written = 0
+    source_opens = 0
+    source_cache_hits = 0
     started = time.perf_counter()
-    report_every = max(1, total_tasks // 100)
+    report_every = max(1, total_batches // 100)
     monitor.start()
     if progress:
-        print(progress_line(0, total_tasks, 0, 0.0), end="", flush=True)
+        print(progress_line(0, total_batches, 0, 0.0), end="", flush=True)
     try:
-        worker = _write_batch if plan.strategy == "file" else _write_chunk
         results = bounded_process_map(
-            worker,
+            _write_batch,
             tasks,
-            workers=min(plan.workers, total_tasks),
+            workers=worker_count,
             initializer=_worker_init,
-            initargs=(str(output), inventory.source_engine),
+            initargs=(str(output), inventory.source_engine, cache_limit),
             cancel_event=cancel_event,
+            max_pending=pending_limit,
         )
-        for completed, amount in enumerate(results, 1):
-            logical_bytes += amount
-            if progress and (completed == total_tasks or completed % report_every == 0):
+        for completed, result in enumerate(results, 1):
+            logical_bytes += result.logical_bytes
+            chunks_written += result.chunks
+            source_opens += result.source_opens
+            source_cache_hits += result.source_cache_hits
+            if progress and (
+                completed == total_batches or completed % report_every == 0
+            ):
                 elapsed = max(time.perf_counter() - started, 1e-9)
                 cpu, rss = samples[-1] if samples else (None, None)
                 print(
                     progress_line(
                         completed,
-                        total_tasks,
+                        total_batches,
                         logical_bytes,
                         elapsed,
                         cpu=cpu,
@@ -690,7 +923,13 @@ def direct_write(
                     end="",
                     flush=True,
                 )
+        if chunks_written != total_chunks:
+            raise RuntimeError(
+                f"直接写入仅完成 {chunks_written}/{total_chunks} 个物理 chunks。"
+            )
     finally:
+        if worker_count == 1:
+            _close_worker_sources()
         stop.set()
         monitor.join(timeout=2)
     elapsed = time.perf_counter() - started
@@ -703,6 +942,16 @@ def direct_write(
         "average_cpu": sum(cpu for cpu, _ in samples) / len(samples) if samples else 0.0,
         "peak_rss": max((rss for _, rss in samples), default=0),
         "tasks": total_tasks,
+        "task_batches": total_batches,
+        "task_batch": effective_batch,
+        "chunks_written": chunks_written,
+        "planned_chunks": total_chunks,
+        "workers": worker_count,
+        "scheduler_max_pending": pending_limit,
+        "source_cache_limit": cache_limit,
+        "source_cache_hits": source_cache_hits,
+        "source_cache_misses": source_opens,
+        "source_opens": source_opens,
     }
 
 

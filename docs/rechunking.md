@@ -2,7 +2,7 @@
 
 ## 定位
 
-`fast_nc_zarr.rechunking` 调整现有 Zarr v3 的 chunks，并可同时应用无损压缩 codec。模块根据目标访问模式、变量 dtype、可用内存和磁盘关系规划有界的两阶段流式写入。
+`fast_nc_zarr.rechunking` 调整现有 Zarr v3 的 chunks，并可同时应用无损压缩 codec。模块先识别等价复制和仅换 codec 的单阶段路径；只有 chunks 真正变化时才根据目标访问模式、变量 dtype、可用内存和磁盘关系执行有界的两阶段流式写入。
 
 入口：
 
@@ -71,9 +71,9 @@ pixi run rechunk -- --input /data/input.zarr --output /data/output.zarr --strate
 
 1. 读取 Zarr v3 根元数据、变量 shape、chunks、dtype、codec 和属性。
 2. 生成 `ChunkPlan` 与 `CompressionPlan`。
-3. 根据源/目标 chunks 判断直接路径或两阶段路径。
-4. 阶段一按源 chunks 读取一次，写入与目标合并方向对齐的中间布局。
-5. 阶段二按最终 chunk 合并有界区域并一次性编码写出。
+3. chunks、codec 和 metadata 等价时，将独立文件复制到 staging 后校验发布，不创建 hardlink。
+4. 数据物理 chunks 相同但 codec 不同时，逐源物理 chunk 单阶段解码并写最终 codec。
+5. chunks 不同时，阶段一按源 chunks 写入对齐中间布局，阶段二按最终 chunk 有界合并。
 6. 抽样逐值校验后原子发布。
 
 所有进程池使用 `spawn`。worker 数受 CPU、未压缩块内存和源/目标磁盘关系限制；同一机械硬盘会主动降低并发，避免顺序 I/O 退化为随机寻道。

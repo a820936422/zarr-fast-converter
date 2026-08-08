@@ -8,7 +8,13 @@ import numpy as np
 
 from .benchmark import COMPRESSION_SAFETY, tune
 from .models import ConversionPlan, Inventory, OutputLayout, Selection, VariableTransform
-from .planner import candidate_plans, resolve_conversion_plan
+from .planner import (
+    candidate_plans,
+    fixed_layout_candidate_plans,
+    output_layout_max_chunk_bytes,
+    output_layout_plan_chunks,
+    resolve_conversion_plan,
+)
 from .publication import make_staging_path, publish_staging, validate_publish_target
 from .selection import selected_logical_bytes
 from .validation import validate_output
@@ -32,6 +38,8 @@ def _canonicalize_dimensions(ds, source_dimensions: tuple[str, str, str]):
     if not temporary:
         return ds
     return ds.rename(temporary).rename(final)
+
+
 
 
 def _dask_write(
@@ -257,23 +265,41 @@ def convert(
     if output == inventory.input_dir:
         raise ValueError("输入目录和输出目录不能相同。")
 
+    fixed_layout = chunks is not None or output_layout is not None
+    plan_chunks = chunks
+    if plan_chunks is None and output_layout is not None:
+        plan_chunks = output_layout_plan_chunks(selection, output_layout)
     plan = resolve_conversion_plan(
         inventory,
         selection,
         output,
-        chunks=chunks,
-        max_workers=max_workers if not auto_tune or chunks is not None else None,
+        chunks=plan_chunks,
+        max_workers=max_workers if not auto_tune or fixed_layout else None,
         reserve_gib=reserve_gib,
     )
     tuning_results = []
-    if auto_tune and chunks is None and plan.strategy != "dask":
-        candidates = candidate_plans(
-            inventory,
-            selection,
-            output,
-            max_workers=max_workers,
-            reserve_gib=reserve_gib,
-        )
+    if auto_tune and plan.strategy != "dask":
+        if fixed_layout:
+            candidates = fixed_layout_candidate_plans(
+                inventory,
+                selection,
+                plan,
+                max_workers=max_workers,
+                reserve_gib=reserve_gib,
+                worker_chunk_bytes=(
+                    output_layout_max_chunk_bytes(selection, output_layout)
+                    if output_layout is not None
+                    else None
+                ),
+            )
+        else:
+            candidates = candidate_plans(
+                inventory,
+                selection,
+                output,
+                max_workers=max_workers,
+                reserve_gib=reserve_gib,
+            )
         plan, tuning_results = tune(
             inventory,
             selection,
@@ -281,6 +307,14 @@ def convert(
             candidates,
             budget_seconds=tune_budget,
             progress=progress,
+            writer_kwargs={
+                "variable_transforms": variable_transforms,
+                "variable_names": variable_names,
+                "output_layout": output_layout,
+                "cancel_event": cancel_event,
+            },
+            fixed_layout=fixed_layout,
+            minimum_candidates=3 if fixed_layout else 1,
         )
 
     if tuning_results:

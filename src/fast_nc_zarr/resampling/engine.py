@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, replace
 import itertools
 from pathlib import Path
 import shutil
 import time
-from queue import Empty
 from typing import Iterable
 from uuid import uuid4
 
@@ -25,6 +25,7 @@ from ..writer import compressor_from_spec
 from .autotune import (
     resolve_auto_space_workers,
     resolve_auto_tile_size,
+    resolve_owner_buffer_budget,
     resolve_auto_time_block,
 )
 from .grid import RESAMPLING_METHODS, build_target_grid, output_chunks
@@ -48,16 +49,29 @@ COMPUTE_DTYPES = ("source", "float32")
 
 
 @dataclass(frozen=True)
-class _TileMetrics:
-    """Timing data returned by one spatial worker without retaining arrays."""
+class _OwnerTask:
+    """One spatial output-chunk region and the arrays it exclusively owns."""
 
-    task: tuple[int, int, int, int]
+    region: tuple[int, int, int, int]
+    item_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _TileMetrics:
+    """Timing and ownership data returned by one spatial worker."""
+
+    task: _OwnerTask
     covered: bool
     elapsed: float
     weight_seconds: float = 0.0
     read_seconds: float = 0.0
     regrid_seconds: float = 0.0
     write_seconds: float = 0.0
+    time_batches: int = 0
+    owner_chunks: int = 0
+    owner_buffer_bytes: int = 0
+    owner_buffer_peak_bytes: int = 0
+    owner_memmap_bytes: int = 0
 
 
 def _empty_timing() -> dict[str, float]:
@@ -119,7 +133,7 @@ def _resolve_temporary_root(
     target: Path,
     temporary_dir: str | Path | None,
 ) -> Path:
-    """Resolve the user-selected root for intermediate stores and weights."""
+    """Resolve the user-selected root for owner buffers and weights."""
 
     root = (
         target.parent
@@ -375,65 +389,8 @@ def _tile_ranges(size: int, tile_size: int):
         yield start, min(start + int(tile_size), int(size))
 
 
-def _chunk_boundaries(size: int, chunk: int) -> set[int]:
-    size = int(size)
-    chunk = max(1, int(chunk))
-    return set(range(0, size, chunk)) | {size}
 
 
-def _aligned_tile_ranges(
-    info: DatasetInfo,
-    target: TargetGrid,
-    tile_size: int,
-    chunks_by_name: dict[str, tuple[int, ...]] | None = None,
-) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-    """Build ranges that never split a spatial output Zarr chunk.
-
-    Different variables may have different chunk layouts.  The union of all
-    chunk boundaries is therefore used.  Adjacent complete chunks are merged
-    until the requested tile-size limit is reached.  A single stored chunk
-    larger than that limit is kept intact because splitting it would make
-    concurrent workers perform unsafe read-modify-write operations.
-    """
-
-    lat_boundaries = {0, int(target.lat.size)}
-    lon_boundaries = {0, int(target.lon.size)}
-    for variable in info.data_variables:
-        if "lat" not in variable.dims or "lon" not in variable.dims:
-            continue
-        chunks = (
-            variable.chunks
-            if chunks_by_name is None
-            else chunks_by_name.get(variable.name, variable.chunks)
-        )
-        lat_index = variable.dims.index("lat")
-        lon_index = variable.dims.index("lon")
-        lat_boundaries.update(
-            _chunk_boundaries(target.lat.size, chunks[lat_index])
-        )
-        lon_boundaries.update(
-            _chunk_boundaries(target.lon.size, chunks[lon_index])
-        )
-
-    def merge(boundaries: set[int]) -> list[tuple[int, int]]:
-        ordered = sorted(boundaries)
-        ranges: list[tuple[int, int]] = []
-        start_index = 0
-        limit = max(1, int(tile_size))
-        while start_index < len(ordered) - 1:
-            start = ordered[start_index]
-            end_index = start_index + 1
-            while (
-                end_index + 1 < len(ordered)
-                and ordered[end_index + 1] - start <= limit
-            ):
-                end_index += 1
-            stop = ordered[end_index]
-            ranges.append((start, stop))
-            start_index = end_index
-        return ranges
-
-    return merge(lat_boundaries), merge(lon_boundaries)
 
 
 def _source_overlap_window(
@@ -722,60 +679,143 @@ def _time_slices(variable: VariableInfo, time_block: int):
     step = max(1, min(int(time_block), size))
     return ((start, min(start + step, size)) for start in range(0, size, step))
 
-
-def _intermediate_chunks(
-    info: DatasetInfo,
+def _owner_task_groups(
+    spatial_items: tuple[VariableInfo, ...],
     plan: ResamplePlan,
-) -> dict[str, tuple[int, ...]]:
-    """Build a compute-oriented layout for the ephemeral intermediate store.
+) -> tuple[tuple[int, int, tuple[str, ...]], ...]:
+    """Group arrays only when their physical spatial chunk grids coincide."""
 
-    Time chunks follow the vectorized computation batch.  Spatial chunks are
-    shared by every resampled variable so workers can own independent tiles
-    even when the final Zarr layout contains a much larger spatial chunk.
-    """
-
-    result = dict(plan.output_chunks)
-    for item in info.data_variables:
-        if item.name not in result or "time" not in item.dims:
-            continue
-        if "lat" not in item.dims or "lon" not in item.dims:
-            continue
-        time_index = item.dims.index("time")
-        chunks = list(result[item.name])
-        chunks[time_index] = min(
-            int(chunks[time_index]),
-            int(plan.time_block),
-            int(item.shape[time_index]),
+    grouped: dict[tuple[int, int], list[str]] = {}
+    for item in spatial_items:
+        chunks = plan.output_chunks[item.name]
+        key = (
+            int(chunks[item.dims.index("lat")]),
+            int(chunks[item.dims.index("lon")]),
         )
-        for dimension in ("lat", "lon"):
-            axis = item.dims.index(dimension)
-            chunks[axis] = min(
-                int(plan.tile_size),
-                int(plan.target.dimensions[dimension]),
-            )
-        result[item.name] = tuple(chunks)
-    return result
+        grouped.setdefault(key, []).append(item.name)
+    return tuple(
+        (lat_chunk, lon_chunk, tuple(names))
+        for (lat_chunk, lon_chunk), names in grouped.items()
+    )
 
 
-def _needs_intermediate(
-    info: DatasetInfo,
+def _owner_tasks(
+    groups: tuple[tuple[int, int, tuple[str, ...]], ...],
+    target: TargetGrid,
+) -> Iterable[_OwnerTask]:
+    """Yield tasks whose regions each cover one physical spatial chunk."""
+
+    for lat_chunk, lon_chunk, item_names in groups:
+        for lat_start, lat_stop in _tile_ranges(target.lat.size, lat_chunk):
+            for lon_start, lon_stop in _tile_ranges(target.lon.size, lon_chunk):
+                yield _OwnerTask(
+                    (lat_start, lat_stop, lon_start, lon_stop),
+                    item_names,
+                )
+
+
+def _owner_task_count(
+    groups: tuple[tuple[int, int, tuple[str, ...]], ...],
+    target: TargetGrid,
+) -> int:
+    return sum(
+        ((int(target.lat.size) + lat_chunk - 1) // lat_chunk)
+        * ((int(target.lon.size) + lon_chunk - 1) // lon_chunk)
+        for lat_chunk, lon_chunk, _item_names in groups
+    )
+
+
+def _owner_item_batch_count(
+    item_names: tuple[str, ...],
+    items_by_name: dict[str, VariableInfo],
     plan: ResamplePlan,
-    intermediate_chunks: dict[str, tuple[int, ...]],
-) -> bool:
-    """Return whether time batches would partially update one output chunk."""
+) -> int:
+    total = 0
+    for name in item_names:
+        item = items_by_name[name]
+        time_axis = item.dims.index("time")
+        time_size = int(item.shape[time_axis])
+        time_chunk = int(plan.output_chunks[name][time_axis])
+        for start in range(0, time_size, time_chunk):
+            length = min(time_chunk, time_size - start)
+            total += (length + int(plan.time_block) - 1) // int(plan.time_block)
+    return total
+
+def _owner_total_batch_count(
+    groups: tuple[tuple[int, int, tuple[str, ...]], ...],
+    target: TargetGrid,
+    items_by_name: dict[str, VariableInfo],
+    plan: ResamplePlan,
+) -> int:
+    total = 0
+    for lat_chunk, lon_chunk, item_names in groups:
+        spatial_count = (
+            (int(target.lat.size) + lat_chunk - 1) // lat_chunk
+        ) * (
+            (int(target.lon.size) + lon_chunk - 1) // lon_chunk
+        )
+        batches = _owner_item_batch_count(item_names, items_by_name, plan)
+        total += spatial_count * batches
+    return total
+
+
+@contextmanager
+def _owner_buffer(
+    shape: tuple[int, ...],
+    dtype: np.dtype,
+    workdir: Path,
+    heap_budget_bytes: int,
+):
+    """Allocate one bounded final-chunk buffer, spilling safely to a memmap."""
+
+    dtype = np.dtype(dtype)
+    nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    values: np.ndarray | np.memmap | None = None
+    path: Path | None = None
+    try:
+        if nbytes <= max(0, int(heap_budget_bytes)):
+            try:
+                values = np.empty(shape, dtype=dtype)
+            except MemoryError:
+                values = None
+        if values is None:
+            path = workdir / f".resample-owner-{uuid4().hex}.bin"
+            values = np.memmap(path, mode="w+", dtype=dtype, shape=shape)
+        yield values, nbytes, path is not None
+    finally:
+        try:
+            if isinstance(values, np.memmap):
+                try:
+                    values.flush()
+                finally:
+                    mapping = getattr(values, "_mmap", None)
+                    if mapping is not None:
+                        mapping.close()
+        finally:
+            del values
+            if path is not None:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+
+def _avoids_intermediate_store(info: DatasetInfo, plan: ResamplePlan) -> bool:
+    """Return whether owner buffers avoid a former batch-layout Zarr write."""
 
     for item in info.data_variables:
-        if item.name not in intermediate_chunks or "time" not in item.dims:
+        chunks = plan.output_chunks.get(item.name)
+        if chunks is None or "time" not in item.dims:
             continue
         if "lat" not in item.dims or "lon" not in item.dims:
             continue
         time_axis = item.dims.index("time")
-        if (
-            intermediate_chunks[item.name][time_axis]
-            != plan.output_chunks[item.name][time_axis]
-        ):
+        final_chunk = min(int(chunks[time_axis]), int(item.shape[time_axis]))
+        if int(plan.time_block) < final_chunk:
             return True
     return False
+
+
 
 
 def _chunk_regions(
@@ -790,156 +830,10 @@ def _chunk_regions(
         )
 
 
-def _relative_region(
-    region: tuple[slice, ...],
-    subregion: tuple[slice, ...],
-) -> tuple[slice, ...]:
-    return tuple(
-        slice(
-            int(sub.start) - int(full.start),
-            int(sub.stop) - int(full.start),
-        )
-        for full, sub in zip(region, subregion)
-    )
 
 
-def _merge_intermediate_region(
-    source_array,
-    target_array,
-    region: tuple[slice, ...],
-    temporary_root: Path,
-) -> int:
-    """Assemble one final chunk from compute chunks and write it once."""
-
-    buffer_shape = tuple(int(part.stop - part.start) for part in region)
-    buffer_path = temporary_root / f".resample-buffer-{uuid4().hex}.bin"
-    buffer = np.memmap(
-        buffer_path,
-        mode="w+",
-        dtype=np.dtype(target_array.dtype),
-        shape=buffer_shape,
-    )
-    try:
-        starts = [
-            range(
-                int(part.start),
-                int(part.stop),
-                max(1, int(source_chunk)),
-            )
-            for part, source_chunk in zip(region, source_array.chunks)
-        ]
-        for origin in itertools.product(*starts):
-            subregion = tuple(
-                slice(
-                    int(start),
-                    min(int(start) + int(source_chunk), int(part.stop)),
-                )
-                for start, source_chunk, part in zip(
-                    origin,
-                    source_array.chunks,
-                    region,
-                )
-            )
-            buffer[_relative_region(region, subregion)] = source_array[subregion]
-        buffer.flush()
-        target_array[region] = buffer
-        return int(np.prod(buffer_shape, dtype=np.int64)) * np.dtype(target_array.dtype).itemsize
-    finally:
-        del buffer
-        try:
-            buffer_path.unlink()
-        except OSError:
-            pass
 
 
-def _merge_intermediate_store(
-    intermediate: Path,
-    staging: Path,
-    spatial_items: tuple[VariableInfo, ...],
-    temporary_root: Path,
-    *,
-    workers: int,
-    progress: bool,
-    cancel_event=None,
-) -> dict[str, float | int]:
-    """Merge disjoint final chunks with bounded I/O concurrency."""
-
-    source_group = zarr.open_group(intermediate, mode="r")
-    target_group = zarr.open_group(staging, mode="r+")
-    merge_workers = max(1, min(2, int(workers)))
-    tasks = (
-        (item.name, region)
-        for item in spatial_items
-        for region in _chunk_regions(
-            tuple(int(size) for size in target_group[item.name].shape),
-            tuple(int(chunk) for chunk in target_group[item.name].chunks),
-        )
-    )
-    total = sum(
-        int(np.prod([
-            (int(size) + int(chunk) - 1) // int(chunk)
-            for size, chunk in zip(
-                target_group[item.name].shape,
-                target_group[item.name].chunks,
-            )
-        ], dtype=np.int64))
-        for item in spatial_items
-    )
-    completed = 0
-    logical_bytes = 0
-    started = time.perf_counter()
-    executor = ThreadPoolExecutor(max_workers=merge_workers)
-    pending = set()
-    task_iter = iter(tasks)
-
-    def submit(task):
-        name, region = task
-        return executor.submit(
-            _merge_intermediate_region,
-            source_group[name],
-            target_group[name],
-            region,
-            temporary_root,
-        )
-
-    try:
-        exhausted = False
-        while pending or not exhausted:
-            if cancel_event is not None and cancel_event.is_set():
-                for future in pending:
-                    future.cancel()
-                raise ResampleExecutionError("任务已取消，未生成输出。")
-            while not exhausted and len(pending) < merge_workers * 2:
-                try:
-                    pending.add(submit(next(task_iter)))
-                except StopIteration:
-                    exhausted = True
-            if not pending:
-                continue
-            done, pending = wait(
-                pending,
-                timeout=0.5,
-                return_when=FIRST_COMPLETED,
-            )
-            for future in done:
-                logical_bytes += int(future.result())
-                completed += 1
-                if progress and (
-                    completed == 1
-                    or completed == total
-                    or completed % max(1, total // 20) == 0
-                ):
-                    print(f"中转数据合并：{completed}/{total} 个最终 chunk", flush=True)
-    finally:
-        executor.shutdown(wait=True, cancel_futures=True)
-        source_group.store.close() if hasattr(source_group.store, "close") else None
-        target_group.store.close() if hasattr(target_group.store, "close") else None
-    return {
-        "tasks": completed,
-        "workers": merge_workers,
-        "logical_bytes": logical_bytes,
-        "elapsed_seconds": time.perf_counter() - started,
-    }
 
 
 def _initialize_output_store(
@@ -989,37 +883,72 @@ def _fill_missing_tile(
     output_group,
     spatial_items: tuple[VariableInfo, ...],
     plan: ResamplePlan,
-    task: tuple[int, int, int, int],
-) -> None:
-    """Materialize NaN for a target tile with no source-cell overlap."""
+    task: _OwnerTask,
+    workdir: Path,
+) -> dict[str, float | int]:
+    """Materialize uncovered final chunks without an unbounded full-time array."""
 
-    lat_start, lat_stop, lon_start, lon_stop = task
+    lat_start, lat_stop, lon_start, lon_stop = task.region
+    write_seconds = 0.0
+    time_batches = 0
+    owner_chunks = 0
+    owner_buffer_bytes = 0
+    owner_buffer_peak_bytes = 0
+    owner_memmap_bytes = 0
     for item in spatial_items:
         dtype = np.dtype(item.dtype)
         if not np.issubdtype(dtype, np.floating):
             dtype = np.dtype("float64")
         elif plan.compute_dtype == "float32":
             dtype = np.dtype("float32")
-        shape = tuple(
-            {
-                "time": int(item.shape[item.dims.index("time")]),
-                "lat": lat_stop - lat_start,
-                "lon": lon_stop - lon_start,
-            }[dim]
-            for dim in item.dims
-        )
-        values = np.full(shape, np.nan, dtype=dtype)
-        _write_region(
-            output_group,
-            item.name,
-            values,
-            item.dims,
-            {
-                "time": slice(0, int(item.shape[item.dims.index("time")])),
-                "lat": slice(lat_start, lat_stop),
-                "lon": slice(lon_start, lon_stop),
-            },
-        )
+        time_axis = item.dims.index("time")
+        time_size = int(item.shape[time_axis])
+        time_chunk = int(plan.output_chunks[item.name][time_axis])
+        for time_start in range(0, time_size, time_chunk):
+            time_stop = min(time_start + time_chunk, time_size)
+            shape = tuple(
+                {
+                    "time": time_stop - time_start,
+                    "lat": lat_stop - lat_start,
+                    "lon": lon_stop - lon_start,
+                }[dim]
+                for dim in item.dims
+            )
+            with _owner_buffer(
+                shape,
+                dtype,
+                workdir,
+                plan.owner_buffer_budget_bytes,
+            ) as (values, nbytes, used_memmap):
+                values[...] = np.nan
+                write_started = time.perf_counter()
+                _write_region(
+                    output_group,
+                    item.name,
+                    values,
+                    item.dims,
+                    {
+                        "time": slice(time_start, time_stop),
+                        "lat": slice(lat_start, lat_stop),
+                        "lon": slice(lon_start, lon_stop),
+                    },
+                )
+                write_seconds += time.perf_counter() - write_started
+            owner_chunks += 1
+            owner_buffer_bytes += nbytes
+            owner_buffer_peak_bytes = max(owner_buffer_peak_bytes, nbytes)
+            if used_memmap:
+                owner_memmap_bytes += nbytes
+            length = time_stop - time_start
+            time_batches += (length + int(plan.time_block) - 1) // int(plan.time_block)
+    return {
+        "write": write_seconds,
+        "time_batches": time_batches,
+        "owner_chunks": owner_chunks,
+        "owner_buffer_bytes": owner_buffer_bytes,
+        "owner_buffer_peak_bytes": owner_buffer_peak_bytes,
+        "owner_memmap_bytes": owner_memmap_bytes,
+    }
 
 
 def _resample_tile_variable(
@@ -1043,8 +972,9 @@ def _resample_tile_variable(
     before_replacements,
     after_replacements,
     statistics: dict[str, float],
-    batch_progress=None,
-) -> dict[str, float]:
+    workdir: Path,
+    owner_buffer_budget_bytes: int,
+) -> dict[str, float | int]:
     source_variable = source[item.name]
     prepared = _mask_missing(source_variable, item)
     effective_dtype = _effective_compute_dtype(source_variable, compute_dtype)
@@ -1065,17 +995,28 @@ def _resample_tile_variable(
     lat_slice = slice(lat_start, lat_stop)
     lon_slice = slice(lon_start, lon_stop)
     timing = _empty_timing()
-    for time_start, time_stop in _time_slices(item, time_block):
+    output_chunks = tuple(int(value) for value in output_group[item.name].chunks)
+    output_shape = tuple(int(value) for value in output_group[item.name].shape)
+    for dimension, start, stop in (
+        ("lat", lat_start, lat_stop),
+        ("lon", lon_start, lon_stop),
+    ):
+        axis = expected_dims.index(dimension)
+        chunk = output_chunks[axis]
+        if start % chunk or (stop != output_shape[axis] and stop % chunk):
+            raise ResampleExecutionError(
+                f"owner task 非完整物理 chunk 边界：{item.name}/{dimension}={start}:{stop}。"
+            )
+
+    result_dtype = _resampled_output_dtype(source_variable, compute_dtype)
+
+    def resample_batch(time_start: int, time_stop: int) -> np.ndarray:
         read_started = time.perf_counter()
         subset = prepared.isel(
             time=slice(time_start, time_stop),
             lat=source_lat_slice,
             lon=source_lon_slice,
         ).transpose(*input_dims)
-        # Materialize one bounded time batch before calling xESMF.  xESMF then
-        # receives a NumPy array with a leading time axis and applies one
-        # vectorized sparse operation, rather than constructing and executing
-        # a Dask graph for every individual time step.
         if hasattr(subset.data, "compute"):
             with dask.config.set(
                 scheduler="threads",
@@ -1083,9 +1024,11 @@ def _resample_tile_variable(
             ):
                 subset = subset.compute()
         if before_replacements.rules:
-            subset = subset.copy(data=apply_replacement_rules(
-                np.asarray(subset.data), before_replacements, statistics
-            ))
+            subset = subset.copy(
+                data=apply_replacement_rules(
+                    np.asarray(subset.data), before_replacements, statistics
+                )
+            )
         timing["read"] += time.perf_counter() - read_started
         regrid_started = time.perf_counter()
         result = regridder(
@@ -1097,33 +1040,85 @@ def _resample_tile_variable(
         )
         result = _rename_xesmf_dims(result).transpose(*expected_dims)
         values = result.data
-        with dask.config.set(scheduler="threads", num_workers=max(1, int(compute_workers))):
+        with dask.config.set(
+            scheduler="threads",
+            num_workers=max(1, int(compute_workers)),
+        ):
             if hasattr(values, "compute"):
                 values = values.compute()
         timing["regrid"] += time.perf_counter() - regrid_started
-        values = np.asarray(
-            values,
-            dtype=_resampled_output_dtype(source_variable, compute_dtype),
-        )
+        values = np.asarray(values, dtype=result_dtype)
         if after_replacements.rules:
             values = apply_replacement_rules(values, after_replacements, statistics)
-        write_started = time.perf_counter()
-        _write_region(
-            output_group,
-            item.name,
-            values,
-            expected_dims,
+        del subset, result
+        return values
+
+    time_axis = expected_dims.index("time")
+    time_size = int(item.shape[time_axis])
+    final_time_chunk = output_chunks[time_axis]
+    owner_chunks = 0
+    owner_buffer_bytes = 0
+    owner_buffer_peak_bytes = 0
+    owner_memmap_bytes = 0
+    time_batches = 0
+    for chunk_start in range(0, time_size, final_time_chunk):
+        chunk_stop = min(chunk_start + final_time_chunk, time_size)
+        chunk_length = chunk_stop - chunk_start
+        chunk_shape = tuple(
             {
-                "time": slice(time_start, time_stop),
-                "lat": lat_slice,
-                "lon": lon_slice,
-            },
+                "time": chunk_length,
+                "lat": lat_stop - lat_start,
+                "lon": lon_stop - lon_start,
+            }[dim]
+            for dim in expected_dims
         )
-        timing["write"] += time.perf_counter() - write_started
-        del subset, result, values
-        if batch_progress is not None:
-            batch_progress(item.name, time_start, time_stop)
-    return timing
+        chunk_bytes = int(np.prod(chunk_shape, dtype=np.int64)) * result_dtype.itemsize
+        region = {
+            "time": slice(chunk_start, chunk_stop),
+            "lat": lat_slice,
+            "lon": lon_slice,
+        }
+        if chunk_length <= int(time_block):
+            values = resample_batch(chunk_start, chunk_stop)
+            time_batches += 1
+            write_started = time.perf_counter()
+            _write_region(output_group, item.name, values, expected_dims, region)
+            timing["write"] += time.perf_counter() - write_started
+            del values
+        else:
+            with _owner_buffer(
+                chunk_shape,
+                result_dtype,
+                workdir,
+                owner_buffer_budget_bytes,
+            ) as (buffer, _nbytes, used_memmap):
+                for time_start in range(chunk_start, chunk_stop, int(time_block)):
+                    time_stop = min(time_start + int(time_block), chunk_stop)
+                    values = resample_batch(time_start, time_stop)
+                    relative = {
+                        "time": slice(time_start - chunk_start, time_stop - chunk_start),
+                        "lat": slice(None),
+                        "lon": slice(None),
+                    }
+                    buffer[tuple(relative[dim] for dim in expected_dims)] = values
+                    del values
+                    time_batches += 1
+                write_started = time.perf_counter()
+                _write_region(output_group, item.name, buffer, expected_dims, region)
+                timing["write"] += time.perf_counter() - write_started
+            if used_memmap:
+                owner_memmap_bytes += chunk_bytes
+        owner_chunks += 1
+        owner_buffer_bytes += chunk_bytes
+        owner_buffer_peak_bytes = max(owner_buffer_peak_bytes, chunk_bytes)
+    return {
+        **timing,
+        "time_batches": time_batches,
+        "owner_chunks": owner_chunks,
+        "owner_buffer_bytes": owner_buffer_bytes,
+        "owner_buffer_peak_bytes": owner_buffer_peak_bytes,
+        "owner_memmap_bytes": owner_memmap_bytes,
+    }
 
 
 _SPACE_WORKER_STATE: dict[str, object] = {}
@@ -1135,7 +1130,6 @@ def _initialize_space_worker(
     plan: ResamplePlan,
     spatial_items: tuple[VariableInfo, ...],
     workdir: str,
-    progress_queue=None,
 ) -> None:
     """Open one input/output handle per spawned spatial worker."""
 
@@ -1152,30 +1146,28 @@ def _initialize_space_worker(
         source=source,
         output_group=zarr.open_group(staging_path, mode="r+"),
         plan=plan,
-        spatial_items=spatial_items,
+        items_by_name={item.name: item for item in spatial_items},
         workdir=Path(workdir),
-        progress_queue=progress_queue,
     )
 
 
-def _process_space_tile(
-    task: tuple[int, int, int, int],
-) -> _TileMetrics:
-    """Process one output-chunk-aligned spatial region in a child process."""
+def _process_space_tile(task: _OwnerTask) -> _TileMetrics:
+    """Process one exclusively owned final spatial-chunk region."""
 
     source = _SPACE_WORKER_STATE["source"]
     output_group = _SPACE_WORKER_STATE["output_group"]
     plan = _SPACE_WORKER_STATE["plan"]
-    spatial_items = _SPACE_WORKER_STATE["spatial_items"]
+    items_by_name = _SPACE_WORKER_STATE["items_by_name"]
     workdir = _SPACE_WORKER_STATE["workdir"]
-    progress_queue = _SPACE_WORKER_STATE.get("progress_queue")
     assert isinstance(source, xr.Dataset)
     assert isinstance(output_group, zarr.Group)
     assert isinstance(plan, ResamplePlan)
+    assert isinstance(items_by_name, dict)
     assert isinstance(workdir, Path)
+    spatial_items = tuple(items_by_name[name] for name in task.item_names)
 
     started = time.perf_counter()
-    lat_start, lat_stop, lon_start, lon_stop = task
+    lat_start, lat_stop, lon_start, lon_stop = task.region
     tile = _tile_target(plan.target, lat_start, lat_stop, lon_start, lon_stop)
     target_tile, source_lat_slice, source_lon_slice = _resolve_local_source_window(
         plan.inspection.grid,
@@ -1183,134 +1175,30 @@ def _process_space_tile(
         plan.method,
     )
     if source_lat_slice is None or source_lon_slice is None:
-        _fill_missing_tile(output_group, spatial_items, plan, task)
-        if progress_queue is not None:
-            progress_queue.put(
-                sum(
-                    (
-                        int(item.shape[item.dims.index("time")])
-                        + plan.time_block
-                        - 1
-                    )
-                    // plan.time_block
-                    for item in spatial_items
-                    if "time" in item.dims
-                )
-            )
-        return _TileMetrics(task, False, time.perf_counter() - started)
+        missing = _fill_missing_tile(output_group, spatial_items, plan, task, workdir)
+        return _TileMetrics(
+            task=task,
+            covered=False,
+            elapsed=time.perf_counter() - started,
+            write_seconds=float(missing["write"]),
+            time_batches=int(missing["time_batches"]),
+            owner_chunks=int(missing["owner_chunks"]),
+            owner_buffer_bytes=int(missing["owner_buffer_bytes"]),
+            owner_buffer_peak_bytes=int(missing["owner_buffer_peak_bytes"]),
+            owner_memmap_bytes=int(missing["owner_memmap_bytes"]),
+        )
 
     grid = plan.inspection.grid
     regridder = None
     weight_path = None
     timing = _empty_timing()
     weight_seconds = 0.0
+    time_batches = 0
+    owner_chunks = 0
+    owner_buffer_bytes = 0
+    owner_buffer_peak_bytes = 0
+    owner_memmap_bytes = 0
     try:
-        lat_start_source = int(source_lat_slice.start)
-        lat_stop_source = int(source_lat_slice.stop)
-        lon_start_source = int(source_lon_slice.start)
-        lon_stop_source = int(source_lon_slice.stop)
-        weights_started = time.perf_counter()
-        regridder, weight_path = _build_regridder(
-            grid.lat[source_lat_slice],
-            grid.lon[source_lon_slice],
-            grid.lat_bounds[lat_start_source : lat_stop_source + 1],
-            grid.lon_bounds[lon_start_source : lon_stop_source + 1],
-            target_tile,
-            plan.method,
-            workdir,
-            lat_attrs=dict(source.lat.attrs),
-            lon_attrs=dict(source.lon.attrs),
-            # A local source window is no longer a complete periodic grid.
-            periodic=bool(
-                grid.periodic
-                and lon_start_source == 0
-                and lon_stop_source == grid.lon.size
-            ),
-        )
-        weight_seconds = time.perf_counter() - weights_started
-        for item in spatial_items:
-            _add_timing(
-                timing,
-                _resample_tile_variable(
-                    source,
-                    item,
-                    regridder,
-                    output_group,
-                    plan.target,
-                    lat_start,
-                    lat_stop,
-                    lon_start,
-                    lon_stop,
-                    source_lat_slice,
-                    source_lon_slice,
-                    target_tile,
-                    plan.skipna,
-                    plan.na_thres,
-                    plan.time_block,
-                    plan.compute_workers,
-                    plan.compute_dtype,
-                    plan.before_replacements,
-                    plan.after_replacements,
-                    plan.statistics.get(item.name, {}),
-                    (
-                        (lambda _name, _start, _stop: progress_queue.put(1))
-                        if progress_queue is not None
-                        else None
-                    ),
-                ),
-            )
-        return _TileMetrics(
-            task,
-            True,
-            time.perf_counter() - started,
-            weight_seconds,
-            timing["read"],
-            timing["regrid"],
-            timing["write"],
-        )
-    finally:
-        del regridder
-        if weight_path is not None:
-            try:
-                weight_path.unlink()
-            except OSError:
-                pass
-
-
-def _execute_serial_tile(
-    source: xr.Dataset,
-    output_group,
-    plan: ResamplePlan,
-    task: tuple[int, int, int, int],
-    workdir: Path,
-    spatial_items: tuple[VariableInfo, ...],
-    full_regridder=None,
-) -> _TileMetrics:
-    """Execute one tile in the caller, used for d2s and tiny jobs."""
-
-    started = time.perf_counter()
-    lat_start, lat_stop, lon_start, lon_stop = task
-    tile = _tile_target(plan.target, lat_start, lat_stop, lon_start, lon_stop)
-    grid = plan.inspection.grid
-    if full_regridder is not None:
-        target_tile = tile
-        source_lat_slice = slice(0, grid.lat.size)
-        source_lon_slice = slice(0, grid.lon.size)
-        regridder = _FullGridTileRegridder(
-            full_regridder,
-            slice(lat_start, lat_stop),
-            slice(lon_start, lon_stop),
-        )
-        weight_path = None
-    else:
-        target_tile, source_lat_slice, source_lon_slice = _resolve_local_source_window(
-            grid,
-            tile,
-            plan.method,
-        )
-        if source_lat_slice is None or source_lon_slice is None:
-            _fill_missing_tile(output_group, spatial_items, plan, task)
-            return _TileMetrics(task, False, time.perf_counter() - started)
         lat_start_source = int(source_lat_slice.start)
         lat_stop_source = int(source_lat_slice.stop)
         lon_start_source = int(source_lon_slice.start)
@@ -1333,10 +1221,8 @@ def _execute_serial_tile(
             ),
         )
         weight_seconds = time.perf_counter() - weights_started
-    timing = _empty_timing()
-    try:
         for item in spatial_items:
-            _add_timing(timing, _resample_tile_variable(
+            variable_metrics = _resample_tile_variable(
                 source,
                 item,
                 regridder,
@@ -1357,15 +1243,163 @@ def _execute_serial_tile(
                 plan.before_replacements,
                 plan.after_replacements,
                 plan.statistics.get(item.name, {}),
-            ))
+                workdir,
+                plan.owner_buffer_budget_bytes,
+            )
+            _add_timing(timing, variable_metrics)
+            time_batches += int(variable_metrics["time_batches"])
+            owner_chunks += int(variable_metrics["owner_chunks"])
+            owner_buffer_bytes += int(variable_metrics["owner_buffer_bytes"])
+            owner_buffer_peak_bytes = max(
+                owner_buffer_peak_bytes,
+                int(variable_metrics["owner_buffer_peak_bytes"]),
+            )
+            owner_memmap_bytes += int(variable_metrics["owner_memmap_bytes"])
         return _TileMetrics(
-            task,
-            True,
-            time.perf_counter() - started,
-            weight_seconds if full_regridder is None else 0.0,
-            timing["read"],
-            timing["regrid"],
-            timing["write"],
+            task=task,
+            covered=True,
+            elapsed=time.perf_counter() - started,
+            weight_seconds=weight_seconds,
+            read_seconds=timing["read"],
+            regrid_seconds=timing["regrid"],
+            write_seconds=timing["write"],
+            time_batches=time_batches,
+            owner_chunks=owner_chunks,
+            owner_buffer_bytes=owner_buffer_bytes,
+            owner_buffer_peak_bytes=owner_buffer_peak_bytes,
+            owner_memmap_bytes=owner_memmap_bytes,
+        )
+    finally:
+        del regridder
+        if weight_path is not None:
+            try:
+                weight_path.unlink()
+            except OSError:
+                pass
+
+
+def _execute_serial_tile(
+    source: xr.Dataset,
+    output_group,
+    plan: ResamplePlan,
+    task: _OwnerTask,
+    workdir: Path,
+    spatial_items: tuple[VariableInfo, ...],
+    full_regridder=None,
+) -> _TileMetrics:
+    """Execute one exclusive owner task in the caller."""
+
+    items_by_name = {item.name: item for item in spatial_items}
+    task_items = tuple(items_by_name[name] for name in task.item_names)
+    started = time.perf_counter()
+    lat_start, lat_stop, lon_start, lon_stop = task.region
+    tile = _tile_target(plan.target, lat_start, lat_stop, lon_start, lon_stop)
+    grid = plan.inspection.grid
+    if full_regridder is not None:
+        target_tile = tile
+        source_lat_slice = slice(0, grid.lat.size)
+        source_lon_slice = slice(0, grid.lon.size)
+        regridder = _FullGridTileRegridder(
+            full_regridder,
+            slice(lat_start, lat_stop),
+            slice(lon_start, lon_stop),
+        )
+        weight_path = None
+    else:
+        target_tile, source_lat_slice, source_lon_slice = _resolve_local_source_window(
+            grid,
+            tile,
+            plan.method,
+        )
+        if source_lat_slice is None or source_lon_slice is None:
+            missing = _fill_missing_tile(output_group, task_items, plan, task, workdir)
+            return _TileMetrics(
+                task=task,
+                covered=False,
+                elapsed=time.perf_counter() - started,
+                write_seconds=float(missing["write"]),
+                time_batches=int(missing["time_batches"]),
+                owner_chunks=int(missing["owner_chunks"]),
+                owner_buffer_bytes=int(missing["owner_buffer_bytes"]),
+                owner_buffer_peak_bytes=int(missing["owner_buffer_peak_bytes"]),
+                owner_memmap_bytes=int(missing["owner_memmap_bytes"]),
+            )
+        lat_start_source = int(source_lat_slice.start)
+        lat_stop_source = int(source_lat_slice.stop)
+        lon_start_source = int(source_lon_slice.start)
+        lon_stop_source = int(source_lon_slice.stop)
+        weights_started = time.perf_counter()
+        regridder, weight_path = _build_regridder(
+            grid.lat[source_lat_slice],
+            grid.lon[source_lon_slice],
+            grid.lat_bounds[lat_start_source : lat_stop_source + 1],
+            grid.lon_bounds[lon_start_source : lon_stop_source + 1],
+            target_tile,
+            plan.method,
+            workdir,
+            lat_attrs=dict(source.lat.attrs),
+            lon_attrs=dict(source.lon.attrs),
+            periodic=bool(
+                grid.periodic
+                and lon_start_source == 0
+                and lon_stop_source == grid.lon.size
+            ),
+        )
+        weight_seconds = time.perf_counter() - weights_started
+    timing = _empty_timing()
+    time_batches = 0
+    owner_chunks = 0
+    owner_buffer_bytes = 0
+    owner_buffer_peak_bytes = 0
+    owner_memmap_bytes = 0
+    try:
+        for item in task_items:
+            variable_metrics = _resample_tile_variable(
+                source,
+                item,
+                regridder,
+                output_group,
+                plan.target,
+                lat_start,
+                lat_stop,
+                lon_start,
+                lon_stop,
+                source_lat_slice,
+                source_lon_slice,
+                target_tile,
+                plan.skipna,
+                plan.na_thres,
+                plan.time_block,
+                plan.compute_workers,
+                plan.compute_dtype,
+                plan.before_replacements,
+                plan.after_replacements,
+                plan.statistics.get(item.name, {}),
+                workdir,
+                plan.owner_buffer_budget_bytes,
+            )
+            _add_timing(timing, variable_metrics)
+            time_batches += int(variable_metrics["time_batches"])
+            owner_chunks += int(variable_metrics["owner_chunks"])
+            owner_buffer_bytes += int(variable_metrics["owner_buffer_bytes"])
+            owner_buffer_peak_bytes = max(
+                owner_buffer_peak_bytes,
+                int(variable_metrics["owner_buffer_peak_bytes"]),
+            )
+            owner_memmap_bytes += int(variable_metrics["owner_memmap_bytes"])
+        return _TileMetrics(
+            task=task,
+            covered=True,
+            elapsed=time.perf_counter() - started,
+            weight_seconds=weight_seconds if full_regridder is None else 0.0,
+            read_seconds=timing["read"],
+            regrid_seconds=timing["regrid"],
+            write_seconds=timing["write"],
+            time_batches=time_batches,
+            owner_chunks=owner_chunks,
+            owner_buffer_bytes=owner_buffer_bytes,
+            owner_buffer_peak_bytes=owner_buffer_peak_bytes,
+            owner_memmap_bytes=owner_memmap_bytes,
         )
     finally:
         del regridder
@@ -1382,27 +1416,16 @@ def _run_parallel_tiles(
     workdir: Path,
     plan: ResamplePlan,
     spatial_items: tuple[VariableInfo, ...],
-    tasks: Iterable[tuple[int, int, int, int]],
+    tasks: Iterable[_OwnerTask],
     total_tasks: int,
+    total_batches: int,
     *,
     cancel_event=None,
     progress: bool,
-) -> dict[str, float]:
-    """Run bounded, spawn-safe spatial work without submitting all tiles."""
+) -> dict[str, float | int]:
+    """Run bounded owner tasks and aggregate progress once per completed task."""
 
     context = spawn_context()
-    progress_queue = context.Queue()
-    batches_per_tile = sum(
-        (
-            int(item.shape[item.dims.index("time")])
-            + plan.time_block
-            - 1
-        )
-        // plan.time_block
-        for item in spatial_items
-        if "time" in item.dims
-    )
-    total_batches = max(0, int(total_tasks) * batches_per_tile)
     completed_batches = 0
     report_interval = max(1, total_batches // 20) if total_batches else 1
     next_report = report_interval
@@ -1416,7 +1439,6 @@ def _run_parallel_tiles(
             plan,
             spatial_items,
             str(workdir),
-            progress_queue,
         ),
     )
     pending = set()
@@ -1426,23 +1448,10 @@ def _run_parallel_tiles(
     timing = _empty_timing()
     weight_seconds = 0.0
     tile_elapsed = 0.0
-
-    def drain_batch_progress() -> None:
-        nonlocal completed_batches, next_report
-        while True:
-            try:
-                completed_batches += int(progress_queue.get_nowait())
-            except Empty:
-                break
-        if progress and total_batches and (
-            completed_batches >= next_report or completed_batches >= total_batches
-        ):
-            print(
-                f"重采样时间批次：{min(completed_batches, total_batches)}/{total_batches}",
-                flush=True,
-            )
-            while next_report <= completed_batches:
-                next_report += report_interval
+    owner_chunks = 0
+    owner_buffer_bytes = 0
+    owner_buffer_peak_bytes = 0
+    owner_memmap_bytes = 0
     try:
         while pending or not cancelled:
             if cancel_event is not None and cancel_event.is_set():
@@ -1468,7 +1477,6 @@ def _run_parallel_tiles(
                 timeout=0.5,
                 return_when=FIRST_COMPLETED,
             )
-            drain_batch_progress()
             if not done:
                 continue
             if cancelled:
@@ -1483,8 +1491,16 @@ def _run_parallel_tiles(
                         f"空间并行 worker 失败：{exc}"
                     ) from exc
                 completed += 1
+                completed_batches += metrics.time_batches
                 tile_elapsed += metrics.elapsed
                 weight_seconds += metrics.weight_seconds
+                owner_chunks += metrics.owner_chunks
+                owner_buffer_bytes += metrics.owner_buffer_bytes
+                owner_buffer_peak_bytes = max(
+                    owner_buffer_peak_bytes,
+                    metrics.owner_buffer_peak_bytes,
+                )
+                owner_memmap_bytes += metrics.owner_memmap_bytes
                 _add_timing(
                     timing,
                     {
@@ -1493,6 +1509,17 @@ def _run_parallel_tiles(
                         "write": metrics.write_seconds,
                     },
                 )
+                if progress and total_batches and (
+                    completed_batches >= next_report
+                    or completed_batches >= total_batches
+                ):
+                    print(
+                        "重采样时间批次："
+                        f"{min(completed_batches, total_batches)}/{total_batches}",
+                        flush=True,
+                    )
+                    while next_report <= completed_batches:
+                        next_report += report_interval
                 if progress and (
                     completed == 1
                     or completed == total_tasks
@@ -1503,18 +1530,19 @@ def _run_parallel_tiles(
                 raise ResampleExecutionError("任务已取消，未生成输出。")
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
-        drain_batch_progress()
-        progress_queue.close()
-        progress_queue.join_thread()
     return {
-        "tiles": float(completed),
+        "tiles": completed,
         "tile_elapsed_seconds": tile_elapsed,
         "weight_seconds": weight_seconds,
         "read_seconds": timing["read"],
         "regrid_seconds": timing["regrid"],
         "write_seconds": timing["write"],
-        "time_batches": float(completed_batches),
-        "total_time_batches": float(total_batches),
+        "time_batches": completed_batches,
+        "total_time_batches": total_batches,
+        "owner_chunks": owner_chunks,
+        "owner_buffer_bytes": owner_buffer_bytes,
+        "owner_buffer_peak_bytes": owner_buffer_peak_bytes,
+        "owner_memmap_bytes": owner_memmap_bytes,
     }
 
 
@@ -1648,6 +1676,12 @@ def plan_resample(
                 if np.dtype(layout_item.dtype) != expected_dtype:
                     raise ValueError(f"变量 {item.name} 与最终输出布局的 dtype 不一致。")
             planned_output_chunks[item.name] = layout_item.chunks
+    owner_buffer_budget_bytes = resolve_owner_buffer_budget(
+        space_workers=selected_space_workers,
+        reserved_bytes=(
+            auto_tile.estimated_peak_bytes if auto_tile is not None else None
+        ),
+    )
     return ResamplePlan(
         inspection=inspection,
         target=target,
@@ -1664,6 +1698,7 @@ def plan_resample(
         tile_size_requested=config.tile_size,
         space_workers_requested=config.space_workers,
         auto_tile=auto_tile,
+        owner_buffer_budget_bytes=owner_buffer_budget_bytes,
         output_layout=config.output_layout,
         before_replacements=config.before_replacements,
         after_replacements=config.after_replacements,
@@ -1692,6 +1727,7 @@ def format_plan(plan: ResamplePlan) -> str:
             f"空间进程={plan.space_workers}"
             f"（{'自动' if plan.space_workers_requested == 'auto' else '手动'}）"
         ),
+        f"owner buffer 单进程内存上限：{_human_bytes(plan.owner_buffer_budget_bytes)}；超出时使用临时 memmap",
         f"采样前替换规则：{plan.before_replacements.as_pairs() or '无'}",
         f"采样后替换规则：{plan.after_replacements.as_pairs() or '无'}",
         f"表达式统计策略：{plan.statistics_policy}",
@@ -1913,7 +1949,6 @@ def run_resample(
     )
     staging = target_path.parent / f".{target_path.name}.resample-{uuid4().hex}.tmp"
     workdir = temporary_root / f".{target_path.name}.weights-{uuid4().hex}.tmp"
-    intermediate: Path | None = None
     started = time.perf_counter()
     source = None
     try:
@@ -1948,37 +1983,11 @@ def run_resample(
             runtime_plan,
             staging,
         )
-        intermediate_chunks = _intermediate_chunks(
+        avoided_intermediate = _avoids_intermediate_store(
             runtime_plan.inspection.info,
             runtime_plan,
-        )
-        use_intermediate = _needs_intermediate(
-            runtime_plan.inspection.info,
-            runtime_plan,
-            intermediate_chunks,
         )
         processing_path = staging
-        if use_intermediate:
-            intermediate = temporary_root / (
-                f".{target_path.name}.intermediate-{uuid4().hex}.tmp"
-            )
-            processing_plan = replace(
-                processing_plan,
-                output_chunks=intermediate_chunks,
-            )
-            _initialize_output_store(
-                source,
-                runtime_plan.inspection.info,
-                processing_plan,
-                intermediate,
-            )
-            processing_path = intermediate
-            if progress:
-                print(
-                    "检测到时间块小于最终输出 time chunk，启用临时中转 Zarr；"
-                    "完成后按最终 chunk 一次性合并。"
-                )
-                print(f"中间处理目录：{temporary_root}")
         output_group = zarr.open_group(processing_path, mode="r+")
         if cancel_event is not None and cancel_event.is_set():
             raise ResampleExecutionError("任务已取消，未生成输出。")
@@ -1989,49 +1998,47 @@ def run_resample(
             for item in runtime_plan.inspection.info.data_variables
             if item.name in spatial_names
         )
-        if use_intermediate:
-            lat_ranges = list(
-                _tile_ranges(runtime_plan.target.lat.size, runtime_plan.tile_size)
-            )
-            lon_ranges = list(
-                _tile_ranges(runtime_plan.target.lon.size, runtime_plan.tile_size)
-            )
-            tile_layout_description = "空间计算块与最终 chunks 解耦"
-        else:
-            lat_ranges, lon_ranges = _aligned_tile_ranges(
-                runtime_plan.inspection.info,
-                runtime_plan.target,
-                runtime_plan.tile_size,
-                processing_plan.output_chunks,
-            )
-            tile_layout_description = "空间块已对齐最终输出 chunks"
-        total_tiles = len(lat_ranges) * len(lon_ranges)
+        owner_groups = _owner_task_groups(spatial_items, processing_plan)
+        total_tiles = _owner_task_count(owner_groups, runtime_plan.target)
+        items_by_name = {item.name: item for item in spatial_items}
+        total_batches = _owner_total_batch_count(
+            owner_groups,
+            runtime_plan.target,
+            items_by_name,
+            processing_plan,
+        )
 
         def tile_tasks():
-            return (
-                (lat_start, lat_stop, lon_start, lon_stop)
-                for lat_start, lat_stop in lat_ranges
-                for lon_start, lon_stop in lon_ranges
-            )
+            return _owner_tasks(owner_groups, runtime_plan.target)
 
         if progress:
+            if avoided_intermediate:
+                print(
+                    "最终物理 chunks 由单一 task 持有；时间批次先填充有界 "
+                    "owner buffer，再各写一次，不创建中转 Zarr。"
+                )
             print(
-                f"流式计算：{total_tiles} 个空间块，"
+                f"流式计算：{total_tiles} 个物理 chunk owner task，"
                 f"空间进程={runtime_plan.space_workers}，"
-                f"每个进程使用 {runtime_plan.compute_workers} 个 Dask 线程；"
-                f"{tile_layout_description}。"
+                f"每个进程使用 {runtime_plan.compute_workers} 个 Dask 线程。"
             )
         full_regridder = None
         full_weight_path = None
-        tile_timing = {
-            "tiles": 0.0,
+        tile_timing: dict[str, float | int] = {
+            "tiles": 0,
             "tile_elapsed_seconds": 0.0,
             "weight_seconds": 0.0,
             "read_seconds": 0.0,
             "regrid_seconds": 0.0,
             "write_seconds": 0.0,
+            "time_batches": 0,
+            "total_time_batches": total_batches,
+            "owner_chunks": 0,
+            "owner_buffer_bytes": 0,
+            "owner_buffer_peak_bytes": 0,
+            "owner_memmap_bytes": 0,
         }
-        if runtime_plan.method == "nearest_d2s":
+        if total_tiles and runtime_plan.method == "nearest_d2s":
             full_regridder, full_weight_path = _build_regridder(
                 grid.lat,
                 grid.lon,
@@ -2046,7 +2053,7 @@ def run_resample(
             )
         try:
             # d2s must retain one full-grid weight matrix, so it deliberately
-            # stays in the caller.  Tiny jobs also avoid the spawn overhead.
+            # stays in the caller. Tiny jobs also avoid spawn overhead.
             if (
                 full_regridder is not None
                 or total_tiles <= 1
@@ -2070,6 +2077,14 @@ def run_resample(
                     tile_timing["read_seconds"] += metrics.read_seconds
                     tile_timing["regrid_seconds"] += metrics.regrid_seconds
                     tile_timing["write_seconds"] += metrics.write_seconds
+                    tile_timing["time_batches"] += metrics.time_batches
+                    tile_timing["owner_chunks"] += metrics.owner_chunks
+                    tile_timing["owner_buffer_bytes"] += metrics.owner_buffer_bytes
+                    tile_timing["owner_buffer_peak_bytes"] = max(
+                        tile_timing["owner_buffer_peak_bytes"],
+                        metrics.owner_buffer_peak_bytes,
+                    )
+                    tile_timing["owner_memmap_bytes"] += metrics.owner_memmap_bytes
                     if progress and (
                         index == 1
                         or index == total_tiles
@@ -2092,6 +2107,7 @@ def run_resample(
                     spatial_items,
                     tile_tasks(),
                     total_tiles,
+                    total_batches,
                     cancel_event=cancel_event,
                     progress=progress,
                 )
@@ -2105,18 +2121,6 @@ def run_resample(
                     pass
 
         merge_metrics = None
-        if use_intermediate:
-            if progress:
-                print("开始将中转数据合并为最终输出 chunks……")
-            merge_metrics = _merge_intermediate_store(
-                processing_path,
-                staging,
-                spatial_items,
-                temporary_root,
-                workers=runtime_plan.space_workers,
-                progress=progress,
-                cancel_event=cancel_event,
-            )
 
         after_statistics: dict[str, dict[str, float]] = {}
         after_statistics_mode = "not_required"
@@ -2169,8 +2173,6 @@ def run_resample(
         source.close()
         source = None
         _publish_staging(staging, target_path, config.overwrite)
-        if intermediate is not None:
-            shutil.rmtree(intermediate, ignore_errors=True)
         elapsed = time.perf_counter() - started
         physical_bytes = _directory_size(target_path)
         if progress:
@@ -2181,13 +2183,24 @@ def run_resample(
             "output": str(target_path),
             "physical_bytes": physical_bytes,
             "logical_bytes": logical_bytes,
-            "used_intermediate": intermediate is not None,
-            "intermediate_logical_bytes": logical_bytes if use_intermediate else 0,
+            "used_intermediate": False,
+            "intermediate_logical_bytes": 0,
+            "owner_buffer_bytes": int(tile_timing["owner_buffer_bytes"]),
+            "avoided_intermediate_bytes": (
+                logical_bytes if avoided_intermediate else 0
+            ),
+            "owner_buffer": {
+                "heap_budget_bytes_per_worker": runtime_plan.owner_buffer_budget_bytes,
+                "logical_bytes": int(tile_timing["owner_buffer_bytes"]),
+                "peak_bytes": int(tile_timing["owner_buffer_peak_bytes"]),
+                "memmap_bytes": int(tile_timing["owner_memmap_bytes"]),
+                "physical_chunks": int(tile_timing["owner_chunks"]),
+            },
             "throughput_mib_s": logical_bytes / 1024**2 / max(elapsed, 1e-9),
             "physical_throughput_mib_s": (
                 physical_bytes / 1024**2 / max(elapsed, 1e-9)
             ),
-            "logical_write_amplification": 2.0 if use_intermediate else 1.0,
+            "logical_write_amplification": 1.0,
             "space_workers": min(runtime_plan.space_workers, total_tiles),
             "compute_workers_per_space_worker": runtime_plan.compute_workers,
             "memory_plan": (
@@ -2201,6 +2214,13 @@ def run_resample(
                     ),
                     "fits_budget": runtime_plan.auto_tile.fits_budget,
                     "warning": runtime_plan.auto_tile.warning,
+                    "owner_buffer_budget_bytes_per_worker": (
+                        runtime_plan.owner_buffer_budget_bytes
+                    ),
+                    "owner_buffer_peak_bytes": int(
+                        tile_timing["owner_buffer_peak_bytes"]
+                    ),
+                    "owner_memmap_bytes": int(tile_timing["owner_memmap_bytes"]),
                 }
                 if runtime_plan.auto_tile is not None
                 else None
@@ -2221,19 +2241,11 @@ def run_resample(
             source = None
         shutil.rmtree(staging, ignore_errors=True)
         if cancel_event is not None and cancel_event.is_set():
-            if intermediate is not None:
-                shutil.rmtree(intermediate, ignore_errors=True)
             raise ResampleExecutionError("任务已取消，未生成输出。") from exc
         if isinstance(exc, ResampleExecutionError):
             raise
         raise ResampleExecutionError(
-            f"重采样失败；输出临时目录已清理：{staging}\n"
-            + (
-                f"中间目录保留用于排查：{intermediate}\n"
-                if intermediate is not None
-                else ""
-            )
-            + str(exc)
+            f"重采样失败；输出临时目录已清理：{staging}\n{exc}"
         ) from exc
     finally:
         if source is not None:

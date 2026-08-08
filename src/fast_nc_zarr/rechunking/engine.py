@@ -23,6 +23,7 @@ from .inspection import inspect_store
 from .models import ChunkPlan, CompressionPlan, DatasetInfo
 from ..publication import publish_staging
 from ..runtime import bounded_process_map
+from ..system import storage_profile
 
 
 class RechunkExecutionError(RuntimeError):
@@ -205,27 +206,27 @@ def _safe_workers(info: DatasetInfo, requested: int) -> int:
     return max(1, min(requested, cpu_cap, memory_workers))
 
 
-def _device_rotational(path: Path) -> tuple[int | None, bool | None]:
-    """Return ``(device_id, rotational)`` for a local path when available."""
+_CONSERVATIVE_FILESYSTEMS = frozenset(
+    {
+        "9p",
+        "afs",
+        "ceph",
+        "cifs",
+        "glusterfs",
+        "lustre",
+        "nfs",
+        "nfs4",
+        "smb",
+        "smb2",
+        "smb3",
+        "sshfs",
+    }
+)
 
-    try:
-        device_id = int(os.stat(path).st_dev)
-        major = os.major(device_id)
-        minor = os.minor(device_id)
-        device_path = Path(f"/sys/dev/block/{major}:{minor}").resolve()
-        # Mounted filesystems normally report a partition (for example
-        # ``sdb1``); the queue/rotational attribute lives on its parent disk
-        # (``sdb``), not on the partition itself.
-        for candidate in (device_path, *device_path.parents):
-            rotational_path = candidate / "queue" / "rotational"
-            if rotational_path.is_file():
-                rotational = (
-                    rotational_path.read_text(encoding="ascii").strip() == "1"
-                )
-                return device_id, rotational
-        return device_id, None
-    except (OSError, ValueError):
-        return None, None
+
+def _conservative_filesystem(filesystem: str) -> bool:
+    value = str(filesystem).strip().lower()
+    return value in _CONSERVATIVE_FILESYSTEMS or value.startswith("fuse")
 
 
 def _parallel_workers(
@@ -233,30 +234,206 @@ def _parallel_workers(
     target_parent: Path,
     requested: int,
 ) -> tuple[int, str]:
-    """Choose a bounded process count for source/output storage.
+    """Choose a bounded process count from shared storage profiles.
 
-    Multiple writers are useful for CPU compression, but concurrent writes to
-    one rotational disk turn this workload into seek-heavy random I/O.  Keep a
-    mechanical same-device pipeline at two processes; allow more parallelism
-    when the source and destination are SSDs or separate devices.
+    Network and userspace filesystems are deliberately conservative: adding
+    processes there often increases metadata round trips rather than useful
+    throughput.  Local SSDs retain the CPU-derived allowance, while rotational
+    media keep the existing seek-avoidance caps.
     """
 
     requested = max(1, int(requested))
-    source_device, source_rotational = _device_rotational(source)
-    target_device, target_rotational = _device_rotational(target_parent)
+    source_profile = storage_profile(source)
+    target_profile = storage_profile(target_parent)
     same_device = (
-        source_device is not None
-        and target_device is not None
-        and source_device == target_device
+        source_profile.device != "unknown"
+        and target_profile.device != "unknown"
+        and source_profile.device == target_profile.device
     )
     base = min(requested, 8, os.cpu_count() or 1)
-    if same_device and (source_rotational is True or target_rotational is True):
+    conservative = tuple(
+        profile.filesystem
+        for profile in (source_profile, target_profile)
+        if _conservative_filesystem(profile.filesystem)
+    )
+    if conservative:
+        filesystems = ", ".join(dict.fromkeys(conservative))
+        return max(1, min(base, 2)), (
+            f"检测到保守文件系统（{filesystems}），限制为 2 个进程"
+        )
+    if same_device and (
+        source_profile.rotational is True or target_profile.rotational is True
+    ):
         return max(1, min(base, 2)), "源和目标位于同一块机械硬盘，限制为 2 个进程"
-    if source_rotational is True or target_rotational is True:
+    if source_profile.rotational is True or target_profile.rotational is True:
         return max(1, min(base, 3)), "检测到机械硬盘，限制为 3 个进程"
     if same_device:
         return max(1, min(base, 4)), "源和目标同设备，限制为 4 个进程"
     return max(1, base), "源和目标设备可并行，按内存和 CPU 使用进程"
+
+
+def _json_signature(value: object) -> str:
+    def default(item: object) -> object:
+        if isinstance(item, np.generic):
+            return item.item()
+        if isinstance(item, np.ndarray):
+            return item.tolist()
+        raise TypeError(f"无法序列化 {type(item).__name__}")
+
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=True,
+        default=default,
+    )
+
+
+def _codec_signature(codec: object) -> tuple[str, str] | None:
+    serializer = getattr(codec, "to_dict", None)
+    if not callable(serializer):
+        return None
+    try:
+        payload = serializer()
+        signature = _json_signature(payload)
+    except (TypeError, ValueError):
+        return None
+    codec_type = f"{type(codec).__module__}.{type(codec).__qualname__}"
+    return codec_type, signature
+
+
+def _compression_matches_source(
+    info: DatasetInfo,
+    compression: CompressionPlan,
+) -> bool:
+    """Return true only when every requested compressor is provably identical."""
+
+    if not compression.enabled:
+        return True
+    for variable in info.variables:
+        desired = codec_for(variable, compression, coordinate=variable.is_coord)
+        if desired is None or len(variable.compressors) != 1:
+            return False
+        expected = _codec_signature(desired)
+        actual = _codec_signature(variable.compressors[0])
+        if expected is None or actual is None or expected != actual:
+            return False
+    return True
+
+
+def _chunks_match_plan(
+    info: DatasetInfo,
+    plan: ChunkPlan,
+    *,
+    data_only: bool,
+) -> bool:
+    variables = info.data_variables if data_only else info.variables
+    return all(
+        variable.chunks == plan.chunks_for(variable)
+        for variable in variables
+        if variable.ndim
+    )
+
+
+def _metadata_unchanged(dataset: xr.Dataset, info: DatasetInfo) -> bool:
+    """Check that CF sanitization did not alter metadata before byte copying."""
+
+    try:
+        if _json_signature(dict(dataset.attrs)) != _json_signature(info.attrs):
+            return False
+        source_variables = {variable.name: variable for variable in info.variables}
+        if set(dataset.variables) != set(source_variables):
+            return False
+        return all(
+            _json_signature(dict(dataset[name].attrs))
+            == _json_signature(source_variables[name].attrs)
+            for name in dataset.variables
+        )
+    except (TypeError, ValueError):
+        # Unknown attribute types must take the decode/encode path; a false
+        # negative only costs performance, while a false positive is unsafe.
+        return False
+
+
+def _copy_equivalent_store(
+    source: Path,
+    staging: Path,
+    *,
+    cancel_event=None,
+) -> None:
+    """Copy an equivalent store into staging without sharing mutable inodes."""
+
+    if staging.exists():
+        raise RechunkExecutionError(f"快速复制暂存目录已存在：{staging}")
+
+    for root, directories, files in os.walk(source, followlinks=False):
+        for name in (*directories, *files):
+            entry = Path(root) / name
+            if entry.is_symlink():
+                raise RechunkExecutionError(
+                    f"等价复制拒绝包含符号链接的源 Zarr：{entry}"
+                )
+
+    def copy_file(source_file: str, target_file: str) -> str:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RechunkExecutionError("任务已取消。")
+        # copy2 always creates an independent destination file.  In
+        # particular, never use hard links for mutable Zarr chunk payloads.
+        return shutil.copy2(source_file, target_file)
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RechunkExecutionError("任务已取消。")
+    shutil.copytree(source, staging, copy_function=copy_file)
+
+
+def _direct_region_chunks(info: DatasetInfo) -> dict[str, tuple[int, ...]]:
+    return {
+        variable.name: tuple(int(value) for value in variable.chunks)
+        for variable in info.data_variables
+        if variable.ndim == 3
+    }
+
+
+def _stage2_safe_workers(
+    info: DatasetInfo,
+    plan: ChunkPlan,
+    region_chunks: dict[str, tuple[int, ...]],
+    compression: CompressionPlan,
+    requested: int,
+) -> tuple[int, int]:
+    """Bound stage-2 concurrency by decoded regions and codec peak buffers."""
+
+    requested = max(1, int(requested))
+    codec_workers = max(1, min(2, requested))
+    peak_bytes = 1
+    for variable in info.data_variables:
+        if variable.ndim != 3:
+            continue
+        region = region_chunks.get(variable.name, variable.chunks)
+        region_bytes = int(
+            np.prod(
+                [
+                    min(int(size), int(chunk))
+                    for size, chunk in zip(variable.shape, region)
+                ],
+                dtype=np.int64,
+            )
+        ) * int(variable.dtype.itemsize)
+        final_bytes = int(
+            np.prod(plan.chunks_for(variable), dtype=np.int64)
+        ) * int(variable.dtype.itemsize)
+        # Dask may transiently retain both decoded inputs and the assembled
+        # region.  Each codec lane additionally needs an input and a worst-case
+        # encoded output buffer for one final physical chunk.
+        has_codec = compression.enabled or bool(variable.compressors)
+        codec_bytes = (
+            2 * final_bytes * codec_workers if has_codec else final_bytes
+        )
+        peak_bytes = max(peak_bytes, 2 * region_bytes + codec_bytes)
+    available = max(1, int(psutil.virtual_memory().available))
+    memory_workers = max(1, int(available * 0.25) // peak_bytes)
+    return max(1, min(requested, memory_workers)), peak_bytes
 
 
 _FUSED_CODEC_PIPELINE = "zarr.core.codec_pipeline.FusedCodecPipeline"
@@ -855,6 +1032,7 @@ def _populate_intermediate_parallel(
     *,
     workers: int,
     progress: bool,
+    stage_label: str = "阶段 1/2：",
     cancel_event=None,
 ) -> None:
     total_tasks = _stage1_time_task_count(info)
@@ -869,7 +1047,7 @@ def _populate_intermediate_parallel(
         initargs=(str(source_path), str(intermediate), codec_workers),
         task_function=_stage1_time_task,
         progress=progress,
-        stage_label="阶段 1/2：",
+        stage_label=stage_label,
         cancel_event=cancel_event,
     )
 
@@ -911,6 +1089,7 @@ def _populate_intermediate(
     workers: int,
     progress: bool,
     source_path: Path | None = None,
+    stage_label: str = "阶段 1/2：",
     parallel: bool = False,
     cancel_event=None,
 ) -> None:
@@ -925,6 +1104,7 @@ def _populate_intermediate(
             intermediate,
             workers=workers,
             progress=progress,
+            stage_label=stage_label,
             cancel_event=cancel_event,
         )
         return
@@ -953,7 +1133,7 @@ def _populate_intermediate(
                 array = zarr.open_array(store=intermediate, path=variable.name, mode="r+")
                 if progress:
                     print(
-                        f"阶段 1/2：写入中间块 {variable.name} "
+                        f"{stage_label}写入块 {variable.name} "
                         f"（{variable_index}/{len(data_variables)}），共 {total} 个源 chunk"
                 )
                 source_data = source_variable.data
@@ -1001,6 +1181,32 @@ def _populate_intermediate(
         if gc_was_enabled:
             gc.enable()
         gc.collect()
+
+
+def _populate_final_direct(
+    source: xr.Dataset,
+    source_path: Path,
+    info: DatasetInfo,
+    staging: Path,
+    *,
+    workers: int,
+    progress: bool,
+    parallel: bool,
+    cancel_event=None,
+) -> None:
+    """Decode each source physical chunk and encode that same final chunk once."""
+
+    _populate_intermediate(
+        source,
+        info,
+        staging,
+        workers=workers,
+        progress=progress,
+        source_path=source_path,
+        parallel=parallel,
+        cancel_event=cancel_event,
+        stage_label="单阶段：",
+    )
 
 
 def _intermediate_time_chunk(info: DatasetInfo, plan: ChunkPlan) -> int:
@@ -1295,7 +1501,7 @@ def _populate_final_from_intermediate(
         with zarr.config.set(
             {
                 "codec_pipeline.path": _FUSED_CODEC_PIPELINE,
-                "codec_pipeline.max_workers": max(1, int(workers)),
+                "codec_pipeline.max_workers": max(1, min(2, int(workers))),
             }
         ):
             for variable_index, variable in enumerate(data_variables, start=1):
@@ -1363,6 +1569,7 @@ def _validate_structure(
     source: DatasetInfo,
     output: DatasetInfo,
     plan: ChunkPlan,
+    compression: CompressionPlan,
 ) -> None:
     if source.dimensions != output.dimensions:
         raise RechunkExecutionError(
@@ -1385,6 +1592,25 @@ def _validate_structure(
                     f"变量 {name} 的 chunks 不符合计划："
                     f"期望 {expected}，实际 {actual.chunks}"
                 )
+        desired_codec = codec_for(variable, compression, coordinate=variable.is_coord)
+        expected_compressors = (
+            (desired_codec,)
+            if compression.enabled and desired_codec is not None
+            else variable.compressors
+        )
+        if len(actual.compressors) != len(expected_compressors):
+            raise RechunkExecutionError(f"变量 {name} 的 codec 数量不符合计划。")
+        for expected_codec, actual_codec in zip(
+            expected_compressors, actual.compressors
+        ):
+            expected_signature = _codec_signature(expected_codec)
+            actual_signature = _codec_signature(actual_codec)
+            if (
+                expected_signature is None
+                or actual_signature is None
+                or expected_signature != actual_signature
+            ):
+                raise RechunkExecutionError(f"变量 {name} 的 codec 不符合计划。")
 
 
 def _sample_slices(info: DatasetInfo) -> tuple[object, ...]:
@@ -1453,17 +1679,18 @@ def run_rechunk(
     target = Path(output).expanduser().resolve()
     if source_path == target:
         raise RechunkExecutionError("输入和输出不能是同一个目录。")
+    if source_path in target.parents or target in source_path.parents:
+        raise RechunkExecutionError("输入和输出 Zarr 不能相互嵌套。")
     if source_path != info.path:
         raise RechunkExecutionError("输入检查结果与执行输入路径不一致。")
     _prepare_target(target, overwrite)
     temporary_root = _resolve_temporary_root(source_path, target, temporary_dir)
-    # The final staging store stays beside the requested output.  It is the
-    # final data written to the destination disk, hidden until validation
-    # succeeds.  Only the repeatedly-read intermediate store is redirected to
-    # the user-selected fast temporary disk.
+    # The final staging store stays beside the requested output.  Publication
+    # remains an atomic rename for every execution path, including byte copy.
     staging = target.parent / f".{target.name}.rechunk-{uuid4().hex}.tmp"
     intermediate = temporary_root / f".{target.name}.intermediate-{uuid4().hex}.tmp"
     started = time.perf_counter()
+    execution_path = "two_stage"
     dataset = None
     intermediate_dataset = None
     try:
@@ -1486,177 +1713,258 @@ def run_rechunk(
         data3d = [variable for variable in info.data_variables if variable.ndim == 3]
         if not data3d:
             raise RechunkExecutionError("没有可写入的三维数据变量。")
-        safe_workers = _safe_workers(info, workers)
-        effective_workers, device_reason = _parallel_workers(
-            source_path,
-            target.parent,
-            safe_workers,
-        )
-        if effective_workers < max(1, int(workers)):
-            print(
-                f"依据源 chunk 和可用内存将 worker 数从 {max(1, int(workers))} "
-                f"调整为 {effective_workers}。"
-            )
-        print(f"并行 I/O 策略：{device_reason}；实际进程数={effective_workers}。")
-        print(
-            f"使用两阶段源 chunk 对齐重分块：源 chunk 读取一次；"
-            f"最终块分批写入，变量逐个处理（{len(data3d)} 个三维变量）。"
-        )
 
-        intermediate_chunks = _intermediate_chunks(info, plan, effective_workers)
-        intermediate_plan = replace(plan, chunks=intermediate_chunks)
-        intermediate_count = _intermediate_chunk_count(info, intermediate_chunks)
-        if intermediate_count >= _INTERMEDIATE_SHARD_THRESHOLD:
-            intermediate_shards = _intermediate_shards(
+        copy_equivalent = (
+            _chunks_match_plan(info, plan, data_only=False)
+            and _compression_matches_source(info, compression)
+            and _metadata_unchanged(dataset, info)
+        )
+        direct_chunks = _chunks_match_plan(info, plan, data_only=True)
+
+        if copy_equivalent:
+            execution_path = "copy"
+            if progress:
+                print(
+                    "chunks、codec 和 metadata 与计划等价；"
+                    "直接复制独立 chunk 文件到暂存目录。"
+                )
+            dataset.close()
+            dataset = None
+            _copy_equivalent_store(
+                source_path,
+                staging,
+                cancel_event=cancel_event,
+            )
+        elif direct_chunks:
+            execution_path = "single_stage"
+            safe_workers = _safe_workers(info, workers)
+            effective_workers, device_reason = _parallel_workers(
+                source_path,
+                target.parent,
+                safe_workers,
+            )
+            effective_workers, worker_peak_bytes = _stage2_safe_workers(
+                info,
+                plan,
+                _direct_region_chunks(info),
+                compression,
+                effective_workers,
+            )
+            if progress:
+                print(
+                    "源与目标物理 chunks 相同；使用单阶段逐 chunk "
+                    "decode→final encode，跳过中间 Zarr。"
+                )
+                print(
+                    f"并行 I/O 策略：{device_reason}；实际进程数="
+                    f"{effective_workers}；估算每 worker 峰值="
+                    f"{worker_peak_bytes / 1024**2:.1f} MiB。"
+                )
+            _initialize_store(dataset, info, plan, compression, staging)
+            direct_task_count = _stage1_time_task_count(info)
+            source_chunk_count = _stage1_source_chunk_count(info)
+            parallel_direct = (
+                effective_workers > 1
+                and direct_task_count >= effective_workers
+                and source_chunk_count >= effective_workers * 2
+            )
+            _populate_final_direct(
+                dataset,
+                source_path,
+                info,
+                staging,
+                workers=effective_workers,
+                progress=progress,
+                parallel=parallel_direct,
+                cancel_event=cancel_event,
+            )
+            dataset.close()
+            dataset = None
+        else:
+            safe_workers = _safe_workers(info, workers)
+            stage1_workers, stage1_reason = _parallel_workers(
+                source_path,
+                temporary_root,
+                safe_workers,
+            )
+            intermediate_chunks = _intermediate_chunks(info, plan, stage1_workers)
+            intermediate_plan = replace(plan, chunks=intermediate_chunks)
+            intermediate_count = _intermediate_chunk_count(info, intermediate_chunks)
+            if intermediate_count >= _INTERMEDIATE_SHARD_THRESHOLD:
+                intermediate_shards = _intermediate_shards(
+                    info,
+                    intermediate_chunks,
+                    plan.chunks,
+                )
+            else:
+                # Grouped stage-2 reads remove call overhead for ordinary
+                # stores; reserve sharding for metadata-dominated grids.
+                intermediate_shards = {}
+            stage2_region_chunks = _stage2_region_chunks(
                 info,
                 intermediate_chunks,
                 plan.chunks,
             )
-        else:
-            # For ordinary stores, bounded stage-2 read grouping removes most
-            # Python/Zarr call overhead without the extra decode cost of
-            # sharded physical files.  Reserve sharding for truly enormous
-            # intermediate grids where directory metadata becomes dominant.
-            intermediate_shards = {}
-        stage2_region_chunks = _stage2_region_chunks(
-            info,
-            intermediate_chunks,
-            plan.chunks,
-        )
-        intermediate_compression = (
-            make_compression_plan("fast") if compression.enabled else compression
-        )
-        print(
-            f"阶段 1 中间 chunks(time, lat, lon)：{intermediate_chunks}；"
-            f"中间 codec：{intermediate_compression.profile}"
-        )
-        print(
-            f"阶段 1 预计逻辑中间 chunk 数：{intermediate_count:,}；"
-            f"sharding 阈值：{_INTERMEDIATE_SHARD_THRESHOLD:,}"
-        )
-        if intermediate_shards:
-            shard_text = ", ".join(
-                f"{name}={shape}" for name, shape in intermediate_shards.items()
+            stage2_storage_workers, stage2_reason = _parallel_workers(
+                temporary_root,
+                target.parent,
+                safe_workers,
             )
-            print(
-                "阶段 1 启用 Zarr v3 sharding，减少中间小文件："
-                f" {shard_text}"
-            )
-        intermediate_by_dim = dict(zip(("time", "lat", "lon"), intermediate_chunks))
-        grouped_text = ", ".join(
-            f"{variable.name}={stage2_region_chunks[variable.name]}"
-            for variable in data3d
-            if stage2_region_chunks.get(variable.name)
-            != tuple(intermediate_by_dim[dim] for dim in variable.dims)
-        )
-        if grouped_text:
-            print(f"阶段 2 读取区域批处理：{grouped_text}")
-        stage1_task_count = (
-            _stage1_time_task_count(info) if plan.strategy == "time" else 0
-        )
-        stage1_source_chunk_count = _stage1_source_chunk_count(info)
-        output_chunk_count = sum(plan.estimated_chunks.values())
-        # Process startup is noticeable for tiny stores.  Keep those cases on
-        # the low-overhead single-process path while enabling multiprocessing
-        # for real multi-chunk workloads.
-        parallel_stage1 = (
-            plan.strategy == "time"
-            and effective_workers > 1
-            and (
-                stage1_task_count >= max(6, effective_workers * 2)
-                or stage1_source_chunk_count >= max(8, effective_workers * 4)
-            )
-        )
-        parallel_stage2 = (
-            effective_workers > 1
-            and output_chunk_count >= max(8, effective_workers * 4)
-        )
-        if parallel_stage1:
-            print("阶段 1 使用按源 time chunk 隔离的多进程写入，避免目标 chunk 冲突。")
-        if parallel_stage2:
-            print("阶段 2 使用按最终 chunk 隔离的多进程合并。")
-
-        # Create both stores before data movement.  This writes coordinates and
-        # array metadata only; no full-sized empty Dask array is materialized.
-        _initialize_store(
-            dataset,
-            info,
-            intermediate_plan,
-            intermediate_compression,
-            intermediate,
-            shards=intermediate_shards,
-        )
-        _initialize_store(dataset, info, plan, compression, staging)
-        stage1_started = time.perf_counter()
-        _populate_intermediate(
-            dataset,
-            info,
-            intermediate,
-            workers=effective_workers,
-            progress=progress,
-            source_path=source_path,
-            parallel=parallel_stage1,
-            cancel_event=cancel_event,
-        )
-        if cancel_event is not None and cancel_event.is_set():
-            raise RechunkExecutionError("任务已取消。")
-        if progress:
-            print(f"阶段 1/2 完成，耗时 {time.perf_counter() - stage1_started:.1f} 秒")
-        dataset.close()
-        dataset = None
-
-        stage2_started = time.perf_counter()
-        if parallel_stage2:
-            _populate_final_parallel(
-                intermediate,
-                staging,
+            stage2_workers, stage2_peak_bytes = _stage2_safe_workers(
                 info,
                 plan,
-                intermediate_chunks,
-                region_chunks=stage2_region_chunks,
-                workers=effective_workers,
-                progress=progress,
-                cancel_event=cancel_event,
+                stage2_region_chunks,
+                compression,
+                stage2_storage_workers,
             )
-        else:
-            # Stage 2 reads one spatially aligned intermediate block and emits
-            # its final chunk.  Time-contiguous output combines only
-            # source-time chunks, so no source spatial chunk is reread.
-            intermediate_dataset = xr.open_zarr(
-                intermediate,
-                consolidated=False,
-                chunks={},
-                decode_times=False,
-                mask_and_scale=False,
+            intermediate_compression = (
+                make_compression_plan("fast") if compression.enabled else compression
             )
-            _populate_final_from_intermediate(
-                intermediate_dataset,
+            if progress:
+                print(
+                    "使用两阶段源 chunk 对齐重分块：源 chunk 读取一次；"
+                    f"最终块分批写入（{len(data3d)} 个三维变量）。"
+                )
+                print(
+                    f"阶段 1 I/O：{stage1_reason}；实际进程数={stage1_workers}。"
+                )
+                print(
+                    f"阶段 2 I/O：{stage2_reason}；实际进程数={stage2_workers}；"
+                    f"估算每 worker 峰值={stage2_peak_bytes / 1024**2:.1f} MiB。"
+                )
+                print(
+                    f"阶段 1 中间 chunks(time, lat, lon)：{intermediate_chunks}；"
+                    f"中间 codec：{intermediate_compression.profile}"
+                )
+                print(
+                    f"阶段 1 预计逻辑中间 chunk 数：{intermediate_count:,}；"
+                    f"sharding 阈值：{_INTERMEDIATE_SHARD_THRESHOLD:,}"
+                )
+                if intermediate_shards:
+                    shard_text = ", ".join(
+                        f"{name}={shape}"
+                        for name, shape in intermediate_shards.items()
+                    )
+                    print(
+                        "阶段 1 启用 Zarr v3 sharding，减少中间小文件："
+                        f" {shard_text}"
+                    )
+                intermediate_by_dim = dict(
+                    zip(("time", "lat", "lon"), intermediate_chunks)
+                )
+                grouped_text = ", ".join(
+                    f"{variable.name}={stage2_region_chunks[variable.name]}"
+                    for variable in data3d
+                    if stage2_region_chunks.get(variable.name)
+                    != tuple(intermediate_by_dim[dim] for dim in variable.dims)
+                )
+                if grouped_text:
+                    print(f"阶段 2 读取区域批处理：{grouped_text}")
+
+            stage1_task_count = (
+                _stage1_time_task_count(info) if plan.strategy == "time" else 0
+            )
+            stage1_source_chunk_count = _stage1_source_chunk_count(info)
+            output_chunk_count = sum(plan.estimated_chunks.values())
+            # Stage 1 can use time-slice owners only when intermediate time
+            # chunks align with source chunks.  Stage 2 tasks always own
+            # disjoint final physical chunks.
+            parallel_stage1 = (
+                plan.strategy == "time"
+                and stage1_workers > 1
+                and (
+                    stage1_task_count >= max(6, stage1_workers * 2)
+                    or stage1_source_chunk_count >= max(8, stage1_workers * 4)
+                )
+            )
+            parallel_stage2 = (
+                stage2_workers > 1
+                and output_chunk_count >= max(8, stage2_workers * 4)
+            )
+            if progress and parallel_stage1:
+                print("阶段 1 使用按源 time chunk 隔离的多进程写入。")
+            if progress and parallel_stage2:
+                print("阶段 2 使用按最终物理 chunk 单 owner 的多进程合并。")
+
+            _initialize_store(
+                dataset,
                 info,
-                staging,
-                plan,
-                intermediate_chunks,
-                region_chunks=stage2_region_chunks,
-                workers=effective_workers,
+                intermediate_plan,
+                intermediate_compression,
+                intermediate,
+                shards=intermediate_shards,
+            )
+            _initialize_store(dataset, info, plan, compression, staging)
+            stage1_started = time.perf_counter()
+            _populate_intermediate(
+                dataset,
+                info,
+                intermediate,
+                workers=stage1_workers,
                 progress=progress,
+                source_path=source_path,
+                parallel=parallel_stage1,
                 cancel_event=cancel_event,
             )
-            intermediate_dataset.close()
-            intermediate_dataset = None
-        if cancel_event is not None and cancel_event.is_set():
-            raise RechunkExecutionError("任务已取消。")
-        if progress:
-            print(f"阶段 2/2 完成，耗时 {time.perf_counter() - stage2_started:.1f} 秒")
+            if cancel_event is not None and cancel_event.is_set():
+                raise RechunkExecutionError("任务已取消。")
+            if progress:
+                print(
+                    f"阶段 1/2 完成，耗时 "
+                    f"{time.perf_counter() - stage1_started:.1f} 秒"
+                )
+            dataset.close()
+            dataset = None
+
+            stage2_started = time.perf_counter()
+            if parallel_stage2:
+                _populate_final_parallel(
+                    intermediate,
+                    staging,
+                    info,
+                    plan,
+                    intermediate_chunks,
+                    region_chunks=stage2_region_chunks,
+                    workers=stage2_workers,
+                    progress=progress,
+                    cancel_event=cancel_event,
+                )
+            else:
+                intermediate_dataset = xr.open_zarr(
+                    intermediate,
+                    consolidated=False,
+                    chunks={},
+                    decode_times=False,
+                    mask_and_scale=False,
+                )
+                _populate_final_from_intermediate(
+                    intermediate_dataset,
+                    info,
+                    staging,
+                    plan,
+                    intermediate_chunks,
+                    region_chunks=stage2_region_chunks,
+                    workers=stage2_workers,
+                    progress=progress,
+                    cancel_event=cancel_event,
+                )
+                intermediate_dataset.close()
+                intermediate_dataset = None
+            if cancel_event is not None and cancel_event.is_set():
+                raise RechunkExecutionError("任务已取消。")
+            if progress:
+                print(
+                    f"阶段 2/2 完成，耗时 "
+                    f"{time.perf_counter() - stage2_started:.1f} 秒"
+                )
 
         output_info = inspect_store(staging)
-        _validate_structure(info, output_info, plan)
+        _validate_structure(info, output_info, plan, compression)
         if validate:
             _validate_samples(source_path, staging, info)
 
         if cancel_event is not None and cancel_event.is_set():
             raise RechunkExecutionError("任务已取消。")
-        # Staging is beside target, so publication is an atomic rename on the
-        # destination filesystem.  An existing valid output is moved to a
-        # recoverable backup until the new store has been installed.
         publish_staging(
             staging,
             target,
@@ -1664,7 +1972,7 @@ def run_rechunk(
             overwrite=overwrite,
             require_zarr_v3=True,
         )
-        shutil.rmtree(intermediate)
+        shutil.rmtree(intermediate, ignore_errors=True)
         elapsed = time.perf_counter() - started
         physical_bytes = _directory_size(target)
         return {
@@ -1674,6 +1982,10 @@ def run_rechunk(
             "throughput_mib_s": info.logical_bytes / 1024**2 / max(elapsed, 1e-9),
             "output": str(target),
             "temporary_dir": str(temporary_root),
+            "execution_path": execution_path,
+            "avoided_intermediate_bytes": (
+                info.logical_bytes if execution_path != "two_stage" else 0
+            ),
         }
     except Exception as exc:
         if dataset is not None:
@@ -1681,9 +1993,7 @@ def run_rechunk(
         if intermediate_dataset is not None:
             intermediate_dataset.close()
         if cancel_event is not None and cancel_event.is_set():
-            # A cancelled task must not leave a large, apparently valid-looking
-            # partial store behind.  Both paths are UUID-scoped staging
-            # directories created by this invocation.
+            # UUID-scoped partial stores are never published on cancellation.
             shutil.rmtree(staging, ignore_errors=True)
             shutil.rmtree(intermediate, ignore_errors=True)
             raise RechunkExecutionError("任务已取消，未生成输出。") from exc

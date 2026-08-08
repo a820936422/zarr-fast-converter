@@ -5,10 +5,51 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
-from .models import ConversionPlan, Inventory, Selection
+import numpy as np
+
+from .models import ConversionPlan, Inventory, OutputLayout, Selection
 from .system import available_memory, physical_cpu_count, storage_profile
 
 MIB = 1024**2
+
+def output_layout_plan_chunks(
+    selection: Selection,
+    output_layout: OutputLayout,
+) -> tuple[int, int, int] | None:
+    """Return a conservative scheduler chunk shape for a fixed variable layout."""
+    shapes: list[tuple[int, int, int]] = []
+    by_source = {item.source_name: item for item in output_layout.variables}
+    for name in selection.variables:
+        item = by_source.get(name)
+        if item is None:
+            continue
+        chunks_by_dim = dict(zip(item.dims, item.chunks))
+        if all(dim in chunks_by_dim for dim in ("time", "lat", "lon")):
+            shapes.append(
+                tuple(int(chunks_by_dim[dim]) for dim in ("time", "lat", "lon"))
+            )
+    if not shapes:
+        return None
+    return tuple(
+        min(size, max(shape[axis] for shape in shapes))
+        for axis, size in enumerate(selection.shape)
+    )
+
+
+def output_layout_max_chunk_bytes(
+    selection: Selection,
+    output_layout: OutputLayout,
+) -> int:
+    """Return the largest encoded variable chunk's decoded byte footprint."""
+    maximum = 0
+    by_source = {item.source_name: item for item in output_layout.variables}
+    for name in selection.variables:
+        item = by_source.get(name)
+        if item is None:
+            continue
+        cells = math.prod(int(chunk) for chunk in item.chunks)
+        maximum = max(maximum, cells * np.dtype(item.dtype).itemsize)
+    return maximum
 
 
 def workload_kind(inventory: Inventory) -> str:
@@ -207,6 +248,82 @@ def resolve_conversion_plan(
             raise ValueError("max_workers 必须是正整数。")
         resolved = replace(resolved, workers=min(resolved.workers, int(max_workers)))
     return resolved
+
+
+def fixed_layout_candidate_plans(
+    inventory: Inventory,
+    selection: Selection,
+    base: ConversionPlan,
+    *,
+    max_workers: int | None = None,
+    reserve_gib: float = 2.0,
+    worker_chunk_bytes: int | None = None,
+) -> list[ConversionPlan]:
+    """Vary execution concurrency without changing a supplied storage layout."""
+
+    if base.strategy == "dask":
+        return [base]
+    if max_workers is not None and int(max_workers) <= 0:
+        raise ValueError("max_workers 必须是正整数。")
+
+    cpu_limit = physical_cpu_count()
+    if max_workers is not None:
+        cpu_limit = min(cpu_limit, int(max_workers))
+    largest_item = max(
+        inventory.variables[name].itemsize for name in selection.variables
+    )
+    chunk_bytes = (
+        min(base.chunk_time, selection.shape[0])
+        * min(base.chunk_lat, selection.shape[1])
+        * min(base.chunk_lon, selection.shape[2])
+        * largest_item
+    )
+    if worker_chunk_bytes is not None:
+        chunk_bytes = max(chunk_bytes, max(1, int(worker_chunk_bytes)))
+    estimated_worker = max(128 * MIB, chunk_bytes * 3)
+    memory_limit = max(1, available_memory(reserve_gib) // estimated_worker)
+    worker_limit = max(1, min(cpu_limit, int(memory_limit)))
+
+    # Always measure at least three distinct worker counts when the declared
+    # CPU, memory and user limits allow it.  Powers of two cover larger hosts
+    # without turning a fixed-layout tune into an exhaustive search.
+    worker_values = set(range(1, min(worker_limit, 4) + 1))
+    value = 8
+    while value < worker_limit:
+        worker_values.add(value)
+        value *= 2
+    worker_values.update((min(base.workers, worker_limit), worker_limit))
+
+    _, ny, nx = selection.shape
+    spatial_chunks = math.ceil(ny / base.chunk_lat) * math.ceil(nx / base.chunk_lon)
+    maximum_batch = max(1, min(16, spatial_chunks))
+    batch_values = {1, min(maximum_batch, max(1, base.task_batch)), maximum_batch}
+    batch_values.update(
+        value for value in (2, 4, 8, 16) if value <= maximum_batch
+    )
+
+    candidates = [
+        replace(
+            base,
+            workers=workers,
+            task_batch=min(maximum_batch, max(1, base.task_batch)),
+        )
+        for workers in sorted(worker_values)
+    ]
+    batching_workers = min(max(1, base.workers), worker_limit)
+    candidates.extend(
+        replace(base, workers=batching_workers, task_batch=batch)
+        for batch in sorted(batch_values)
+    )
+
+    unique: list[ConversionPlan] = []
+    seen: set[tuple[int, int]] = set()
+    for item in candidates:
+        key = (item.workers, item.task_batch)
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
 
 
 def candidate_plans(

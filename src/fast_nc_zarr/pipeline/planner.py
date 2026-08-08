@@ -147,19 +147,157 @@ def _inventory_id(inventory: Inventory) -> str:
     digest.update(np.asarray(inventory.times).tobytes())
     return digest.hexdigest()
 
+_MAX_EQUIVALENT_PIXEL_FRACTION = 1.0 / 1024.0
+_AXIS_EQUIVALENCE_ULPS = 4.0
 
-def _exact_slice(values: np.ndarray, target: np.ndarray) -> tuple[int, int] | None:
-    if target.size == 0 or target.size > values.size:
-        return None
-    for start in range(values.size - target.size + 1):
-        if np.allclose(
-            values[start : start + target.size],
-            target,
-            rtol=0.0,
-            atol=1e-8,
+
+def _ulp_width(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    """Return the wider adjacent representable interval at each value."""
+
+    quantized = np.asarray(values, dtype=dtype)
+    positive = np.nextafter(quantized, dtype.type(np.inf))
+    negative = np.nextafter(quantized, dtype.type(-np.inf))
+    return np.maximum(
+        np.asarray(np.abs(positive - quantized), dtype="float64"),
+        np.asarray(np.abs(quantized - negative), dtype="float64"),
+    )
+
+
+def _axis_value_tolerances(
+    source: np.ndarray,
+    target: np.ndarray,
+    resolution: float,
+) -> np.ndarray:
+    """Bound coordinate equality by source precision and a tiny pixel fraction."""
+
+    source = np.asarray(source)
+    target = np.asarray(target)
+    precision = source.dtype if np.issubdtype(source.dtype, np.floating) else np.dtype("float64")
+    dtype_ulps = np.maximum(
+        _ulp_width(source, precision),
+        _ulp_width(target, precision),
+    )
+    # Regular float32 axes are often generated from an origin and a step,
+    # then rounded element by element.  Near zero the local ULP is tiny even
+    # though accumulated origin/step quantization remains bounded by the
+    # widest ULP on the same axis.  Use that axis-wide precision floor while
+    # retaining the strict sub-pixel cap below.
+    dtype_quantization = float(np.max(dtype_ulps, initial=0.0))
+    arithmetic_ulps = np.maximum(
+        _ulp_width(source, np.dtype("float64")),
+        _ulp_width(target, np.dtype("float64")),
+    )
+    pixel_cap = abs(float(resolution)) * _MAX_EQUIVALENT_PIXEL_FRACTION
+    return np.minimum(
+        np.maximum(
+            dtype_quantization * _AXIS_EQUIVALENCE_ULPS,
+            arithmetic_ulps * (_AXIS_EQUIVALENCE_ULPS * 2.0),
+        ),
+        pixel_cap,
+    )
+
+
+def _axis_tolerance(values: np.ndarray, resolution: float) -> float:
+    tolerances = _axis_value_tolerances(values, values, resolution)
+    return float(np.max(tolerances, initial=0.0))
+
+
+def _regular_axis_equivalent(
+    source: np.ndarray,
+    target: np.ndarray,
+    *,
+    source_resolution: float,
+    target_resolution: float,
+) -> bool:
+    """Compare regular axes without hiding shape, direction, scale, or real shifts."""
+
+    source = np.asarray(source)
+    target = np.asarray(target)
+    if source.ndim != 1 or target.ndim != 1 or source.shape != target.shape or source.size == 0:
+        return False
+    comparison_dtype = np.result_type(source.dtype, target.dtype, np.float64)
+    try:
+        source_values = source.astype(comparison_dtype, copy=False)
+        target_values = target.astype(comparison_dtype, copy=False)
+    except (TypeError, ValueError):
+        return False
+    if not np.all(np.isfinite(source_values)) or not np.all(np.isfinite(target_values)):
+        return False
+    if source.size > 1:
+        source_differences = np.diff(source_values)
+        target_differences = np.diff(target_values)
+        source_ascending = bool(np.all(source_differences > 0))
+        source_descending = bool(np.all(source_differences < 0))
+        target_ascending = bool(np.all(target_differences > 0))
+        target_descending = bool(np.all(target_differences < 0))
+        if not (
+            (source_ascending and target_ascending)
+            or (source_descending and target_descending)
         ):
-            return start, start + target.size
+            return False
+    resolution_scale = min(abs(float(source_resolution)), abs(float(target_resolution)))
+    if not np.isfinite(resolution_scale) or resolution_scale <= 0:
+        return False
+    if abs(float(source_resolution) - float(target_resolution)) > _axis_tolerance(
+        source, resolution_scale
+    ):
+        return False
+    tolerances = _axis_value_tolerances(source, target, resolution_scale)
+    return bool(np.all(np.abs(source_values - target_values) <= tolerances))
+
+
+def _exact_slice(
+    values: np.ndarray,
+    target: np.ndarray,
+    *,
+    source_resolution: float,
+    target_resolution: float,
+) -> tuple[int, int] | None:
+    values = np.asarray(values)
+    target = np.asarray(target)
+    if values.ndim != 1 or target.ndim != 1 or target.size == 0 or target.size > values.size:
+        return None
+    comparison_dtype = np.result_type(values.dtype, target.dtype, np.float64)
+    try:
+        distances = np.abs(
+            values.astype(comparison_dtype, copy=False)
+            - target.astype(comparison_dtype, copy=False)[0]
+        )
+    except (TypeError, ValueError):
+        return None
+    nearest = int(np.argmin(distances))
+    for start in sorted({nearest - 1, nearest, nearest + 1}):
+        stop = start + target.size
+        if start < 0 or stop > values.size:
+            continue
+        if _regular_axis_equivalent(
+            values[start:stop],
+            target,
+            source_resolution=source_resolution,
+            target_resolution=target_resolution,
+        ):
+            return start, stop
     return None
+
+
+def _conversion_tasks_own_physical_chunks(
+    task_chunks: tuple[int, int, int],
+    output_layout: OutputLayout,
+) -> bool:
+    """Return whether task boundaries can never split a physical data chunk."""
+
+    task_by_dim = dict(zip(("time", "lat", "lon"), map(int, task_chunks)))
+    for item in output_layout.variables:
+        if item.is_coord:
+            continue
+        for dim, size, physical_chunk in zip(item.dims, item.shape, item.chunks):
+            task_chunk = min(int(size), task_by_dim.get(dim, int(size)))
+            physical_chunk = min(int(size), int(physical_chunk))
+            if task_chunk <= 0 or physical_chunk <= 0:
+                return False
+            if task_chunk < int(size) and task_chunk % physical_chunk != 0:
+                return False
+    return True
 
 
 def _final_layout(
@@ -324,16 +462,30 @@ def _output_layout(
         }
         target_axes = {"lat": np.asarray(target.lat), "lon": np.asarray(target.lon)}
         reversals = []
+        full_axes = {
+            "lat": np.asarray(inventory.lat_values),
+            "lon": np.asarray(inventory.lon_values),
+        }
         for name in ("lat", "lon"):
             source_values = selected_axes[name]
             target_values = target_axes[name]
-            same_size = source_values.shape == target_values.shape
-            if same_size and np.allclose(
-                source_values, target_values, rtol=1e-7, atol=1e-10
+            full_values = full_axes[name]
+            source_resolution = float(
+                np.median(np.abs(np.diff(full_values.astype(np.longdouble))))
+            )
+            target_resolution = float(getattr(target, f"{name}_resolution"))
+            if _regular_axis_equivalent(
+                source_values,
+                target_values,
+                source_resolution=source_resolution,
+                target_resolution=target_resolution,
             ):
                 continue
-            if same_size and np.allclose(
-                source_values[::-1], target_values, rtol=1e-7, atol=1e-10
+            if _regular_axis_equivalent(
+                source_values[::-1],
+                target_values,
+                source_resolution=source_resolution,
+                target_resolution=target_resolution,
             ):
                 reversals.append(name)
                 continue
@@ -363,10 +515,17 @@ def _output_layout(
             )
         )
     coordinate_codec = CodecSpec("zstd", level=1)
+    spatial_coordinate_values = (
+        {"lat": target.lat, "lon": target.lon}
+        if needs_resample
+        else {
+            name: values[::-1] if name in axis_reversals else values
+            for name, values in selected_axes.items()
+        }
+    )
     coordinate_values = {
         "time": inventory.times[selection.time_start : selection.time_stop],
-        "lat": target.lat,
-        "lon": target.lon,
+        **spatial_coordinate_values,
     }
     dim_chunks = dict(zip(("time", "lat", "lon"), chunk_plan.chunks))
     for name, values in coordinate_values.items():
@@ -767,14 +926,19 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
             lat_descending=True,
             lon_descending=False,
         )
-        exact_lat = _exact_slice(grid.lat, target.lat) if grid.lat_descending else None
-        exact_lon = _exact_slice(grid.lon, target.lon) if not grid.lon_descending else None
-        same_grid = bool(
-            np.isclose(grid.lat_resolution, options.resolution, rtol=1e-5, atol=1e-10)
-            and np.isclose(grid.lon_resolution, options.resolution, rtol=1e-5, atol=1e-10)
-            and exact_lat is not None
-            and exact_lon is not None
+        exact_lat = _exact_slice(
+            inventory.lat_values,
+            target.lat,
+            source_resolution=grid.lat_resolution,
+            target_resolution=target.lat_resolution,
         )
+        exact_lon = _exact_slice(
+            inventory.lon_values,
+            target.lon,
+            source_resolution=grid.lon_resolution,
+            target_resolution=target.lon_resolution,
+        )
+        same_grid = exact_lat is not None and exact_lon is not None
         if same_grid:
             lat_start, lat_stop = exact_lat
             lon_start, lon_stop = exact_lon
@@ -856,18 +1020,26 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
     source_west, source_east, source_south, source_north = grid.source_extent
     requested_west, requested_east = general.lon_min, general.lon_max
     requested_south, requested_north = general.lat_min, general.lat_max
-    tolerance = max(
-        1e-10,
-        (config.resampling.resolution if operations.resample else grid.lat_resolution) * 1e-7,
+    lat_pixel_size = (
+        min(grid.lat_resolution, target.lat_resolution)
+        if operations.resample
+        else grid.lat_resolution
     )
+    lon_pixel_size = (
+        min(grid.lon_resolution, target.lon_resolution)
+        if operations.resample
+        else grid.lon_resolution
+    )
+    lat_tolerance = _axis_tolerance(inventory.lat_values, lat_pixel_size)
+    lon_tolerance = _axis_tolerance(inventory.lon_values, lon_pixel_size)
     outside = []
-    if requested_south < source_south - tolerance:
+    if requested_south < source_south - lat_tolerance:
         outside.append(f"南侧 {requested_south:g}° 以下")
-    if requested_north > source_north + tolerance:
+    if requested_north > source_north + lat_tolerance:
         outside.append(f"北侧 {requested_north:g}° 以上")
-    if requested_west < source_west - tolerance:
+    if requested_west < source_west - lon_tolerance:
         outside.append(f"西侧 {requested_west:g}° 以西")
-    if requested_east > source_east + tolerance:
+    if requested_east > source_east + lon_tolerance:
         outside.append(f"东侧 {requested_east:g}° 以东")
     coverage_warning = None
     if outside:
@@ -905,7 +1077,24 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
         inventory.variables[name].direct_compatible for name in selected_names
     )
     storage_requested = operations.rechunk or operations.recompress
-    finalization_required = storage_requested and not direct_layout
+    chunk_ownership_safe = bool(
+        needs_resample
+        or not storage_requested
+        or _conversion_tasks_own_physical_chunks(conversion_chunks, output_layout)
+    )
+    finalization_required = storage_requested and (
+        not direct_layout or not chunk_ownership_safe
+    )
+    if not direct_layout:
+        finalization_reason = "终端写入器无法直接满足目标存储布局，使用最终化阶段。"
+    elif not chunk_ownership_safe:
+        finalization_reason = (
+            f"转换任务 chunks={conversion_chunks} 无法完整覆盖最终物理 Zarr "
+            f"chunks={final_chunk_plan.chunks}；为保证每个物理 chunk 仅由一个并行任务写入，"
+            "使用最终化阶段。"
+        )
+    else:
+        finalization_reason = ""
     fused = "fused_into_resampling" if needs_resample else "fused_into_conversion"
     decisions = (
         OperationDecision(
@@ -943,7 +1132,7 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
                 else "not_requested"
             ),
             (
-                "终端写入器无法直接满足目标 chunks，使用最终化阶段。"
+                finalization_reason
                 if finalization_required and operations.rechunk
                 else f"目标 chunks 已融合到{terminal_label}写出。"
                 if operations.rechunk
@@ -961,7 +1150,7 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
                 else "not_requested"
             ),
             (
-                "终端写入器无法直接满足目标 codec，使用最终化阶段。"
+                finalization_reason
                 if finalization_required and operations.recompress
                 else f"目标 codec 已融合到{terminal_label}写出。"
                 if operations.recompress

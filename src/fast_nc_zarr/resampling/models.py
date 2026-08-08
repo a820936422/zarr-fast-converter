@@ -153,6 +153,7 @@ class ResamplePlan:
     tile_size_requested: TileSize = "auto"
     space_workers_requested: SpaceWorkers = "auto"
     auto_tile: AutoTileDecision | None = None
+    owner_buffer_budget_bytes: int = 0
     output_layout: OutputLayout | None = None
     before_replacements: ReplacementRules = field(default_factory=ReplacementRules)
     after_replacements: ReplacementRules = field(default_factory=ReplacementRules)
