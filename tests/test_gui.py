@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import math
+import threading
 from pathlib import Path
 import shutil
 import sys
@@ -12,7 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import xarray as xr
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import QApplication
+from unittest.mock import patch
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
@@ -32,8 +35,10 @@ from fast_nc_zarr.application.services import (  # noqa: E402
     run_conversion,
 )
 from fast_nc_zarr.models import VariableSpec, VariableTransform
-from fast_nc_zarr.gui.main_window import MainWindow  # noqa: E402
-from fast_nc_zarr.gui.workers import resolve_storage_targets  # noqa: E402
+from fast_nc_zarr.gui import fonts  # noqa: E402
+from fast_nc_zarr.gui.fonts import configure_application_font  # noqa: E402
+from fast_nc_zarr.gui.main_window import MainWindow, _run_cancelable  # noqa: E402
+from fast_nc_zarr.gui.workers import parse_progress_message, resolve_storage_targets  # noqa: E402
 from fast_nc_zarr.time_mapping import inspect_time_metadata  # noqa: E402
 from fast_nc_zarr.pipeline.models import (  # noqa: E402
     PipelineChunkingOptions,
@@ -50,14 +55,67 @@ ROOT = Path("/tmp/codex_test/fast_nc_zarr_gui_tests")
 
 
 
+class FontTests(unittest.TestCase):
+    def test_bundled_font_registers_and_is_applied_to_application(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        self.assertTrue(fonts.FONT_PATH.is_file())
+
+        family = configure_application_font(app)
+
+        self.assertTrue(family)
+        self.assertIn(family, QFontDatabase.families())
+        self.assertEqual(app.font().family(), family)
+
+    def test_missing_font_resource_reports_its_path(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        missing = fonts.FONT_PATH.with_name("missing-font.ttf")
+        with patch.object(fonts, "FONT_PATH", missing):
+            with self.assertRaisesRegex(RuntimeError, str(missing)):
+                configure_application_font(app)
+
+    def test_unregistrable_font_resource_reports_its_path(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        license_path = fonts.FONT_PATH.with_name("OFL.txt")
+        with patch.object(fonts, "FONT_PATH", license_path):
+            with self.assertRaisesRegex(RuntimeError, str(license_path)):
+                configure_application_font(app)
+
+
 class VersionTests(unittest.TestCase):
     def test_window_title_displays_release_version(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = MainWindow()
-        self.assertEqual(__version__, "1.6.4")
-        self.assertIn("v1.6.4", window.windowTitle())
+        self.assertEqual(__version__, "1.6.5")
+        self.assertIn("v1.6.5", window.windowTitle())
         window.close()
         app.processEvents()
+
+
+class TaskFeedbackTests(unittest.TestCase):
+    def test_progress_messages_drive_determinate_progress_bar(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        window.task_page.started("测试任务", lambda: None)
+
+        parsed = parse_progress_message("空间块进度：3/4 | 本块 0.1s")
+        self.assertEqual(parsed[:2], (3, 4))
+        window.task_page.update_progress(*parsed)
+
+        self.assertEqual(window.task_page.progress.minimum(), 0)
+        self.assertEqual(window.task_page.progress.maximum(), 1000)
+        self.assertIsNone(parse_progress_message("目标磁盘使用率达到 95%"))
+        self.assertEqual(window.task_page.progress.value(), 750)
+        self.assertIn("空间块进度", window.task_page.progress.format())
+        window.close()
+        app.processEvents()
+
+    def test_short_preview_cancellation_gates_callback_result(self) -> None:
+        cancelled = threading.Event()
+        cancelled.set()
+
+        with self.assertRaisesRegex(RuntimeError, "任务已取消"):
+            _run_cancelable(cancelled, lambda: "stale result")
+
 
 class GuiServiceTests(unittest.TestCase):
     @classmethod
@@ -188,7 +246,7 @@ class GuiServiceTests(unittest.TestCase):
         window = MainWindow()
         self.assertEqual(window.navigation.count(), 6)
         self.assertEqual(window.stack.count(), 6)
-        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.4")
+        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.5")
         self.assertEqual(
             [
                 window.navigation.item(index).text()
@@ -436,6 +494,24 @@ class GuiServiceTests(unittest.TestCase):
         window.inspection_page._time_inspection_done(result)
         self.assertTrue(window.inspection_page.confirm_time_button.isEnabled())
         self.assertFalse(bool(window.navigation.item(1).flags() & Qt.ItemFlag.ItemIsEnabled))
+        window.close()
+        app.processEvents()
+
+    def test_changed_inspection_parameters_revoke_downstream_result(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        result = inspect_source(
+            SourceInspectionConfig(ROOT / "source", engine="h5netcdf", workers=1)
+        )
+        window.inspection_page._inspection_done(result)
+        self.assertTrue(bool(window.navigation.item(4).flags() & Qt.ItemFlag.ItemIsEnabled))
+
+        window.inspection_page.inspect_workers.setValue(2)
+
+        self.assertIsNone(window.inspection_page.result)
+        self.assertIsNone(window.pipeline_page.inspection)
+        self.assertFalse(bool(window.navigation.item(4).flags() & Qt.ItemFlag.ItemIsEnabled))
+        self.assertEqual(window.navigation.currentRow(), 0)
         window.close()
         app.processEvents()
 

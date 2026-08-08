@@ -998,7 +998,7 @@ def inspect_filename_inventory(
         for path, value in zip(scan.files, scan.actual_times)
     )
     cached_by_path = (
-        {record.path.resolve(): record for record in cached_inventory.files}
+        {record.path: record for record in cached_inventory.files}
         if (
             cached_inventory is not None
             and cached_inventory.source_engine == engine
@@ -1011,7 +1011,7 @@ def inspect_filename_inventory(
     for task in tasks:
         path = task[0]
         expected_time = np.datetime64(task[-1], "ns")
-        cached = cached_by_path.get(path.resolve())
+        cached = cached_by_path.get(path)
         stat = path.stat()
         if (
             cached is not None

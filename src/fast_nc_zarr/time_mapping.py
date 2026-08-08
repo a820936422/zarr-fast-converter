@@ -117,11 +117,17 @@ class TimeInspectionResult:
     report: str
 
 
+def _raise_if_cancelled(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("任务已取消。")
+
+
 def inspect_time_metadata(
     input_dir: Path,
     *,
     recursive: bool = False,
     requested_engine: str = "auto",
+    cancel_event=None,
 ) -> TimeInspectionResult:
     """Read only filenames and the first file's metadata/time coordinate."""
 
@@ -129,11 +135,16 @@ def inspect_time_metadata(
 
     source = Path(input_dir).expanduser().resolve()
     files = discover_filename_files(source, recursive=recursive)
+    _raise_if_cancelled(cancel_event)
     engine, dimensions, coordinates, has_time, _has_space = probe_dataset_structure(
         files[0], requested_engine
     )
-    filename_fields = _discover_filename_fields(files)
-    time_info = _inspect_time_dimension(files[0], engine, dimensions, has_time)
+    filename_fields = _discover_filename_fields(files, cancel_event=cancel_event)
+    _raise_if_cancelled(cancel_event)
+    time_info = _inspect_time_dimension(
+        files[0], engine, dimensions, has_time, cancel_event=cancel_event
+    )
+    _raise_if_cancelled(cancel_event)
     options = _make_options(filename_fields, time_info)
     suggested = _suggest_rule(filename_fields, time_info, options)
     report = format_time_inspection(
@@ -245,13 +256,16 @@ def format_time_inspection(
     return "\n".join(lines)
 
 
-def _discover_filename_fields(files: tuple[Path, ...]) -> tuple[FilenameField, ...]:
+def _discover_filename_fields(
+    files: tuple[Path, ...], *, cancel_event=None
+) -> tuple[FilenameField, ...]:
     sample_matches = list(_NUMBER.finditer(files[0].name))
     fields = []
     for index, match in enumerate(sample_matches):
         start, end = match.span()
         values = []
         valid = True
+        _raise_if_cancelled(cancel_event)
         for path in files:
             if len(path.name) < end or not path.name[start:end].isdigit():
                 valid = False
@@ -277,11 +291,14 @@ def _inspect_time_dimension(
     engine: str,
     dimensions: tuple[str, ...],
     has_time: bool,
+    *,
+    cancel_event=None,
 ) -> TimeDimensionInfo:
     import xarray as xr
 
     if not has_time:
         return TimeDimensionInfo(False, None, (), (), {}, "不存在 time 维度")
+    _raise_if_cancelled(cancel_event)
     with xr.open_dataset(
         path,
         engine=engine,
@@ -296,6 +313,7 @@ def _inspect_time_dimension(
         raw_values = tuple(_render_value(value) for value in np.asarray(variable.values).reshape(-1)[:20])
         attrs = {str(key): _json_value(value) for key, value in variable.attrs.items()}
     decoded_values: tuple[str, ...] = ()
+    _raise_if_cancelled(cancel_event)
     try:
         with xr.open_dataset(
             path,
@@ -311,6 +329,7 @@ def _inspect_time_dimension(
                     decoded_values = tuple(item for item in decoded if item is not None)
     except Exception:
         decoded_values = ()
+    _raise_if_cancelled(cancel_event)
     units = str(attrs.get("units", ""))
     if decoded_values:
         format_label = "可解码为完整日期 YYYY-MM-DD"

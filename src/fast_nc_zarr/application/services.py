@@ -9,6 +9,7 @@ objects and operation configuration.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from hashlib import blake2b
 import json
 from pathlib import Path
 from typing import Any, Literal
@@ -72,6 +73,13 @@ from ..time_mapping import (
 
 
 SourceMode = Literal["auto", "complete", "filename"]
+
+def default_inspection_cache_path(input_dir: Path) -> Path:
+    """Return a stable per-source cache outside the potentially slow source drive."""
+    source = Path(input_dir).expanduser().resolve()
+    digest = blake2b(str(source).encode("utf-8"), digest_size=12).hexdigest()
+    return Path.home() / ".cache" / "fast-nc-zarr" / "inspections" / f"{digest}.json"
+
 
 
 @dataclass(frozen=True)
@@ -314,7 +322,6 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
                 )
             ):
                 cached_inventory = cached.source_inventory
-    files = discover_filename_files(source, recursive=config.recursive)
     requested_engine = config.engine or "auto"
     mode = config.mode
     resolved_engine = requested_engine
@@ -324,6 +331,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
             source,
             recursive=config.recursive,
             requested_engine=requested_engine,
+            cancel_event=cancel_event,
         )
         resolved_engine = time_result.engine
         if (
@@ -387,6 +395,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
             time_inspection=time_result,
             time_rule=config.time_rule,
         ), config.cache_path)
+    files = discover_filename_files(source, recursive=config.recursive)
     if mode == "auto":
         resolved_engine, dims, _coords, has_time, has_space = probe_dataset_structure(
             files[0], requested_engine

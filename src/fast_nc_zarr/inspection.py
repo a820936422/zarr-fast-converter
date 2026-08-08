@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from itertools import batched
 from hashlib import blake2b
+import os
 from pathlib import Path
 from typing import Any
 
@@ -28,20 +30,36 @@ class DimensionMappingRequired(ValueError):
         )
 
 
-def discover_files(input_dir: Path, recursive: bool = False) -> list[Path]:
-    input_dir = input_dir.expanduser().resolve()
-    if not input_dir.is_dir():
-        raise FileNotFoundError(f"输入目录不存在：{input_dir}")
-    iterator = input_dir.rglob("*") if recursive else input_dir.iterdir()
-    files = sorted(path for path in iterator if path.is_file() and path.suffix.lower() in SUFFIXES)
-    if not files:
-        raise FileNotFoundError(f"没有在 {input_dir} 中找到 NetCDF 文件。")
-    suffixes = {path.suffix.lower() for path in files}
+def _discover_files_with_stats(
+    input_dir: Path, recursive: bool = False
+) -> list[tuple[Path, os.stat_result]]:
+    root = input_dir.expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"输入目录不存在：{root}")
+    entries: list[tuple[Path, os.stat_result]] = []
+    if recursive:
+        for path in root.rglob("*"):
+            if path.suffix.lower() in SUFFIXES and path.is_file():
+                entries.append((path, path.stat()))
+    else:
+        with os.scandir(root) as iterator:
+            for entry in iterator:
+                if Path(entry.name).suffix.lower() not in SUFFIXES or not entry.is_file():
+                    continue
+                entries.append((Path(entry.path), entry.stat()))
+    entries.sort(key=lambda item: item[0])
+    if not entries:
+        raise FileNotFoundError(f"没有在 {root} 中找到 NetCDF 文件。")
+    suffixes = {path.suffix.lower() for path, _stat in entries}
     if len(suffixes) > 1:
         raise ValueError(
             "同一批次只能使用一种源文件后缀；发现：" + ", ".join(sorted(suffixes))
         )
-    return files
+    return entries
+
+
+def discover_files(input_dir: Path, recursive: bool = False) -> list[Path]:
+    return [path for path, _stat in _discover_files_with_stats(input_dir, recursive)]
 
 
 def _hash_axis(values: np.ndarray) -> str:
@@ -61,10 +79,18 @@ def time_key(value: Any) -> str:
 
 
 def _clean_attr(value: Any) -> Any:
+    if isinstance(value, (bytes, np.bytes_)):
+        return bytes(value).decode("utf-8", errors="replace")
     if isinstance(value, np.generic):
-        return value.item()
+        return _clean_attr(value.item())
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        if value.size == 1:
+            return _clean_attr(value.reshape(-1)[0])
+        return _clean_attr(value.tolist())
+    if isinstance(value, list):
+        return [_clean_attr(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clean_attr(item) for item in value)
     return value
 
 
@@ -105,6 +131,19 @@ def _normalize_daily_times(values: tuple[Any, ...], path: Path | None = None) ->
 
 def _source_dimensions(path: Path, engine: str) -> tuple[str, str, str]:
     """Infer standard names or report dimensions requiring a user mapping."""
+    if engine == "h5netcdf":
+        try:
+            import h5netcdf
+
+            with h5netcdf.File(path, "r") as dataset:
+                available = tuple(str(item) for item in dataset.dimensions)
+        except Exception:
+            available = ()
+        if available:
+            if set(CANONICAL_DIMENSIONS).issubset(available):
+                return CANONICAL_DIMENSIONS
+            raise DimensionMappingRequired(available)
+
     import xarray as xr
 
     try:
@@ -129,12 +168,13 @@ def _validate_source_dimensions(
         raise ValueError("指定的源维度不存在：" + ", ".join(missing) + "。")
 
 
-def inspect_file(
+def _inspect_file_xarray(
     path: Path,
     engine: str,
-    source_dimensions: tuple[str, str, str] = CANONICAL_DIMENSIONS,
-    time_rule: TimeRule | None = None,
-    filename_fields: tuple[FilenameField, ...] = (),
+    source_dimensions: tuple[str, str, str],
+    time_rule: TimeRule | None,
+    filename_fields: tuple[FilenameField, ...],
+    file_stat: os.stat_result | None = None,
 ) -> FileRecord:
     import xarray as xr
 
@@ -162,8 +202,6 @@ def inspect_file(
         lat = np.asarray(ds[source_lat].values)
         lon = np.asarray(ds[source_lon].values)
         rename_dimensions = dict(zip(source_dimensions, CANONICAL_DIMENSIONS))
-        # Keep numpy datetime64 scalars; ndarray.tolist() turns ns-resolution
-        # values into integers on some NumPy versions.
         raw_times = tuple(np.asarray(ds[source_time].values))
         if time_rule is None:
             times = _normalize_daily_times(raw_times, path)
@@ -192,7 +230,7 @@ def inspect_file(
                     attrs={key: _clean_attr(value) for key, value in variable.attrs.items()},
                 )
             )
-        stat = path.stat()
+        stat = file_stat or path.stat()
         return FileRecord(
             path=path,
             size_bytes=stat.st_size,
@@ -209,8 +247,262 @@ def inspect_file(
         ds.close()
 
 
+_HDF5_INTERNAL_ATTRS = {
+    "CLASS",
+    "NAME",
+    "REFERENCE_LIST",
+    "DIMENSION_LIST",
+    "_Netcdf4Coordinates",
+    "_Netcdf4Dimid",
+}
+
+
+def _public_hdf5_attrs(dataset) -> dict[str, Any]:
+    return {
+        str(key): _clean_attr(value)
+        for key, value in dataset.attrs.items()
+        if str(key) not in _HDF5_INTERNAL_ATTRS
+    }
+
+
+def _inspect_file_h5py(
+    path: Path,
+    source_dimensions: tuple[str, str, str],
+    time_rule: TimeRule | None,
+    filename_fields: tuple[FilenameField, ...],
+    file_stat: os.stat_result | None = None,
+) -> FileRecord:
+    """Read ordinary NetCDF4/HDF5 metadata through h5py's thin API."""
+    import h5py
+
+    with h5py.File(path, "r") as dataset:
+        if any(isinstance(value, h5py.Group) for value in dataset.values()):
+            raise ValueError("grouped NetCDF requires the compatibility reader")
+        source_time, source_lat, source_lon = source_dimensions
+        coordinates = {}
+        for name, label in (
+            (source_time, "时间"),
+            (source_lat, "纬度"),
+            (source_lon, "经度"),
+        ):
+            variable = dataset.get(name)
+            if not isinstance(variable, h5py.Dataset) or variable.ndim != 1:
+                raise ValueError(f"{path.name} 的{label}坐标 {name} 必须是一维坐标。")
+            coordinates[name] = variable
+
+        lat = np.asarray(coordinates[source_lat][...])
+        lon = np.asarray(coordinates[source_lon][...])
+        time_variable = coordinates[source_time]
+        time_attrs = _public_hdf5_attrs(time_variable)
+        raw_values = np.asarray(time_variable[...])
+        raw_times = tuple(raw_values)
+        if time_rule is None:
+            times = _normalize_daily_times(
+                _decode_h5netcdf_times(raw_values, time_attrs), path
+            )
+        else:
+            times = resolve_file_times(
+                path.name,
+                raw_times,
+                time_attrs,
+                time_rule,
+                filename_fields,
+            )
+
+        coordinate_names = set(source_dimensions)
+        for variable in dataset.values():
+            if not isinstance(variable, h5py.Dataset):
+                continue
+            value = _clean_attr(variable.attrs.get("coordinates", ""))
+            if value:
+                coordinate_names.update(str(value).split())
+        rename_dimensions = dict(zip(source_dimensions, CANONICAL_DIMENSIONS))
+        specs = []
+        for name, variable in dataset.items():
+            if name in coordinate_names:
+                continue
+            if not isinstance(variable, h5py.Dataset):
+                raise ValueError("grouped NetCDF requires the compatibility reader")
+            dimensions = []
+            for axis in variable.dims:
+                scales = list(axis.keys())
+                if len(scales) != 1:
+                    raise ValueError("unlabelled HDF5 dimensions require the compatibility reader")
+                dimensions.append(str(scales[0]))
+            dimensions_tuple = tuple(dimensions)
+            specs.append(
+                VariableSpec(
+                    name=str(name),
+                    dims=tuple(
+                        rename_dimensions.get(dim, dim) for dim in dimensions_tuple
+                    ),
+                    dtype=str(variable.dtype),
+                    shape_without_time=tuple(
+                        int(size)
+                        for dim, size in zip(dimensions_tuple, variable.shape)
+                        if dim != source_time
+                    ),
+                    native_chunks=(
+                        tuple(map(int, variable.chunks)) if variable.chunks else None
+                    ),
+                    attrs=_public_hdf5_attrs(variable),
+                )
+            )
+    stat = file_stat or path.stat()
+    return FileRecord(
+        path=path,
+        size_bytes=stat.st_size,
+        times=times,
+        time_keys=tuple(time_key(item) for item in times),
+        lat_hash=_hash_axis(lat),
+        lon_hash=_hash_axis(lon),
+        lat_size=int(lat.size),
+        lon_size=int(lon.size),
+        variables=tuple(specs),
+        mtime_ns=stat.st_mtime_ns,
+    )
+
+
+def _decode_h5netcdf_times(values: np.ndarray, attrs: dict[str, Any]) -> tuple[Any, ...]:
+    units = attrs.get("units")
+    if not units:
+        raise ValueError("time 坐标缺少 CF units")
+    try:
+        import cftime
+
+        decoded = cftime.num2date(
+            values,
+            units=str(units),
+            calendar=str(attrs.get("calendar", "standard")),
+            only_use_cftime_datetimes=False,
+        )
+    except Exception as exc:
+        raise ValueError(f"无法解码 CF time 坐标：{exc}") from exc
+    return tuple(np.atleast_1d(decoded))
+
+
+def _inspect_file_h5netcdf(
+    path: Path,
+    source_dimensions: tuple[str, str, str],
+    time_rule: TimeRule | None,
+    filename_fields: tuple[FilenameField, ...],
+    file_stat: os.stat_result | None = None,
+) -> FileRecord:
+    """Read HDF5-backed NetCDF metadata without constructing xarray objects."""
+    import h5netcdf
+
+    with h5netcdf.File(path, "r") as dataset:
+        _validate_source_dimensions(source_dimensions, set(dataset.dimensions))
+        source_time, source_lat, source_lon = source_dimensions
+        coordinates = {}
+        for name, label in (
+            (source_time, "时间"),
+            (source_lat, "纬度"),
+            (source_lon, "经度"),
+        ):
+            variable = dataset.variables.get(name)
+            if variable is None or tuple(variable.dimensions) != (name,):
+                raise ValueError(f"{path.name} 的{label}坐标 {name} 必须是一维坐标。")
+            coordinates[name] = variable
+
+        lat = np.asarray(coordinates[source_lat][:])
+        lon = np.asarray(coordinates[source_lon][:])
+        time_variable = coordinates[source_time]
+        time_attrs = {
+            str(key): _clean_attr(value) for key, value in time_variable.attrs.items()
+        }
+        raw_values = np.asarray(time_variable[:])
+        raw_times = tuple(raw_values)
+        if time_rule is None:
+            times = _normalize_daily_times(
+                _decode_h5netcdf_times(raw_values, time_attrs), path
+            )
+        else:
+            times = resolve_file_times(
+                path.name,
+                raw_times,
+                time_attrs,
+                time_rule,
+                filename_fields,
+            )
+
+        coordinate_names = set(source_dimensions)
+        for variable in dataset.variables.values():
+            value = variable.attrs.get("coordinates")
+            if value:
+                coordinate_names.update(str(value).split())
+        rename_dimensions = dict(zip(source_dimensions, CANONICAL_DIMENSIONS))
+        specs = []
+        for name, variable in dataset.variables.items():
+            if name in coordinate_names:
+                continue
+            dimensions = tuple(str(item) for item in variable.dimensions)
+            chunks = variable.chunks
+            specs.append(
+                VariableSpec(
+                    name=str(name),
+                    dims=tuple(rename_dimensions.get(dim, dim) for dim in dimensions),
+                    dtype=str(variable.dtype),
+                    shape_without_time=tuple(
+                        int(size)
+                        for dim, size in zip(dimensions, variable.shape)
+                        if dim != source_time
+                    ),
+                    native_chunks=tuple(map(int, chunks)) if chunks else None,
+                    attrs={
+                        str(key): _clean_attr(value)
+                        for key, value in variable.attrs.items()
+                    },
+                )
+            )
+    stat = file_stat or path.stat()
+    return FileRecord(
+        path=path,
+        size_bytes=stat.st_size,
+        times=times,
+        time_keys=tuple(time_key(item) for item in times),
+        lat_hash=_hash_axis(lat),
+        lon_hash=_hash_axis(lon),
+        lat_size=int(lat.size),
+        lon_size=int(lon.size),
+        variables=tuple(specs),
+        mtime_ns=stat.st_mtime_ns,
+    )
+
+
+def inspect_file(
+    path: Path,
+    engine: str,
+    source_dimensions: tuple[str, str, str] = CANONICAL_DIMENSIONS,
+    time_rule: TimeRule | None = None,
+    filename_fields: tuple[FilenameField, ...] = (),
+    file_stat: os.stat_result | None = None,
+) -> FileRecord:
+    if engine == "h5netcdf":
+        try:
+            return _inspect_file_h5py(
+                path, source_dimensions, time_rule, filename_fields, file_stat
+            )
+        except (ImportError, OSError, ValueError, TypeError, KeyError):
+            try:
+                return _inspect_file_h5netcdf(
+                    path, source_dimensions, time_rule, filename_fields, file_stat
+                )
+            except (ImportError, OSError, ValueError, TypeError, KeyError):
+                # Preserve compatibility with unusual NetCDF/HDF layouts that
+                # xarray can decode but the direct metadata readers cannot.
+                pass
+    return _inspect_file_xarray(
+        path, engine, source_dimensions, time_rule, filename_fields, file_stat
+    )
+
+
 def _inspect_file_task(task) -> FileRecord:
     return inspect_file(*task)
+
+
+def _inspect_file_batch(tasks) -> tuple[FileRecord, ...]:
+    return tuple(_inspect_file_task(task) for task in tasks)
 
 
 def choose_inspection_workers(files: list[Path], requested: int | None = None) -> int:
@@ -250,6 +542,34 @@ def _variable_signatures(variables: tuple[VariableSpec, ...]) -> tuple[tuple, ..
     perfectly compatible collection (FLUXSAT is one such product).
     """
     return tuple(sorted((_variable_signature(item) for item in variables), key=lambda item: item[0]))
+
+def _read_reference_axes(
+    path: Path,
+    engine: str,
+    source_lat: str,
+    source_lon: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if engine == "h5netcdf":
+        try:
+            import h5netcdf
+
+            with h5netcdf.File(path, "r") as dataset:
+                return (
+                    np.asarray(dataset.variables[source_lat][:]).copy(),
+                    np.asarray(dataset.variables[source_lon][:]).copy(),
+                )
+        except (ImportError, OSError, KeyError, TypeError, ValueError):
+            pass
+
+    import xarray as xr
+
+    with xr.open_dataset(
+        path, engine=engine, chunks=None, decode_times=True, mask_and_scale=False
+    ) as dataset:
+        return (
+            np.asarray(dataset[source_lat].values).copy(),
+            np.asarray(dataset[source_lon].values).copy(),
+        )
 
 
 def _infer_frequency(times: np.ndarray) -> tuple[str, list[str]]:
@@ -293,16 +613,17 @@ def inspect_dataset(
     cached_inventory: Inventory | None = None,
     cancel_event=None,
 ) -> Inventory:
-    import xarray as xr
+    file_entries = _discover_files_with_stats(input_dir, recursive)
+    files = [path for path, _stat in file_entries]
+    stats_by_path = {path: stat for path, stat in file_entries}
 
-    files = discover_files(input_dir, recursive)
     source_dimensions = (
         _source_dimensions(files[0], engine)
         if dimension_names is None
         else tuple(str(item).strip() for item in dimension_names)
     )
     cached_by_path = (
-        {record.path.resolve(): record for record in cached_inventory.files}
+        {record.path: record for record in cached_inventory.files}
         if (
             cached_inventory is not None
             and cached_inventory.source_engine == engine
@@ -315,8 +636,8 @@ def inspect_dataset(
     records_by_path: dict[Path, FileRecord] = {}
     changed_files = []
     for path in files:
-        cached = cached_by_path.get(path.resolve())
-        stat = path.stat()
+        cached = cached_by_path.get(path)
+        stat = stats_by_path[path]
         if (
             cached is not None
             and cached.size_bytes == stat.st_size
@@ -333,18 +654,23 @@ def inspect_dataset(
             f"检查 {len(changed_files)} 个（{worker_count} 个进程）……"
         )
     tasks = (
-        (path, engine, source_dimensions, time_rule, filename_fields)
+        (path, engine, source_dimensions, time_rule, filename_fields, stats_by_path[path])
         for path in changed_files
     )
-    for record in bounded_process_map(
-        _inspect_file_task,
-        tasks,
+    task_batch_size = max(
+        1,
+        min(64, (len(changed_files) + max(1, worker_count) * 16 - 1) // (max(1, worker_count) * 16)),
+    )
+    task_batches = batched(tasks, task_batch_size)
+    for batch_records in bounded_process_map(
+        _inspect_file_batch,
+        task_batches,
         workers=min(worker_count, max(1, len(changed_files))),
         cancel_event=cancel_event,
     ):
-        records_by_path[record.path] = record
+        for record in batch_records:
+            records_by_path[record.path] = record
     records = [records_by_path[path] for path in files]
-
     reference = records[0]
     reference_variables = _variable_signatures(reference.variables)
     errors = []
@@ -377,11 +703,7 @@ def inspect_dataset(
     ordered_times = np.asarray([value for _, value in ordered])
 
     source_time, source_lat, source_lon = source_dimensions
-    with xr.open_dataset(
-        reference.path, engine=engine, chunks=None, decode_times=True, mask_and_scale=False
-    ) as ds:
-        lat = np.asarray(ds[source_lat].values).copy()
-        lon = np.asarray(ds[source_lon].values).copy()
+    lat, lon = _read_reference_axes(reference.path, engine, source_lat, source_lon)
     frequency, gaps = _infer_frequency(ordered_times)
     return Inventory(
         input_dir=Path(input_dir).expanduser().resolve(),

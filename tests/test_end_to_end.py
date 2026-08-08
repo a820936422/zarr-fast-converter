@@ -188,6 +188,21 @@ class EndToEndTests(unittest.TestCase):
         inventory = inspect_dataset(folder, engine="h5netcdf", workers=1, progress=False)
         self.assertEqual(set(inventory.variables), {"temperature", "quality", "permuted"})
 
+    def test_h5netcdf_inspection_avoids_xarray_dataset_construction(self) -> None:
+        with patch(
+            "fast_nc_zarr.inspection._inspect_file_xarray",
+            side_effect=AssertionError("unexpected xarray fallback"),
+        ):
+            inventory = inspect_dataset(
+                ROOT / "small", engine="h5netcdf", workers=1, progress=False
+            )
+
+        self.assertEqual(len(inventory.files), 8)
+        self.assertEqual(
+            set(inventory.variables), {"temperature", "quality", "permuted"}
+        )
+        self.assertEqual(inventory.variables["temperature"].native_chunks, (1, 4, 4))
+
     def test_inspection_cache_reopens_only_changed_files(self) -> None:
         first = inspect_dataset(ROOT / "small", workers=1, progress=False)
         changed = ROOT / "small" / "day-003.nc"

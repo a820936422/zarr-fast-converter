@@ -4,6 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import inspect
 import os
+import re
 import time
 import threading
 import traceback
@@ -120,6 +121,26 @@ class _SignalStream(io.TextIOBase):
         self._buffer = ""
 
 
+_PERCENT_PROGRESS = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*%")
+_FRACTION_PROGRESS = re.compile(r"(?<![\d.])(\d+)\s*/\s*(\d+)(?![\d.])")
+
+
+def parse_progress_message(message: str) -> tuple[int, int, str] | None:
+    """Extract the latest concrete percentage or completed/total pair from log output."""
+    percentages = _PERCENT_PROGRESS.findall(message)
+    if percentages and (
+        "进度" in message or "Completed" in message or "[" in message
+    ):
+        value = min(1000, max(0, int(round(float(percentages[-1]) * 10))))
+        return value, 1000, message
+    fractions = _FRACTION_PROGRESS.findall(message)
+    if fractions:
+        completed, total = map(int, fractions[-1])
+        if total > 0 and 0 <= completed <= total:
+            return completed, total, message
+    return None
+
+
 class TaskWorker(QThread):
     """Run a synchronous application service without blocking Qt's UI thread."""
 
@@ -128,6 +149,7 @@ class TaskWorker(QThread):
     failed = Signal(str)
     finished_cleanly = Signal()
     resource = Signal(object)
+    progress = Signal(int, int, str)
     cancelled = Signal()
 
     def __init__(
@@ -145,6 +167,12 @@ class TaskWorker(QThread):
     def request_cancel(self) -> None:
         self.cancel_event.set()
         self.log.emit("已请求取消；当前正在执行的块完成后停止。")
+
+    def _handle_output(self, message: str) -> None:
+        self.log.emit(message)
+        parsed = parse_progress_message(message)
+        if parsed is not None:
+            self.progress.emit(*parsed)
 
     def _call(self) -> Any:
         try:
@@ -256,7 +284,7 @@ class TaskWorker(QThread):
             return
 
     def run(self) -> None:
-        stream = _SignalStream(self.log.emit)
+        stream = _SignalStream(self._handle_output)
         monitor_stop = threading.Event()
         started = time.perf_counter()
         monitor = threading.Thread(

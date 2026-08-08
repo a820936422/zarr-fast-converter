@@ -51,6 +51,7 @@ from ..application.services import (
     ResampleConfig,
     ResamplePreview,
     SourceInspectionConfig,
+    default_inspection_cache_path,
     inspect_source,
     inspect_zarr,
     inspect_temporary_pipeline,
@@ -119,6 +120,16 @@ def _button(text: str, slot: Callable[[], None]) -> QPushButton:
     return button
 
 
+def _run_cancelable(cancel_event, operation: Callable[[], Any]) -> Any:
+    """Run a short synchronous inspection/preview with cancellation gates."""
+    if cancel_event.is_set():
+        raise RuntimeError("任务已取消。")
+    result = operation()
+    if cancel_event.is_set():
+        raise RuntimeError("任务已取消。")
+    return result
+
+
 class TaskPage(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -130,7 +141,7 @@ class TaskPage(QWidget):
         layout.addWidget(title)
         self.status = QLabel("当前没有运行中的任务。")
         self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
+        self.progress.setRange(0, 1000)
         self.progress.setVisible(False)
         layout.addWidget(self.status)
         layout.addWidget(self.progress)
@@ -208,6 +219,8 @@ class TaskPage(QWidget):
     def started(self, label: str, cancel: Callable[[], None]) -> None:
         self.status.setText(f"运行中：{label}")
         self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.progress.setFormat("等待可量化进度…")
         self.cancel.setEnabled(True)
         self.cancel_callback = cancel
         self._active_history = {
@@ -225,6 +238,15 @@ class TaskPage(QWidget):
             self.cpu_curve.setData([], [])
             self.memory_curve.setData([], [])
         self.append(f"\n===== {label} =====")
+
+
+    def update_progress(self, completed: int, total: int, detail: str) -> None:
+        if total <= 0:
+            return
+        value = min(1000, max(0, int(round(completed * 1000 / total))))
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(value)
+        self.progress.setFormat(f"%p%  {detail[:96]}")
 
     def update_resource(self, sample: dict[str, Any]) -> None:
         elapsed = float(sample.get("elapsed", 0.0))
@@ -391,6 +413,7 @@ class InspectionPage(QWidget):
     task_requested = Signal(str, object, object)
     result_ready = Signal(object)
     zarr_result_ready = Signal(object)
+    result_invalidated = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -471,8 +494,16 @@ class InspectionPage(QWidget):
         root.addWidget(self.report, 1)
         self.path.textChanged.connect(self._invalidate_time_check)
         self.input_kind.currentIndexChanged.connect(self._input_kind_changed)
+        self.engine.currentIndexChanged.connect(self._invalidate_time_check)
+        self.recursive.toggled.connect(self._invalidate_time_check)
+        self.inspect_workers.valueChanged.connect(self._invalidate_structure_check)
+        for edit in (self.source_time_dim, self.source_lat_dim, self.source_lon_dim):
+            edit.textChanged.connect(self._invalidate_structure_check)
+        for combo in self.time_panel.combos.values():
+            combo.currentIndexChanged.connect(self._invalidate_structure_check)
 
     def _input_kind_changed(self, *_args) -> None:
+        self._invalidate_time_check()
         kind = self.input_kind.currentData()
         is_zarr = kind == "zarr"
         is_temporary = kind == "temporary"
@@ -526,7 +557,9 @@ class InspectionPage(QWidget):
             self.status.setText("正在检查临时任务清单和已验证的中间 Zarr。")
             self.task_requested.emit(
                 "检查临时处理产物",
-                lambda: inspect_temporary_pipeline(Path(path)),
+                lambda cancel_event: _run_cancelable(
+                    cancel_event, lambda: inspect_temporary_pipeline(Path(path))
+                ),
                 self._temporary_inspection_done,
             )
             return
@@ -534,7 +567,9 @@ class InspectionPage(QWidget):
             self.status.setText("正在检查现有 Zarr 元数据。")
             self.task_requested.emit(
                 "检查现有 Zarr",
-                lambda: inspect_zarr(Path(path)),
+                lambda cancel_event: _run_cancelable(
+                    cancel_event, lambda: inspect_zarr(Path(path))
+                ),
                 self._zarr_inspection_done,
             )
             return
@@ -549,10 +584,11 @@ class InspectionPage(QWidget):
         self.status.setText("正在检查文件名和 time 维度信息，请在任务与日志页面查看进度。")
         self.task_requested.emit(
             "检查文件时间维度信息",
-            lambda: inspect_time_metadata(
+            lambda cancel_event: inspect_time_metadata(
                 config.input_dir,
                 recursive=config.recursive,
                 requested_engine=config.engine,
+                cancel_event=cancel_event,
             ),
             self._time_inspection_done,
         )
@@ -602,6 +638,7 @@ class InspectionPage(QWidget):
                 workers=self.inspect_workers.value() or None,
                 time_rule=rule,
                 time_inspection=self.time_result,
+                cache_path=default_inspection_cache_path(self.time_result.input_dir),
             )
         except ValueError as exc:
             QMessageBox.warning(self, "时间规则不完整", str(exc))
@@ -623,9 +660,10 @@ class InspectionPage(QWidget):
         self.save_button.setEnabled(True)
         self.result_ready.emit(result)
 
-    def _invalidate_time_check(self, _text: str) -> None:
+    def _invalidate_time_check(self, *_args) -> None:
         if self.time_result is None and self.result is None:
             return
+        had_result = self.result is not None
         self.time_result = None
         self.result = None
         self.time_panel.setEnabled(False)
@@ -633,7 +671,17 @@ class InspectionPage(QWidget):
         self.mapping_group.setEnabled(False)
         self.save_button.setEnabled(False)
         self.report.clear()
-        self.status.setText("源目录已改变，请重新检查文件时间维度信息。")
+        self.status.setText("检查参数已改变，请重新检查文件时间维度信息。")
+        if had_result:
+            self.result_invalidated.emit()
+
+    def _invalidate_structure_check(self, *_args) -> None:
+        if self.result is None:
+            return
+        self.result = None
+        self.save_button.setEnabled(False)
+        self.status.setText("结构检查参数已改变，请重新检查数据结构。")
+        self.result_invalidated.emit()
 
     def _save_snapshot(self) -> None:
         if self.result is None:
@@ -952,7 +1000,9 @@ class ConversionPage(QWidget):
             return
         self.task_requested.emit(
             "生成转换计划",
-            lambda: preview_conversion(self.inspection, config),
+            lambda cancel_event: _run_cancelable(
+                cancel_event, lambda: preview_conversion(self.inspection, config)
+            ),
             self._preview_done,
         )
 
@@ -1195,7 +1245,9 @@ class RechunkPage(QWidget):
             return
         self.task_requested.emit(
             "检查 Zarr 输入",
-            lambda: inspect_zarr(Path(self.input.text().strip())),
+            lambda cancel_event: _run_cancelable(
+                cancel_event, lambda: inspect_zarr(Path(self.input.text().strip()))
+            ),
             self._inspection_done,
         )
 
@@ -1250,7 +1302,9 @@ class RechunkPage(QWidget):
             return
         self.task_requested.emit(
             f"生成{self._operation_label()}计划",
-            lambda: preview_rechunk(config, self.info),
+            lambda cancel_event: _run_cancelable(
+                cancel_event, lambda: preview_rechunk(config, self.info)
+            ),
             self._preview_done,
         )
 
@@ -1490,7 +1544,9 @@ class ResamplePage(QWidget):
             return
         self.task_requested.emit(
             "检查重采样输入",
-            lambda: inspect_resample(Path(self.input.text().strip())),
+            lambda cancel_event: _run_cancelable(
+                cancel_event, lambda: inspect_resample(Path(self.input.text().strip()))
+            ),
             self._inspection_done,
         )
 
@@ -1551,7 +1607,9 @@ class ResamplePage(QWidget):
             return
         self.task_requested.emit(
             "生成 Zarr 重采样计划",
-            lambda: preview_resample(config, self.inspection),
+            lambda cancel_event: _run_cancelable(
+                cancel_event, lambda: preview_resample(config, self.inspection)
+            ),
             self._preview_done,
         )
 
@@ -2026,6 +2084,15 @@ class PipelinePage(QWidget):
         self.status.setText("检查结果已载入，请选择处理操作并生成计划。")
         self._set_enabled(True)
 
+    def clear_inspection(self) -> None:
+        self.inspection = None
+        self.recovery = None
+        self.plan = None
+        self.run_button.setEnabled(False)
+        self.variables.setRowCount(0)
+        self.status.setText("检查参数已改变，请返回数据检查页面重新检查。")
+        self._set_enabled(False)
+
     def _update_operation_state(self, *_args) -> None:
         available = self.inspection is not None
         resample = self.resample_checkbox.isChecked()
@@ -2201,7 +2268,9 @@ class PipelinePage(QWidget):
             return
         self.task_requested.emit(
             "生成一条龙计划",
-            lambda: preview_pipeline(self.inspection, config),
+            lambda cancel_event: _run_cancelable(
+                cancel_event, lambda: preview_pipeline(self.inspection, config)
+            ),
             self._preview_done,
         )
 
@@ -2334,6 +2403,7 @@ class MainWindow(QMainWindow):
         self.pipeline_page.task_requested.connect(self._task_requested)
         self.inspection_page.result_ready.connect(self._source_ready)
         self.inspection_page.zarr_result_ready.connect(self._workflow_zarr_ready)
+        self.inspection_page.result_invalidated.connect(self._inspection_invalidated)
         self.rechunk_page.result_ready.connect(self._zarr_ready)
 
     def _apply_modern_theme(self) -> None:
@@ -2344,17 +2414,22 @@ class MainWindow(QMainWindow):
         app.setStyle("Fusion")
         app.setStyleSheet(
             """
-            QWidget { font-size: 13px; color: #243447; }
+            QWidget { font-size: 13px; color: #111827; }
+            QWidget:disabled { color: #4b5563; }
             QMainWindow { background: #f5f7fb; }
-            QListWidget { background: #17212b; color: #d8e2ec; border: 0; padding: 12px 6px; }
+            QLabel, QCheckBox, QRadioButton { color: #111827; }
+            QListWidget { background: #17212b; color: #f1f5f9; border: 0; padding: 12px 6px; }
             QListWidget::item { padding: 11px 14px; margin: 2px 0; border-radius: 6px; }
-            QListWidget::item:selected { background: #2f80ed; color: white; }
-            QGroupBox { border: 1px solid #d8e0ea; border-radius: 6px; margin-top: 14px; padding: 12px; background: white; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #31506f; }
-            QPushButton { background: #2f80ed; color: white; border: 0; border-radius: 5px; padding: 7px 14px; }
-            QPushButton:hover { background: #256dcc; }
-            QPushButton:disabled { background: #b7c3d0; }
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QPlainTextEdit, QTableWidget { border: 1px solid #c9d4df; border-radius: 4px; background: white; padding: 4px; }
+            QListWidget::item:selected { background: #1d63c6; color: #ffffff; }
+            QListWidget::item:disabled { color: #aebdca; }
+            QGroupBox { border: 1px solid #c7d2df; border-radius: 6px; margin-top: 14px; padding: 12px; background: white; color: #111827; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #193b5a; }
+            QPushButton { background: #1d63c6; color: #ffffff; border: 0; border-radius: 5px; padding: 7px 14px; }
+            QPushButton:hover { background: #174fa0; }
+            QPushButton:disabled { background: #cbd5e1; color: #374151; }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QPlainTextEdit, QTextEdit, QTextBrowser, QTableWidget { border: 1px solid #b8c5d3; border-radius: 4px; background: #ffffff; color: #111827; padding: 4px; }
+            QHeaderView::section { background: #e8eef5; color: #172033; border: 0; border-right: 1px solid #c7d2df; border-bottom: 1px solid #c7d2df; padding: 5px; }
+            QToolTip { color: #111827; background: #fffbea; border: 1px solid #9aa8b8; }
             QProgressBar { border: 1px solid #c9d4df; border-radius: 4px; text-align: center; background: white; }
             QProgressBar::chunk { background: #27ae60; }
             """
@@ -2375,6 +2450,16 @@ class MainWindow(QMainWindow):
             )
         )
         help_menu.addAction(about)
+
+    def _inspection_invalidated(self) -> None:
+        self.source_result = None
+        self.zarr_result = None
+        self.pipeline_page.clear_inspection()
+        for index in (1, 4):
+            self._set_nav_enabled(index, False)
+        self.navigation.item(1).setText("转换")
+        self.navigation.item(4).setText("处理流程")
+        self.navigation.setCurrentRow(0)
 
     def _source_ready(self, result: InspectionResult) -> None:
         self.source_result = result
@@ -2453,6 +2538,7 @@ class MainWindow(QMainWindow):
         self.task_page.started(label, worker.request_cancel)
         worker.log.connect(self.task_page.append)
         worker.resource.connect(self.task_page.update_resource)
+        worker.progress.connect(self.task_page.update_progress)
 
         def succeeded(result: Any) -> None:
             try:

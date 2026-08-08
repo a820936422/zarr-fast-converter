@@ -9,6 +9,8 @@
 无论源数据使用源时间、年 + DOY 还是年 + 月 + 日，输出 Zarr 的 `time` 坐标统一
 按 `YYYY-MM-DD` 日期格式表示，例如 `2001001` 转换为 `2001-01-01`。
 
+模块功能与使用手册见 [docs/README.md](docs/README.md)。
+
 ## 运行
 
 当前 Python 环境和项目命令统一由 Pixi 管理。首次运行会根据 `pixi.lock` 创建当前项目
@@ -51,12 +53,14 @@ pixi run convert \
 
 时间范围中的日期可以直接写成 `--time '[2001-01-01, 2022-12-31]'`，不需要为日期加引号；年份范围仍可写成 `--time '[2003, 2010]'`。
 
-## GUI（v1.6.4）
+## GUI（v1.6.5）
 
 PySide6 图形界面将主导航收敛为“数据检查、处理流程、任务中心”。转换、重采样、重分块
 和重压缩不再作为相互割裂的主页面出现，而是在处理流程中按需组合；未勾选的操作不会进入
 物理执行计划。旧页面对象和独立命令行入口暂时保留，供已有自动化脚本兼容使用。
 界面使用 Fusion + QSS 主题，在 1280x820 和较小窗口下保持紧凑的参数区与计划摘要区。
+
+v1.6.5 增加真实源数据校验模块的自动化覆盖；任务中心会从转换、重采样、重分块和流水线日志中提取实际百分比或完成量；时间检查与计划预览均响应安全取消。修改输入类型、读取引擎、递归选项、worker、维度映射或时间规则后，旧检查结果会立即失效并锁定下游处理，避免使用过期计划。
 
 v1.6.4 将现有 Zarr 和失败任务续跑的最终 chunks/codec 直接下推到重采样阶段，避免重采样成功后再次完整重分块；仅时间批次会部分更新同一最终 chunk 时才建立中转 Zarr，空间 chunk 差异改用边界对齐直接写入。中转 chunk 使用受控并行合并，并分别记录时间批次、合并耗时、内部写入和避免的最终化 I/O。ESMF 自动 worker 使用生产任务校准后的内存基线，GUI 同时显示实际占用核心数与整机 CPU 百分比。
 
@@ -76,7 +80,7 @@ NetCDF/Zarr 输入输出等用户数据路径仍按运行时选择记录，不�
 pixi run gui
 ```
 
-## 可组合处理流程（v1.6.4）
+## 可组合处理流程（v1.6.5）
 
 一条龙模块会先执行完整的数据检查和时间规则确认。原始数据转换是必经步骤；
 重采样、重分块和重压缩可以独立选择，所有组合始终只发布一份最终 Zarr。规划器按统一
@@ -116,8 +120,8 @@ pixi run pipeline \
 `--after-results` 提供；`--statistics-policy auto|sample|exact` 控制统计表达式。
 重压缩既可以继续使用旧 `--compression` profile，也可以通过 `--compression-codec`、
 `--compression-level` 和 `--compression-shuffle` 明确指定最终 Zarr v3 codec。
-`--cleanup-intermediate` 会在下游验证通过后删除已不再需要的上游临时 Zarr。完整设计与
-阶段边界见 [docs/ONE_STOP_PIPELINE_V1.md](docs/ONE_STOP_PIPELINE_V1.md)。
+`--cleanup-intermediate` 会在下游验证通过后删除已不再需要的上游临时 Zarr。完整工作流与
+阶段边界见 [一条龙处理模块文档](docs/pipeline.md)。
 对于数千个源文件，建议固定使用同一个 `--inspection-cache` 路径。快照记录文件路径、
 大小、纳秒修改时间和读取后端；再次运行时仍会枚举当前目录，但只打开新增或指纹变化的
 文件读取元数据。直接导入快照用于转换时会严格拒绝已变化的源文件，避免使用过期索引。
@@ -273,7 +277,7 @@ ds = xr.open_zarr("/path/to/result.zarr", consolidated=False)
 
 ## 开发测试
 
-第二个模块的设计流程见 [docs/RECHUNK_WORKFLOW.md](docs/RECHUNK_WORKFLOW.md)。
+重分块的工作流和完整参数见 [重分块与重压缩模块文档](docs/rechunking.md)。
 当前已经提供独立的 Zarr 重分块与无损重压缩入口：
 
 ~~~bash

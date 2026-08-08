@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 import sys
+import threading
 import unittest
 
 import numpy as np
@@ -99,6 +100,17 @@ class TimeMappingTests(unittest.TestCase):
         result = inspect_time_metadata(ROOT / "complete", requested_engine="h5netcdf")
         self.assertIsNotNone(result.suggested_rule)
         self.assertEqual(result.suggested_rule.full.source, "time")
+
+    def test_time_metadata_inspection_honours_preexisting_cancellation(self) -> None:
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        with self.assertRaisesRegex(RuntimeError, "任务已取消"):
+            inspect_time_metadata(
+                ROOT / "complete",
+                requested_engine="h5netcdf",
+                cancel_event=cancel_event,
+            )
 
     def test_filename_year_and_time_doy_build_hybrid_inventory(self) -> None:
         result = inspect_time_metadata(ROOT / "hybrid", requested_engine="h5netcdf")
