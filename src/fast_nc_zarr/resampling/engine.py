@@ -26,6 +26,7 @@ from .autotune import (
     resolve_auto_time_block,
 )
 from .grid import RESAMPLING_METHODS, build_target_grid, output_chunks
+from .environment import validate_resampling_environment
 from .inspection import inspect_resample_input
 from .models import (
     ComputeDType,
@@ -1757,6 +1758,7 @@ def run_resample(
     cancel_event=None,
     progress: bool = True,
 ) -> dict[str, object]:
+    validate_resampling_environment()
     plan = plan or plan_resample(config)
     requested_plan = plan
     source_path = Path(config.input).expanduser().resolve()

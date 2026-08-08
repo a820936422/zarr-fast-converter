@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QLineEdit,
 )
+from .. import __version__
 
 from ..application.services import (
     ConversionConfig,
@@ -2139,7 +2140,7 @@ class PipelinePage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("快速 Zarr 转换器")
+        self.setWindowTitle(f"快速 Zarr 转换器 v{__version__}")
         self.resize(1280, 820)
         self._apply_modern_theme()
         self.worker: TaskWorker | None = None
@@ -2243,7 +2244,7 @@ class MainWindow(QMainWindow):
             lambda: QMessageBox.information(
                 self,
                 "关于",
-                "快速 Zarr 转换器\nPySide6 GUI MVP\n\n源数据检查、转换、重分块、重压缩和重采样共享同一套核心引擎。",
+                f"快速 Zarr 转换器 v{__version__}\n\n源数据检查、转换、重分块、重压缩和重采样共享同一套核心引擎。",
             )
         )
         help_menu.addAction(about)

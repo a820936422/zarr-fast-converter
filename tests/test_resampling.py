@@ -6,6 +6,8 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import xarray as xr
@@ -31,6 +33,10 @@ from fast_nc_zarr.resampling.grid import (  # noqa: E402
     _axis_is_uniform,
     build_target_grid,
     inspect_grid,
+)
+from fast_nc_zarr.resampling.environment import (  # noqa: E402
+    ResamplingEnvironmentError,
+    validate_resampling_environment,
 )
 from fast_nc_zarr.resampling.inspection import inspect_resample_input  # noqa: E402
 from fast_nc_zarr.resampling.models import GridInfo, ResampleConfig  # noqa: E402
@@ -530,6 +536,49 @@ class ResamplingTests(unittest.TestCase):
         irregular = lat.copy()
         irregular[1800] += np.float32(0.001)
         self.assertFalse(_axis_is_uniform(irregular, resolution))
+
+    def test_resampling_environment_reports_stale_esmf_prefix(self) -> None:
+        prefix = ROOT / "current-prefix"
+        lib = prefix / "lib"
+        lib.mkdir(parents=True, exist_ok=True)
+        (lib / "libesmf_fullylinked.so").touch()
+        makefile = lib / "esmf.mk"
+        makefile.write_text(
+            "ESMF_LIBSDIR=/deleted/old-project/.pixi/envs/default/lib\n",
+            encoding="utf-8",
+        )
+        with (
+            patch("fast_nc_zarr.resampling.environment.sys.prefix", str(prefix)),
+            patch.dict("os.environ", {"ESMFMKFILE": str(makefile)}),
+            patch(
+                "fast_nc_zarr.resampling.environment.importlib.import_module",
+                return_value=SimpleNamespace(__version__="test"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ResamplingEnvironmentError, "ESMF 配置仍指向其他环境"
+            ):
+                validate_resampling_environment()
+
+    def test_resampling_environment_preserves_import_diagnostics(self) -> None:
+        prefix = ROOT / "valid-prefix"
+        lib = prefix / "lib"
+        lib.mkdir(parents=True, exist_ok=True)
+        (lib / "libesmf_fullylinked.so").touch()
+        makefile = lib / "esmf.mk"
+        makefile.write_text(f"ESMF_LIBSDIR={lib}\n", encoding="utf-8")
+        with (
+            patch("fast_nc_zarr.resampling.environment.sys.prefix", str(prefix)),
+            patch.dict("os.environ", {"ESMFMKFILE": str(makefile)}),
+            patch(
+                "fast_nc_zarr.resampling.environment.importlib.import_module",
+                side_effect=ImportError("shared library did not load"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ResamplingEnvironmentError, "shared library did not load"
+            ):
+                validate_resampling_environment()
 
 
 if __name__ == "__main__":

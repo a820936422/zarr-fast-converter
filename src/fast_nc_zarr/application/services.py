@@ -49,6 +49,7 @@ from ..resampling.engine import (
     plan_resample as core_plan_resample,
     run_resample as core_run_resample,
 )
+from ..resampling.environment import validate_resampling_environment
 from ..resampling.inspection import inspect_resample_input as core_inspect_resample
 from ..resampling.models import (
     ResampleConfig,
@@ -759,6 +760,7 @@ def preview_resample(
     config: ResampleConfig,
     inspection: ResampleInspection | None = None,
 ) -> ResamplePreview:
+    validate_resampling_environment()
     plan = core_plan_resample(config, inspection)
     return ResamplePreview(plan.inspection, plan)
 

@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
+from fast_nc_zarr import __version__  # noqa: E402
 
 from fast_nc_zarr.application.services import (  # noqa: E402
     ConversionConfig,
@@ -37,6 +38,16 @@ from fast_nc_zarr.time_mapping import inspect_time_metadata  # noqa: E402
 
 ROOT = Path("/tmp/codex_test/fast_nc_zarr_gui_tests")
 
+
+
+class VersionTests(unittest.TestCase):
+    def test_window_title_displays_release_version(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        self.assertEqual(__version__, "1.6.2")
+        self.assertIn("v1.6.2", window.windowTitle())
+        window.close()
+        app.processEvents()
 
 class GuiServiceTests(unittest.TestCase):
     @classmethod
@@ -167,7 +178,7 @@ class GuiServiceTests(unittest.TestCase):
         window = MainWindow()
         self.assertEqual(window.navigation.count(), 6)
         self.assertEqual(window.stack.count(), 6)
-        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器")
+        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.2")
         self.assertEqual(
             [
                 window.navigation.item(index).text()

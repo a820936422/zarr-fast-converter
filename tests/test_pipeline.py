@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
+from collections import namedtuple
 
 import numpy as np
 import xarray as xr
@@ -23,7 +24,11 @@ from fast_nc_zarr.application.services import (  # noqa: E402
     inspect_source,
     inspect_zarr,
 )
-from fast_nc_zarr.pipeline.engine import preview_pipeline, run_pipeline  # noqa: E402
+from fast_nc_zarr.pipeline.engine import (  # noqa: E402
+    PipelineExecutionError,
+    preview_pipeline,
+    run_pipeline,
+)
 from fast_nc_zarr.pipeline.cli import main as pipeline_main  # noqa: E402
 from fast_nc_zarr.pipeline.models import (  # noqa: E402
     PipelineChunkingOptions,
@@ -37,6 +42,7 @@ from fast_nc_zarr.pipeline.models import (  # noqa: E402
 )
 from fast_nc_zarr.pipeline.planner import build_pipeline_plan  # noqa: E402
 from fast_nc_zarr.models import VariableSpec  # noqa: E402
+from fast_nc_zarr.resampling.environment import ResamplingEnvironmentError  # noqa: E402
 
 
 ROOT = Path("/tmp/codex_test/fast_nc_zarr_pipeline_tests")
@@ -721,6 +727,65 @@ class PipelineTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "辅助坐标、边界或 CRS"):
             build_pipeline_plan(inspection, config)
+
+    def test_esmf_preflight_fails_before_creating_intermediate_store(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        temporary = ROOT / "preflight-temporary"
+        config = replace(
+            self._config(ROOT / "preflight-output.zarr"),
+            general=replace(self._config(ROOT / "unused.zarr").general, temporary_dir=temporary),
+        )
+        with patch(
+            "fast_nc_zarr.pipeline.engine.validate_resampling_environment",
+            side_effect=ResamplingEnvironmentError("ESMF 配置错误"),
+        ):
+            with self.assertRaisesRegex(ResamplingEnvironmentError, "ESMF 配置错误"):
+                run_pipeline(inspection, config, progress=False)
+        self.assertFalse(temporary.exists())
+
+    def test_capacity_preflight_fails_before_conversion(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        temporary = ROOT / "capacity-temporary"
+        base = self._config(ROOT / "capacity-output.zarr")
+        config = replace(base, general=replace(base.general, temporary_dir=temporary))
+        usage = namedtuple("usage", "total used free")(1024**3, 0, 1024)
+        with (
+            patch("fast_nc_zarr.pipeline.engine.validate_resampling_environment"),
+            patch("fast_nc_zarr.pipeline.engine.shutil.disk_usage", return_value=usage),
+            patch("fast_nc_zarr.pipeline.engine.run_conversion") as conversion,
+        ):
+            with self.assertRaisesRegex(PipelineExecutionError, "预计临时与最终产物"):
+                run_pipeline(inspection, config, progress=False)
+        conversion.assert_not_called()
+        self.assertFalse(temporary.exists())
+
+    def test_resampling_failure_records_stage_and_retains_conversion(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        temporary = ROOT / "failed-stage-temporary"
+        base = self._config(ROOT / "failed-stage-output.zarr")
+        config = replace(base, general=replace(base.general, temporary_dir=temporary))
+        with (
+            patch("fast_nc_zarr.pipeline.engine.validate_resampling_environment"),
+            patch(
+                "fast_nc_zarr.pipeline.engine.run_resample",
+                side_effect=RuntimeError("worker failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(PipelineExecutionError, "worker failed"):
+                run_pipeline(inspection, config, progress=False)
+        roots = list((temporary / "fast-nc-zarr-pipeline").iterdir())
+        self.assertEqual(len(roots), 1)
+        manifest = json.loads((roots[0] / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["failed_stage"], "resampling")
+        self.assertTrue((roots[0] / "source-crop.zarr" / "zarr.json").is_file())
+        self.assertFalse(config.general.output.exists())
 
 
 if __name__ == "__main__":

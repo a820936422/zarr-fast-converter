@@ -20,6 +20,7 @@ from ..application.services import (
     run_resample,
 )
 from ..publication import publish_staging, validate_publish_target
+from ..selection import selected_logical_bytes
 from ..resampling.engine import (
     _build_regridder,
     _mask_missing,
@@ -27,6 +28,7 @@ from ..resampling.engine import (
     _tile_target,
 )
 from ..resampling.grid import _axis_bounds
+from ..resampling.environment import validate_resampling_environment
 from ..resampling.models import GridInfo, ResampleConfig
 from ..resampling.replacements import apply_replacement_rules, parse_replacement_rules
 from .models import (
@@ -86,6 +88,85 @@ def _paths(config: PipelineConfig) -> PipelinePaths:
         resampled=root / "resampled.zarr",
         final_staging=output.parent / f".{output.name}.pipeline-{uuid4().hex}.tmp",
     )
+
+def _nearest_existing(path: Path) -> Path:
+    current = path.expanduser().resolve()
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    return current
+
+
+def _raw_storage_estimate(inspection, plan: PipelinePlan) -> tuple[int, int]:
+    inventory = inspection.source_inventory
+    selected_logical = selected_logical_bytes(inventory, plan.source_selection)
+    full_selected_logical = sum(
+        len(inventory.times)
+        * len(inventory.lat_values)
+        * len(inventory.lon_values)
+        * inventory.variables[name].itemsize
+        for name in plan.source_selection.variables
+    )
+    selected_fraction = selected_logical / max(1, full_selected_logical)
+    converted_estimate = max(
+        64 * 1024**2,
+        int(inventory.total_bytes * selected_fraction * 1.25),
+    )
+    source_cells = max(1, int(np.prod(plan.source_selection.shape, dtype=np.int64)))
+    target_cells = max(
+        1,
+        plan.source_selection.shape[0]
+        * int(plan.target_grid.lat.size)
+        * int(plan.target_grid.lon.size),
+    )
+    final_estimate = max(
+        64 * 1024**2,
+        int(converted_estimate * target_cells / source_cells),
+    )
+    temporary_estimate = 0
+    if plan.needs_resample or plan.finalization_required:
+        temporary_estimate += converted_estimate
+    if plan.needs_resample:
+        # xESMF may require one additional target-shaped intermediate when a
+        # large time chunk cannot be written directly to the final layout.
+        temporary_estimate += final_estimate
+    if plan.finalization_required:
+        temporary_estimate += final_estimate
+    return temporary_estimate, final_estimate
+
+
+def _check_raw_storage_capacity(inspection, plan: PipelinePlan, paths: PipelinePaths) -> None:
+    temporary_estimate, final_estimate = _raw_storage_estimate(inspection, plan)
+    temporary_base = paths.root.parent
+    output_base = Path(paths.final_staging).parent
+    temporary_existing = _nearest_existing(temporary_base)
+    output_existing = _nearest_existing(output_base)
+    temporary_usage = shutil.disk_usage(temporary_existing)
+    output_usage = shutil.disk_usage(output_existing)
+    same_filesystem = temporary_existing.stat().st_dev == output_existing.stat().st_dev
+    required_on_temporary = temporary_estimate + (final_estimate if same_filesystem else 0)
+    print("存储规划：")
+    print(f"  临时任务根目录：{paths.root}")
+    print(f"  转换中间 Zarr：{paths.converted}")
+    print(f"  最终输出目录：{Path(paths.final_staging).parent}")
+    print(
+        f"  预计临时峰值：{temporary_estimate / 1024**3:.1f} GiB；"
+        f"预计最终输出：{final_estimate / 1024**3:.1f} GiB"
+    )
+    print(
+        f"  临时文件系统可用：{temporary_usage.free / 1024**3:.1f} GiB；"
+        f"输出文件系统可用：{output_usage.free / 1024**3:.1f} GiB"
+    )
+    if required_on_temporary > temporary_usage.free * 0.9:
+        raise PipelineExecutionError(
+            "预计临时与最终产物需要 "
+            f"{required_on_temporary / 1024**3:.1f} GiB，但临时文件系统仅可用 "
+            f"{temporary_usage.free / 1024**3:.1f} GiB（保留 10% 安全余量）。"
+        )
+    if not same_filesystem and final_estimate > output_usage.free * 0.9:
+        raise PipelineExecutionError(
+            f"预计最终输出需要 {final_estimate / 1024**3:.1f} GiB，但输出文件系统仅可用 "
+            f"{output_usage.free / 1024**3:.1f} GiB（保留 10% 安全余量）。"
+        )
 
 
 def _sample_indices(size: int) -> list[int]:
@@ -386,7 +467,10 @@ def validate_resample_samples(
 def preview_pipeline(inspection, config: PipelineConfig) -> PipelinePlan | ZarrPipelinePlan:
     """Build a no-write pipeline plan from an already completed inspection."""
 
-    return build_pipeline_plan(inspection, config)
+    plan = build_pipeline_plan(inspection, config)
+    if plan.needs_resample:
+        validate_resampling_environment()
+    return plan
 
 
 def _run_zarr_pipeline(
@@ -588,8 +672,10 @@ def run_pipeline(
     progress: bool = True,
 ) -> dict[str, object]:
     """Execute the selected product operations and publish one final Zarr."""
-
     plan = build_pipeline_plan(inspection, config)
+    if plan.needs_resample:
+        validate_resampling_environment()
+
     if isinstance(plan, ZarrPipelinePlan):
         return _run_zarr_pipeline(
             inspection,
@@ -599,6 +685,7 @@ def run_pipeline(
             progress=progress,
         )
     paths = _paths(config)
+    _check_raw_storage_capacity(inspection, plan, paths)
     paths.root.mkdir(parents=True, exist_ok=False)
     requested_operations = {
         "conversion": True,
@@ -643,6 +730,7 @@ def run_pipeline(
     _write_manifest(paths.manifest, manifest)
     started = time.perf_counter()
     current = paths.converted
+    current_stage = "preparation"
     try:
         conversion = config.conversion
         conversion_is_final = not plan.needs_resample and not plan.finalization_required
@@ -689,6 +777,7 @@ def run_pipeline(
             )
             if plan.coverage_warning:
                 print("覆盖提醒：" + plan.coverage_warning)
+        current_stage = "conversion"
         conversion_plan, conversion_metrics = run_conversion(
             inspection,
             conversion_config,
@@ -756,6 +845,7 @@ def run_pipeline(
                     f"一条龙阶段 2/{len(physical_stages)}："
                     "xESMF 重采样到目标网格"
                 )
+            current_stage = "resampling"
             resample_metrics = run_resample(
                 resample_config,
                 cancel_event=cancel_event,
@@ -767,6 +857,7 @@ def run_pipeline(
             _write_manifest(paths.manifest, manifest)
             if progress:
                 print("重采样主体完成，开始局部数学验证……", flush=True)
+            current_stage = "mathematical_validation"
             validation_metrics = validate_resample_samples(
                 paths.converted,
                 resample_output,
@@ -843,6 +934,7 @@ def run_pipeline(
                     f"一条龙阶段 {len(physical_stages)}/{len(physical_stages)}："
                     "执行布局兼容性最终化"
                 )
+            current_stage = "finalization"
             rechunk_metrics = run_rechunk(rechunk_config, cancel_event=cancel_event)
             manifest["stages"]["finalization"] = {
                 "status": "published_and_validated",
@@ -902,6 +994,7 @@ def run_pipeline(
         }
     except Exception as exc:
         manifest["status"] = "failed"
+        manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started
         manifest["error"] = str(exc)
         _write_manifest(paths.manifest, manifest)
