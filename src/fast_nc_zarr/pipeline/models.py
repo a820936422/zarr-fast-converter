@@ -107,6 +107,7 @@ class PipelineConfig:
     chunking: PipelineChunkingOptions = field(default_factory=PipelineChunkingOptions)
     compression: PipelineCompressionOptions = field(default_factory=PipelineCompressionOptions)
     validate: bool = True
+    semantic_constraints: dict[str, dict[str, float | bool]] = field(default_factory=dict)
 
     @property
     def requested_operations(self) -> tuple[str, ...]:
@@ -200,6 +201,7 @@ class ZarrPipelinePlan:
     final_chunk_plan: ChunkPlan | None
     final_compression: CompressionPlan | None
     final_chunks: tuple[int, int, int] | None
+    output_layout: OutputLayout | None
     direct_finalization: bool
     finalization_required: bool
     operation_decisions: tuple[OperationDecision, ...]

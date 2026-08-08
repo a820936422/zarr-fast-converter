@@ -228,16 +228,18 @@ class TaskWorker(QThread):
                             "write_mib_s": disk_write,
                         }
                     )
+                logical_cpus = max(1, int(psutil.cpu_count(logical=True) or 1))
+                cpu_cores = cpu / 100.0
+                cpu_machine_percent = cpu / logical_cpus
                 self.resource.emit(
                     {
                         "elapsed": now - started,
-                        "cpu": cpu,
+                        "cpu": cpu_machine_percent,
+                        "cpu_machine_percent": cpu_machine_percent,
+                        "cpu_core_percent": cpu,
+                        "cpu_cores": cpu_cores,
+                        "logical_cpus": logical_cpus,
                         "rss_gib": rss / 1024**3,
-                        # ``read_bytes``/``write_bytes`` are already the
-                        # per-interval deltas accumulated above.  The old
-                        # implementation subtracted the removed aggregate
-                        # counters ``previous_read``/``previous_write`` here,
-                        # which caused the monitor thread to raise NameError.
                         "read_mib_s": read_bytes / 1024**2 / elapsed,
                         "write_mib_s": write_bytes / 1024**2 / elapsed,
                         "disks": disks,

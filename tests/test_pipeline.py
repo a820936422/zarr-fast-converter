@@ -146,7 +146,10 @@ class PipelineTests(unittest.TestCase):
                 plan = preview_pipeline(inspection, config)
                 self.assertFalse(plan.decision("conversion").requested)
                 self.assertEqual(plan.needs_resample, resample)
-                self.assertEqual(plan.finalization_required, rechunk or recompress)
+                self.assertEqual(
+                    plan.finalization_required,
+                    (rechunk or recompress) and not resample,
+                )
                 self.assertEqual(plan.decision("rechunking").requested, rechunk)
                 self.assertEqual(plan.decision("recompression").requested, recompress)
 
@@ -177,9 +180,24 @@ class PipelineTests(unittest.TestCase):
         )
         result = run_pipeline(inspection, config, progress=False)
         manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
-        self.assertEqual(manifest["physical_stages"], ["resampling", "finalization"])
-        self.assertEqual(manifest["stages"]["resampling"]["status"], "validated_and_cleaned")
-        self.assertGreater(manifest["logical_io"]["write_amplification"], 1.0)
+        self.assertEqual(manifest["physical_stages"], ["resampling"])
+        self.assertEqual(
+            manifest["stages"]["resampling"]["status"],
+            "published_as_final",
+        )
+        self.assertEqual(
+            manifest["operation_decisions"]["recompression"]["disposition"],
+            "fused_into_resampling",
+        )
+        self.assertGreaterEqual(manifest["logical_io"]["write_amplification"], 1.0)
+        self.assertGreater(
+            manifest["logical_io"]["avoided_finalization_read_bytes"],
+            0,
+        )
+        self.assertEqual(
+            manifest["logical_io"]["avoided_finalization_read_bytes"],
+            manifest["logical_io"]["avoided_finalization_write_bytes"],
+        )
         self.assertTrue((ROOT / "zarr-resampled-compressed.zarr" / "zarr.json").is_file())
 
     def test_replacement_rules_prevent_identity_resample_from_becoming_noop(self) -> None:
@@ -633,6 +651,7 @@ class PipelineTests(unittest.TestCase):
             manifest["stages"]["finalization"]["status"],
             "not_required_direct_layout",
         )
+        self.assertEqual(manifest["semantic_validation"]["status"], "passed")
         self.assertFalse((Path(manifest["temporary_root"]) / "source-crop.zarr").exists())
         group = zarr.open_group(config.general.output, mode="r")
         value_layout = plan.output_layout.for_source("value")
@@ -845,6 +864,17 @@ class PipelineTests(unittest.TestCase):
             recovered.recovery.manifest_path.read_text(encoding="utf-8")
         )
         self.assertEqual(original_manifest["status"], "resumed_succeeded")
+        self.assertEqual(original_manifest["schema_version"], 5)
+        self.assertNotIn("error", original_manifest)
+        self.assertNotIn("failed_stage", original_manifest)
+        self.assertEqual(
+            original_manifest["error_history"][-1]["message"],
+            "simulated worker failure",
+        )
+        self.assertEqual(
+            original_manifest["error_history"][-1]["resolved_by_job"],
+            Path(result["manifest"]).parent.name,
+        )
         self.assertTrue(original_manifest["retained_checkpoints_cleaned"])
         self.assertFalse(recovered.recovery.checkpoint.exists())
 

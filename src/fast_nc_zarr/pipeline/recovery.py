@@ -167,6 +167,10 @@ def _restore_config(
             shuffle=str(compression.get("shuffle", "auto")),
         ),
         validate=bool(data.get("validate", True)),
+        semantic_constraints={
+            str(name): dict(value)
+            for name, value in dict(data.get("semantic_constraints") or {}).items()
+        },
     )
 
 
@@ -296,11 +300,34 @@ def mark_recovery_succeeded(
     recovery: PipelineRecovery, result: dict[str, Any], *, cleanup: bool
 ) -> None:
     payload = _json(recovery.manifest_path)
+    prior_status = str(payload.get("status", "failed"))
+    prior_error = payload.pop("error", None)
+    resolved_manifest = result.get("manifest")
+    resolved_job = (
+        Path(str(resolved_manifest)).expanduser().resolve().parent.name
+        if resolved_manifest
+        else None
+    )
+    if prior_error:
+        error_history = list(payload.get("error_history") or [])
+        error_history.append(
+            {
+                "status": prior_status,
+                "stage": payload.pop("failed_stage", None),
+                "message": str(prior_error),
+                "resolved_by_job": resolved_job,
+            }
+        )
+        payload["error_history"] = error_history
+    else:
+        payload.pop("failed_stage", None)
+    payload["schema_version"] = 5
     payload["status"] = "resumed_succeeded"
     payload["resume_result"] = {
         "output": result.get("output"),
-        "manifest": result.get("manifest"),
+        "manifest": resolved_manifest,
         "resumed_from": recovery.checkpoint_stage,
+        "resumed_by_job": resolved_job,
     }
     if cleanup:
         for item in recovery.job_root.iterdir():

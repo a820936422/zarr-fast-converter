@@ -364,7 +364,7 @@ class ResamplingTests(unittest.TestCase):
             output,
             resolution=2.0,
             time_block=1,
-            space_workers=1,
+            space_workers=2,
             temporary_dir=temporary,
         )
         metrics = run_resample(config, progress=False)
@@ -375,9 +375,12 @@ class ResamplingTests(unittest.TestCase):
         self.assertTrue(temporary.is_dir())
         self.assertEqual(metrics["temporary_dir"], str(temporary.resolve()))
         self.assertEqual(list(temporary.glob(".*.tmp")), [])
+        self.assertGreater(int(metrics["merge_timing"]["tasks"]), 0)
+        self.assertEqual(int(metrics["merge_timing"]["workers"]), 2)
+        self.assertGreater(float(metrics["merge_timing"]["elapsed_seconds"]), 0.0)
         self.assertEqual(list(temporary.glob(".resample-buffer-*.bin")), [])
 
-    def test_spatial_compute_tiles_are_decoupled_from_final_chunks(self) -> None:
+    def test_spatial_compute_tiles_write_aligned_final_chunks_directly(self) -> None:
         source = ROOT / "input.zarr"
         output = ROOT / "spatial-intermediate-output.zarr"
         temporary = ROOT / "spatial-intermediate-temporary"
@@ -402,9 +405,9 @@ class ResamplingTests(unittest.TestCase):
             progress=False,
         )
 
-        self.assertTrue(metrics["used_intermediate"])
-        self.assertEqual(int(metrics["tile_timing"]["tiles"]), 4)
-        self.assertEqual(metrics["logical_write_amplification"], 2.0)
+        self.assertFalse(metrics["used_intermediate"])
+        self.assertEqual(int(metrics["tile_timing"]["tiles"]), 1)
+        self.assertEqual(metrics["logical_write_amplification"], 1.0)
         self.assertGreater(metrics["throughput_mib_s"], 0.0)
         self.assertGreater(metrics["physical_throughput_mib_s"], 0.0)
         with xr.open_zarr(output, consolidated=False, chunks=None) as result:
@@ -436,11 +439,16 @@ class ResamplingTests(unittest.TestCase):
             compute_workers=1,
             space_workers=2,
         )
-        run_resample(config, progress=False)
+        metrics = run_resample(config, progress=False)
         with xr.open_zarr(output, consolidated=False, chunks=None) as dataset:
             self.assertEqual(dataset.value.shape, (2, 4, 4))
             self.assertEqual(dataset.value.encoding["chunks"], (1, 2, 2))
             self.assertTrue(np.isfinite(dataset.value.values).any())
+        self.assertEqual(
+            int(metrics["tile_timing"]["time_batches"]),
+            int(metrics["tile_timing"]["total_time_batches"]),
+        )
+        self.assertGreater(int(metrics["tile_timing"]["time_batches"]), 0)
 
     def test_streaming_small_tiles_preserves_nearest_d2s_semantics(self) -> None:
         output = ROOT / "nearest-d2s-stream.zarr"

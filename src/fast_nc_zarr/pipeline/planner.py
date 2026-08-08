@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import blake2b
 import math
 from pathlib import Path
@@ -516,6 +517,34 @@ def _zarr_target_info(info: DatasetInfo, resample_plan) -> DatasetInfo:
         )
     return DatasetInfo(info.path, dimensions, tuple(variables), info.attrs, info.zarr_format)
 
+def _zarr_output_layout(
+    info: DatasetInfo,
+    chunk_plan: ChunkPlan,
+    compression: CompressionPlan,
+    *,
+    recompress: bool,
+) -> OutputLayout:
+    layouts = []
+    for item in info.variables:
+        codec = (
+            _codec_spec(np.dtype(item.dtype), compression)
+            if recompress and not item.is_coord
+            else None
+        )
+        layouts.append(
+            VariableOutputLayout(
+                source_name=item.name,
+                output_name=item.name,
+                dims=item.dims,
+                shape=item.shape,
+                dtype=str(item.dtype),
+                chunks=chunk_plan.chunks_for(item),
+                codec=codec,
+                is_coord=item.is_coord,
+            )
+        )
+    return OutputLayout(tuple(layouts))
+
 
 def _existing_chunks(info: DatasetInfo) -> tuple[int, int, int]:
     reference = next(
@@ -608,6 +637,29 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
         )
     )
     storage_requested = operations.rechunk or operations.recompress
+    output_layout = (
+        _zarr_output_layout(
+            target_info,
+            chunk_plan,
+            compression,
+            recompress=operations.recompress,
+        )
+        if operations.resample
+        else None
+    )
+    if resample_plan is not None and output_layout is not None:
+        resample_plan = replace(
+            resample_plan,
+            output_chunks={
+                item.output_name: item.chunks for item in output_layout.variables
+            },
+            output_layout=output_layout,
+        )
+    finalization_required = storage_requested and not operations.resample
+    storage_disposition = (
+        "fused_into_resampling" if operations.resample else "executed_as_stage"
+    )
+    storage_stage = "重采样阶段" if operations.resample else "最终化阶段"
     decisions = (
         OperationDecision("conversion", False, "not_requested", "现有 Zarr 输入跳过转换。"),
         OperationDecision(
@@ -619,14 +671,14 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
         OperationDecision(
             "rechunking",
             operations.rechunk,
-            "executed_as_stage" if operations.rechunk else "not_requested",
-            "由最终化阶段应用目标 chunks。" if operations.rechunk else "用户未请求重分块。",
+            storage_disposition if operations.rechunk else "not_requested",
+            f"由{storage_stage}应用目标 chunks。" if operations.rechunk else "用户未请求重分块。",
         ),
         OperationDecision(
             "recompression",
             operations.recompress,
-            "executed_as_stage" if operations.recompress else "not_requested",
-            "由最终化阶段应用目标 codec。" if operations.recompress else "用户未请求重压缩。",
+            storage_disposition if operations.recompress else "not_requested",
+            f"由{storage_stage}应用目标 codec。" if operations.recompress else "用户未请求重压缩。",
         ),
     )
     return ZarrPipelinePlan(
@@ -637,8 +689,9 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
         final_chunk_plan=chunk_plan,
         final_compression=compression,
         final_chunks=chunk_plan.chunks,
-        direct_finalization=not storage_requested,
-        finalization_required=storage_requested,
+        output_layout=output_layout,
+        direct_finalization=not finalization_required,
+        finalization_required=finalization_required,
         operation_decisions=decisions,
     )
 

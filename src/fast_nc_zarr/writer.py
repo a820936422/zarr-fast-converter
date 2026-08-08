@@ -10,6 +10,7 @@ from typing import Iterator
 
 import numpy as np
 
+from .metadata import sanitize_cf_references
 from .models import (
     CodecSpec,
     ConversionPlan,
@@ -365,7 +366,10 @@ def initialize_zarr(
                 coordinate_compressor = compressor_from_spec(coordinate_layout.codec)
                 if coordinate_compressor is not None:
                     encoding[name]["compressors"] = [coordinate_compressor]
-        template = xr.Dataset(variables, coords=coordinates, attrs=source.attrs.copy())
+        template = sanitize_cf_references(
+            xr.Dataset(variables, coords=coordinates, attrs=source.attrs.copy()),
+            renames=variable_names,
+        )
         delayed = template.to_zarr(
             output,
             mode="w",

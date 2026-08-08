@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 import itertools
 from pathlib import Path
 import shutil
 import time
+from queue import Empty
 from typing import Iterable
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ import numpy as np
 import xarray as xr
 import zarr
 
+from ..metadata import sanitize_cf_references
 from ..rechunking.models import DatasetInfo, VariableInfo
 from ..publication import publish_staging
 from ..runtime import configure_process_runtime, spawn_context
@@ -312,10 +314,10 @@ def _build_output_encoding(
                 codec = output_layout.coordinate_codec if item.is_coord else None
             else:
                 codec = layout_item.codec
-            compressor = compressor_from_spec(codec)
-            if compressor is None:
-                entry.pop("compressors", None)
-            else:
+            # ``None`` means this layout changes chunks only. Preserve the
+            # existing source codec instead of silently writing uncompressed.
+            if codec is not None:
+                compressor = compressor_from_spec(codec)
                 entry["compressors"] = [compressor]
         encoding[name] = entry
     return encoding
@@ -698,6 +700,7 @@ def _build_output_skeleton(
             "resampling_statistics_policy": plan.statistics_policy,
         }
     )
+    output = sanitize_cf_references(output)
     for variable in output.variables.values():
         _clean_attrs(variable)
     encoding = _build_output_encoding(
@@ -759,12 +762,18 @@ def _needs_intermediate(
     plan: ResamplePlan,
     intermediate_chunks: dict[str, tuple[int, ...]],
 ) -> bool:
+    """Return whether time batches would partially update one output chunk."""
+
     for item in info.data_variables:
         if item.name not in intermediate_chunks or "time" not in item.dims:
             continue
         if "lat" not in item.dims or "lon" not in item.dims:
             continue
-        if intermediate_chunks[item.name] != plan.output_chunks[item.name]:
+        time_axis = item.dims.index("time")
+        if (
+            intermediate_chunks[item.name][time_axis]
+            != plan.output_chunks[item.name][time_axis]
+        ):
             return True
     return False
 
@@ -794,61 +803,53 @@ def _relative_region(
     )
 
 
-def _merge_intermediate_variable(
-    intermediate_group,
-    final_group,
-    name: str,
+def _merge_intermediate_region(
+    source_array,
+    target_array,
+    region: tuple[slice, ...],
     temporary_root: Path,
-) -> None:
-    """Assemble compute chunks and write each final chunk exactly once."""
+) -> int:
+    """Assemble one final chunk from compute chunks and write it once."""
 
-    source_array = intermediate_group[name]
-    target_array = final_group[name]
-    for region in _chunk_regions(
-        tuple(int(size) for size in target_array.shape),
-        tuple(int(chunk) for chunk in target_array.chunks),
-    ):
-        buffer_shape = tuple(int(part.stop - part.start) for part in region)
-        buffer_path = temporary_root / f".resample-buffer-{uuid4().hex}.bin"
-        buffer = np.memmap(
-            buffer_path,
-            mode="w+",
-            dtype=np.dtype(target_array.dtype),
-            shape=buffer_shape,
-        )
+    buffer_shape = tuple(int(part.stop - part.start) for part in region)
+    buffer_path = temporary_root / f".resample-buffer-{uuid4().hex}.bin"
+    buffer = np.memmap(
+        buffer_path,
+        mode="w+",
+        dtype=np.dtype(target_array.dtype),
+        shape=buffer_shape,
+    )
+    try:
+        starts = [
+            range(
+                int(part.start),
+                int(part.stop),
+                max(1, int(source_chunk)),
+            )
+            for part, source_chunk in zip(region, source_array.chunks)
+        ]
+        for origin in itertools.product(*starts):
+            subregion = tuple(
+                slice(
+                    int(start),
+                    min(int(start) + int(source_chunk), int(part.stop)),
+                )
+                for start, source_chunk, part in zip(
+                    origin,
+                    source_array.chunks,
+                    region,
+                )
+            )
+            buffer[_relative_region(region, subregion)] = source_array[subregion]
+        buffer.flush()
+        target_array[region] = buffer
+        return int(np.prod(buffer_shape, dtype=np.int64)) * np.dtype(target_array.dtype).itemsize
+    finally:
+        del buffer
         try:
-            starts = [
-                range(
-                    int(part.start),
-                    int(part.stop),
-                    max(1, int(source_chunk)),
-                )
-                for part, source_chunk in zip(region, source_array.chunks)
-            ]
-            for origin in itertools.product(*starts):
-                subregion = tuple(
-                    slice(
-                        int(start),
-                        min(
-                            int(start) + int(source_chunk),
-                            int(part.stop),
-                        ),
-                    )
-                    for start, source_chunk, part in zip(
-                        origin,
-                        source_array.chunks,
-                        region,
-                    )
-                )
-                buffer[_relative_region(region, subregion)] = source_array[subregion]
-            buffer.flush()
-            target_array[region] = buffer
-        finally:
-            del buffer
-            try:
-                buffer_path.unlink()
-            except OSError:
-                pass
+            buffer_path.unlink()
+        except OSError:
+            pass
 
 
 def _merge_intermediate_store(
@@ -857,23 +858,88 @@ def _merge_intermediate_store(
     spatial_items: tuple[VariableInfo, ...],
     temporary_root: Path,
     *,
+    workers: int,
     progress: bool,
-) -> None:
+    cancel_event=None,
+) -> dict[str, float | int]:
+    """Merge disjoint final chunks with bounded I/O concurrency."""
+
     source_group = zarr.open_group(intermediate, mode="r")
     target_group = zarr.open_group(staging, mode="r+")
-    try:
-        for index, item in enumerate(spatial_items, start=1):
-            _merge_intermediate_variable(
-                source_group,
-                target_group,
-                item.name,
-                temporary_root,
+    merge_workers = max(1, min(2, int(workers)))
+    tasks = (
+        (item.name, region)
+        for item in spatial_items
+        for region in _chunk_regions(
+            tuple(int(size) for size in target_group[item.name].shape),
+            tuple(int(chunk) for chunk in target_group[item.name].chunks),
+        )
+    )
+    total = sum(
+        int(np.prod([
+            (int(size) + int(chunk) - 1) // int(chunk)
+            for size, chunk in zip(
+                target_group[item.name].shape,
+                target_group[item.name].chunks,
             )
-            if progress:
-                print(f"中转数据合并：{index}/{len(spatial_items)} 个变量")
+        ], dtype=np.int64))
+        for item in spatial_items
+    )
+    completed = 0
+    logical_bytes = 0
+    started = time.perf_counter()
+    executor = ThreadPoolExecutor(max_workers=merge_workers)
+    pending = set()
+    task_iter = iter(tasks)
+
+    def submit(task):
+        name, region = task
+        return executor.submit(
+            _merge_intermediate_region,
+            source_group[name],
+            target_group[name],
+            region,
+            temporary_root,
+        )
+
+    try:
+        exhausted = False
+        while pending or not exhausted:
+            if cancel_event is not None and cancel_event.is_set():
+                for future in pending:
+                    future.cancel()
+                raise ResampleExecutionError("任务已取消，未生成输出。")
+            while not exhausted and len(pending) < merge_workers * 2:
+                try:
+                    pending.add(submit(next(task_iter)))
+                except StopIteration:
+                    exhausted = True
+            if not pending:
+                continue
+            done, pending = wait(
+                pending,
+                timeout=0.5,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                logical_bytes += int(future.result())
+                completed += 1
+                if progress and (
+                    completed == 1
+                    or completed == total
+                    or completed % max(1, total // 20) == 0
+                ):
+                    print(f"中转数据合并：{completed}/{total} 个最终 chunk", flush=True)
     finally:
+        executor.shutdown(wait=True, cancel_futures=True)
         source_group.store.close() if hasattr(source_group.store, "close") else None
         target_group.store.close() if hasattr(target_group.store, "close") else None
+    return {
+        "tasks": completed,
+        "workers": merge_workers,
+        "logical_bytes": logical_bytes,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
 
 
 def _initialize_output_store(
@@ -977,6 +1043,7 @@ def _resample_tile_variable(
     before_replacements,
     after_replacements,
     statistics: dict[str, float],
+    batch_progress=None,
 ) -> dict[str, float]:
     source_variable = source[item.name]
     prepared = _mask_missing(source_variable, item)
@@ -1054,6 +1121,8 @@ def _resample_tile_variable(
         )
         timing["write"] += time.perf_counter() - write_started
         del subset, result, values
+        if batch_progress is not None:
+            batch_progress(item.name, time_start, time_stop)
     return timing
 
 
@@ -1066,6 +1135,7 @@ def _initialize_space_worker(
     plan: ResamplePlan,
     spatial_items: tuple[VariableInfo, ...],
     workdir: str,
+    progress_queue=None,
 ) -> None:
     """Open one input/output handle per spawned spatial worker."""
 
@@ -1084,6 +1154,7 @@ def _initialize_space_worker(
         plan=plan,
         spatial_items=spatial_items,
         workdir=Path(workdir),
+        progress_queue=progress_queue,
     )
 
 
@@ -1097,6 +1168,7 @@ def _process_space_tile(
     plan = _SPACE_WORKER_STATE["plan"]
     spatial_items = _SPACE_WORKER_STATE["spatial_items"]
     workdir = _SPACE_WORKER_STATE["workdir"]
+    progress_queue = _SPACE_WORKER_STATE.get("progress_queue")
     assert isinstance(source, xr.Dataset)
     assert isinstance(output_group, zarr.Group)
     assert isinstance(plan, ResamplePlan)
@@ -1112,6 +1184,19 @@ def _process_space_tile(
     )
     if source_lat_slice is None or source_lon_slice is None:
         _fill_missing_tile(output_group, spatial_items, plan, task)
+        if progress_queue is not None:
+            progress_queue.put(
+                sum(
+                    (
+                        int(item.shape[item.dims.index("time")])
+                        + plan.time_block
+                        - 1
+                    )
+                    // plan.time_block
+                    for item in spatial_items
+                    if "time" in item.dims
+                )
+            )
         return _TileMetrics(task, False, time.perf_counter() - started)
 
     grid = plan.inspection.grid
@@ -1144,28 +1229,36 @@ def _process_space_tile(
         )
         weight_seconds = time.perf_counter() - weights_started
         for item in spatial_items:
-            _add_timing(timing, _resample_tile_variable(
-                source,
-                item,
-                regridder,
-                output_group,
-                plan.target,
-                lat_start,
-                lat_stop,
-                lon_start,
-                lon_stop,
-                source_lat_slice,
-                source_lon_slice,
-                target_tile,
-                plan.skipna,
-                plan.na_thres,
-                plan.time_block,
-                plan.compute_workers,
-                plan.compute_dtype,
-                plan.before_replacements,
-                plan.after_replacements,
-                plan.statistics.get(item.name, {}),
-            ))
+            _add_timing(
+                timing,
+                _resample_tile_variable(
+                    source,
+                    item,
+                    regridder,
+                    output_group,
+                    plan.target,
+                    lat_start,
+                    lat_stop,
+                    lon_start,
+                    lon_stop,
+                    source_lat_slice,
+                    source_lon_slice,
+                    target_tile,
+                    plan.skipna,
+                    plan.na_thres,
+                    plan.time_block,
+                    plan.compute_workers,
+                    plan.compute_dtype,
+                    plan.before_replacements,
+                    plan.after_replacements,
+                    plan.statistics.get(item.name, {}),
+                    (
+                        (lambda _name, _start, _stop: progress_queue.put(1))
+                        if progress_queue is not None
+                        else None
+                    ),
+                ),
+            )
         return _TileMetrics(
             task,
             True,
@@ -1298,11 +1391,33 @@ def _run_parallel_tiles(
     """Run bounded, spawn-safe spatial work without submitting all tiles."""
 
     context = spawn_context()
+    progress_queue = context.Queue()
+    batches_per_tile = sum(
+        (
+            int(item.shape[item.dims.index("time")])
+            + plan.time_block
+            - 1
+        )
+        // plan.time_block
+        for item in spatial_items
+        if "time" in item.dims
+    )
+    total_batches = max(0, int(total_tasks) * batches_per_tile)
+    completed_batches = 0
+    report_interval = max(1, total_batches // 20) if total_batches else 1
+    next_report = report_interval
     executor = ProcessPoolExecutor(
         max_workers=max(1, int(plan.space_workers)),
         mp_context=context,
         initializer=_initialize_space_worker,
-        initargs=(str(source_path), str(staging), plan, spatial_items, str(workdir)),
+        initargs=(
+            str(source_path),
+            str(staging),
+            plan,
+            spatial_items,
+            str(workdir),
+            progress_queue,
+        ),
     )
     pending = set()
     task_iter = iter(tasks)
@@ -1311,6 +1426,23 @@ def _run_parallel_tiles(
     timing = _empty_timing()
     weight_seconds = 0.0
     tile_elapsed = 0.0
+
+    def drain_batch_progress() -> None:
+        nonlocal completed_batches, next_report
+        while True:
+            try:
+                completed_batches += int(progress_queue.get_nowait())
+            except Empty:
+                break
+        if progress and total_batches and (
+            completed_batches >= next_report or completed_batches >= total_batches
+        ):
+            print(
+                f"重采样时间批次：{min(completed_batches, total_batches)}/{total_batches}",
+                flush=True,
+            )
+            while next_report <= completed_batches:
+                next_report += report_interval
     try:
         while pending or not cancelled:
             if cancel_event is not None and cancel_event.is_set():
@@ -1336,6 +1468,7 @@ def _run_parallel_tiles(
                 timeout=0.5,
                 return_when=FIRST_COMPLETED,
             )
+            drain_batch_progress()
             if not done:
                 continue
             if cancelled:
@@ -1370,6 +1503,9 @@ def _run_parallel_tiles(
                 raise ResampleExecutionError("任务已取消，未生成输出。")
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+        drain_batch_progress()
+        progress_queue.close()
+        progress_queue.join_thread()
     return {
         "tiles": float(completed),
         "tile_elapsed_seconds": tile_elapsed,
@@ -1377,6 +1513,8 @@ def _run_parallel_tiles(
         "read_seconds": timing["read"],
         "regrid_seconds": timing["regrid"],
         "write_seconds": timing["write"],
+        "time_batches": float(completed_batches),
+        "total_time_batches": float(total_batches),
     }
 
 
@@ -1966,15 +2104,18 @@ def run_resample(
                 except OSError:
                     pass
 
+        merge_metrics = None
         if use_intermediate:
             if progress:
                 print("开始将中转数据合并为最终输出 chunks……")
-            _merge_intermediate_store(
+            merge_metrics = _merge_intermediate_store(
                 processing_path,
                 staging,
                 spatial_items,
                 temporary_root,
+                workers=runtime_plan.space_workers,
                 progress=progress,
+                cancel_event=cancel_event,
             )
 
         after_statistics: dict[str, dict[str, float]] = {}
@@ -2049,7 +2190,23 @@ def run_resample(
             "logical_write_amplification": 2.0 if use_intermediate else 1.0,
             "space_workers": min(runtime_plan.space_workers, total_tiles),
             "compute_workers_per_space_worker": runtime_plan.compute_workers,
+            "memory_plan": (
+                {
+                    "available_bytes": runtime_plan.auto_tile.available_bytes,
+                    "budget_bytes": runtime_plan.auto_tile.budget_bytes,
+                    "estimated_worker_peak_bytes": runtime_plan.auto_tile.estimated_peak_bytes,
+                    "estimated_parallel_peak_bytes": (
+                        runtime_plan.auto_tile.estimated_peak_bytes
+                        * min(runtime_plan.space_workers, total_tiles)
+                    ),
+                    "fits_budget": runtime_plan.auto_tile.fits_budget,
+                    "warning": runtime_plan.auto_tile.warning,
+                }
+                if runtime_plan.auto_tile is not None
+                else None
+            ),
             "temporary_dir": str(temporary_root),
+            "merge_timing": merge_metrics,
             "tile_timing": tile_timing,
             "replacement_statistics": {
                 "before": before_statistics,

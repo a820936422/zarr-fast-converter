@@ -17,6 +17,7 @@ import psutil
 import xarray as xr
 import zarr
 
+from ..metadata import sanitize_cf_references
 from .compression import codec_for, make_compression_plan
 from .inspection import inspect_store
 from .models import ChunkPlan, CompressionPlan, DatasetInfo
@@ -1479,6 +1480,7 @@ def run_rechunk(
             decode_times=False,
             mask_and_scale=False,
         )
+        sanitize_cf_references(dataset)
         if not info.data_variables:
             raise RechunkExecutionError("没有可写入的数据变量。")
         data3d = [variable for variable in info.data_variables if variable.ndim == 3]

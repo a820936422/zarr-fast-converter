@@ -6,6 +6,91 @@ import numpy as np
 
 from .models import Inventory, OutputLayout, Selection, VariableTransform
 
+def validate_semantic_samples(
+    output: Path,
+    constraints: dict[str, dict[str, float | bool]] | None = None,
+    *,
+    points_per_axis: int = 3,
+) -> dict[str, object]:
+    """Report bounded value-domain checks without modifying scientific data."""
+
+    import zarr
+
+    group = zarr.open_group(output, mode="r")
+    requested = constraints or {}
+    checks: dict[str, dict[str, object]] = {}
+    warnings: list[str] = []
+    for name in group.array_keys():
+        array = group[name]
+        dimensions = tuple(array.metadata.dimension_names or ())
+        if not {"time", "lat", "lon"}.issubset(dimensions):
+            continue
+        dtype = np.dtype(array.dtype)
+        if dtype.kind not in "iuf":
+            continue
+        indices = {
+            dimension: np.unique(
+                np.linspace(
+                    0,
+                    int(array.shape[axis]) - 1,
+                    min(max(1, points_per_axis), int(array.shape[axis])),
+                    dtype=int,
+                )
+            )
+            for axis, dimension in enumerate(dimensions)
+        }
+        selection = tuple(indices[dimension] for dimension in dimensions)
+        values = np.asarray(array.oindex[selection], dtype="float64")
+        finite = values[np.isfinite(values)]
+        attrs = dict(array.attrs)
+        variable_constraints = dict(requested.get(name) or {})
+        descriptor = " ".join(
+            str(attrs.get(key, "")) for key in ("standard_name", "long_name")
+        ).lower()
+        inferred_nonnegative = "standard_error" in descriptor or "uncertainty" in descriptor
+        nonnegative = bool(variable_constraints.get("nonnegative", inferred_nonnegative))
+        minimum = (
+            float(variable_constraints["min"])
+            if "min" in variable_constraints
+            else float(attrs["valid_min"])
+            if "valid_min" in attrs
+            else None
+        )
+        maximum = (
+            float(variable_constraints["max"])
+            if "max" in variable_constraints
+            else float(attrs["valid_max"])
+            if "valid_max" in attrs
+            else None
+        )
+        violations = []
+        if finite.size and nonnegative and np.any(finite < 0):
+            violations.append(f"发现 {int(np.count_nonzero(finite < 0))} 个负值")
+        if finite.size and minimum is not None and np.any(finite < minimum):
+            violations.append(f"存在小于 {minimum:g} 的值")
+        if finite.size and maximum is not None and np.any(finite > maximum):
+            violations.append(f"存在大于 {maximum:g} 的值")
+        if violations:
+            warnings.append(f"{name}: " + "；".join(violations))
+        checks[name] = {
+            "samples": int(values.size),
+            "finite": int(finite.size),
+            "minimum": float(finite.min()) if finite.size else None,
+            "maximum": float(finite.max()) if finite.size else None,
+            "nonnegative": nonnegative,
+            "required_min": minimum,
+            "required_max": maximum,
+            "violations": violations,
+        }
+    close = getattr(group.store, "close", None)
+    if close is not None:
+        close()
+    return {
+        "status": "warning" if warnings else "passed",
+        "checks": checks,
+        "warnings": warnings,
+    }
+
 
 def _lookup(inventory: Inventory, selection: Selection) -> list[tuple[Path, int]]:
     mapping = {}

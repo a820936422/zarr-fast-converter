@@ -54,8 +54,8 @@ class VersionTests(unittest.TestCase):
     def test_window_title_displays_release_version(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = MainWindow()
-        self.assertEqual(__version__, "1.6.3")
-        self.assertIn("v1.6.3", window.windowTitle())
+        self.assertEqual(__version__, "1.6.4")
+        self.assertIn("v1.6.4", window.windowTitle())
         window.close()
         app.processEvents()
 
@@ -188,7 +188,7 @@ class GuiServiceTests(unittest.TestCase):
         window = MainWindow()
         self.assertEqual(window.navigation.count(), 6)
         self.assertEqual(window.stack.count(), 6)
-        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.3")
+        self.assertEqual(window.windowTitle(), "快速 Zarr 转换器 v1.6.4")
         self.assertEqual(
             [
                 window.navigation.item(index).text()

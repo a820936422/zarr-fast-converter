@@ -31,6 +31,7 @@ from ..resampling.grid import _axis_bounds
 from ..resampling.environment import validate_resampling_environment
 from ..resampling.models import GridInfo, ResampleConfig
 from ..resampling.replacements import apply_replacement_rules, parse_replacement_rules
+from ..validation import validate_semantic_samples
 from .models import (
     PipelineConfig,
     PipelinePaths,
@@ -473,6 +474,21 @@ def preview_pipeline(inspection, config: PipelineConfig) -> PipelinePlan | ZarrP
     return plan
 
 
+def _semantic_validation(
+    output: Path,
+    config: PipelineConfig,
+    *,
+    progress: bool,
+) -> dict[str, object] | None:
+    if not config.validate:
+        return None
+    result = validate_semantic_samples(output, config.semantic_constraints)
+    if progress:
+        for warning in result.get("warnings", []):
+            print(f"语义检查提醒：{warning}", flush=True)
+    return result
+
+
 def _run_zarr_pipeline(
     inspection,
     config: PipelineConfig,
@@ -522,6 +538,7 @@ def _run_zarr_pipeline(
             plan.resample_plan.target.spatial_extent if plan.resample_plan else None
         ),
         "config": asdict(config),
+        "output_layout": asdict(plan.output_layout) if plan.output_layout else None,
         "resolved_compression": (
             asdict(plan.final_compression) if plan.final_compression is not None else None
         ),
@@ -582,6 +599,7 @@ def _run_zarr_pipeline(
                     compute_workers=options.compute_workers,
                     space_workers=options.space_workers,
                     temporary_dir=paths.root,
+                    output_layout=plan.output_layout,
                     before_replacements=parse_replacement_rules(
                         options.before_conditions, options.before_results
                     ),
@@ -676,16 +694,28 @@ def _run_zarr_pipeline(
             if plan.needs_resample and config.general.cleanup_intermediate:
                 shutil.rmtree(current)
                 manifest["stages"]["resampling"]["status"] = "validated_and_cleaned"
+        semantic_validation = _semantic_validation(output, config, progress=progress)
+        manifest["semantic_validation"] = semantic_validation
         final_output_bytes = int(
             (finalization_metrics or resample_metrics or {}).get(
                 "logical_bytes", plan.input_info.logical_bytes
             )
         )
-        temporary_write_bytes = (
-            int((resample_metrics or {}).get("logical_bytes", final_output_bytes))
-            if plan.needs_resample and plan.finalization_required
-            else 0
-        )
+        temporary_write_bytes = 0
+        if plan.needs_resample:
+            temporary_write_bytes += int(
+                (resample_metrics or {}).get("intermediate_logical_bytes", 0)
+            )
+            if plan.finalization_required:
+                temporary_write_bytes += int(
+                    (resample_metrics or {}).get("logical_bytes", final_output_bytes)
+                )
+        if plan.finalization_required:
+            # Rechunking materializes one complete intermediate before writing
+            # final staging. The staging bytes are counted as final output.
+            temporary_write_bytes += int(
+                (finalization_metrics or {}).get("logical_bytes", final_output_bytes)
+            )
         logical_io = {
             "final_output_bytes": final_output_bytes,
             "temporary_write_bytes": temporary_write_bytes,
@@ -693,6 +723,16 @@ def _run_zarr_pipeline(
             "write_amplification": (
                 (final_output_bytes + temporary_write_bytes)
                 / max(1, final_output_bytes)
+            ),
+            "avoided_finalization_read_bytes": (
+                final_output_bytes
+                if plan.needs_resample and not plan.finalization_required
+                else 0
+            ),
+            "avoided_finalization_write_bytes": (
+                final_output_bytes
+                if plan.needs_resample and not plan.finalization_required
+                else 0
             ),
         }
         manifest["logical_io"] = logical_io
@@ -711,6 +751,7 @@ def _run_zarr_pipeline(
             "resampling": resample_metrics,
             "finalization": finalization_metrics,
             "mathematical_validation": validation_metrics,
+            "semantic_validation": semantic_validation,
             "logical_io": logical_io,
         }
     except Exception as exc:
@@ -1026,6 +1067,12 @@ def run_pipeline(
             if config.general.cleanup_intermediate:
                 shutil.rmtree(current, ignore_errors=False)
                 manifest["stages"]["resampling" if plan.needs_resample else "conversion"]["status"] = "validated_and_cleaned"
+        semantic_validation = _semantic_validation(
+            Path(config.general.output).expanduser().resolve(),
+            config,
+            progress=progress,
+        )
+        manifest["semantic_validation"] = semantic_validation
         final_logical_bytes = _logical_output_bytes(plan)
         temporary_logical_writes = 0
         if not conversion_is_final:
@@ -1072,6 +1119,7 @@ def run_pipeline(
             "conversion": conversion_metrics,
             "resampling": resample_metrics,
             "mathematical_validation": validation_metrics,
+            "semantic_validation": semantic_validation,
             "finalization": rechunk_metrics,
             "logical_io": logical_io,
         }

@@ -228,7 +228,8 @@ class TaskPage(QWidget):
 
     def update_resource(self, sample: dict[str, Any]) -> None:
         elapsed = float(sample.get("elapsed", 0.0))
-        cpu = float(sample.get("cpu", 0.0))
+        cpu = float(sample.get("cpu_machine_percent", sample.get("cpu", 0.0)))
+        cpu_cores = float(sample.get("cpu_cores", cpu / 100.0))
         memory = float(sample.get("rss_gib", 0.0))
         self.resource_times.append(elapsed)
         self.resource_cpu.append(cpu)
@@ -251,7 +252,7 @@ class TaskPage(QWidget):
             for column, value in enumerate(values):
                 self.disk_table.setItem(row, column, QTableWidgetItem(value))
         self.resource_label.setText(
-            f"资源：CPU {cpu:.1f}%；RSS {memory:.2f} GiB；"
+            f"资源：CPU {cpu_cores:.2f} 核 / 整机 {cpu:.1f}%；RSS {memory:.2f} GiB；"
             f"读取 {float(sample.get('read_mib_s', 0.0)):.1f} MiB/s；"
             f"写入 {float(sample.get('write_mib_s', 0.0)):.1f} MiB/s；"
             f"磁盘 {len(disks)} 个"

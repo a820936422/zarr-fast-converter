@@ -19,11 +19,11 @@ MIN_TILE_SIZE = 16
 # actual guardrail; this only exposes a useful larger candidate.
 MAX_TILE_SIZE = 1024
 MAX_AUTO_TIME_BLOCK = 64
-# Conservative ESMF regridders retain native coordinate/weight work buffers
-# in addition to the Python/Dask arrays modelled below.  Production telemetry
-# on a 0.05° -> 0.1° GOSIF job showed roughly 2 GiB RSS per worker, so retain
-# a deliberately conservative base before accepting a large tile.
-ESMF_WORKER_BASELINE_BYTES = int(1.5 * GIB)
+# ESMF retains native coordinate, sparse-weight and temporary work buffers
+# outside Python-managed arrays. Production conservative-resampling telemetry
+# observed 4.5--4.7 GiB RSS per process for 600 x 1024 target tiles. Reserve
+# 4 GiB before the explicit source/output/weight estimates below are added.
+ESMF_WORKER_BASELINE_BYTES = 4 * GIB
 
 
 @dataclass(frozen=True)
@@ -88,14 +88,12 @@ def resolve_auto_space_workers(
     )
     total = max(256 * MIB, int(detected_total if total_bytes is None else total_bytes))
     cpu_limit = max(1, min(int(maximum), int(os.cpu_count() or 1)))
-    # Reserve half of currently available memory for the application and OS.
-    # A conservative 1 GiB/process baseline covers ESMF plus decoded chunks;
-    # additional Dask threads receive a smaller allowance.
-    per_process = (1.5 + 0.25 * max(0, int(compute_workers) - 1)) * GIB
-    memory_limit = max(1, int((available * 0.50) / per_process))
-    # On systems where psutil reports an unusually optimistic available value,
-    # keep a second cap tied to physical memory as well.
-    total_limit = max(1, int((total * 0.35) / per_process))
+    # Keep enough headroom for the controller, filesystem cache and native
+    # libraries. The detailed tile model adds decoded arrays and weights; this
+    # baseline represents the ESMF process before those explicit buffers.
+    per_process = (4.0 + 0.25 * max(0, int(compute_workers) - 1)) * GIB
+    memory_limit = max(1, int((available * 0.60) / per_process))
+    total_limit = max(1, int((total * 0.50) / per_process))
     return max(1, min(cpu_limit, memory_limit, total_limit))
 
 
