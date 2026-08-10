@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import numpy as np
 from PySide6.QtCore import QDate, Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
@@ -87,6 +88,16 @@ from ..selection import parse_list
 from ..time_mapping import TimeInspectionResult, TimeRule, TimeFieldOption, inspect_time_metadata
 from .workers import TaskWorker
 from .path_picker import PathPicker, PathPickerSettings
+from .components import (
+    MetricCard,
+    PlanSummary,
+    ProgressHeader,
+    SectionCard,
+    StatusBadge,
+    Stepper,
+)
+from .state import GuiSessionState
+from .theme import apply_theme
 
 try:
     import pyqtgraph as pg
@@ -147,16 +158,32 @@ class TaskPage(QWidget):
         self.history: list[dict[str, Any]] = []
         self._active_history: dict[str, Any] | None = None
         layout = QVBoxLayout(self)
-        title = QLabel("任务与日志")
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(12)
+        title = QLabel("任务中心")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
-        self.status = QLabel("当前没有运行中的任务。")
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 1000)
-        self.progress.setVisible(False)
-        layout.addWidget(self.status)
-        layout.addWidget(self.progress)
+        subtitle = QLabel("查看当前任务、资源指标、运行日志和本次会话历史。")
+        subtitle.setObjectName("pageSubtitle")
+        layout.addWidget(subtitle)
+        self.progress_header = ProgressHeader()
+        self.status = self.progress_header.label
+        self.progress = self.progress_header.progress
+        layout.addWidget(self.progress_header)
+        metrics = QHBoxLayout()
+        metrics.setSpacing(8)
+        self.metric_cards = {
+            "cpu": MetricCard("CPU", "—", "暂无运行数据"),
+            "memory": MetricCard("RSS", "—", "暂无运行数据"),
+            "read": MetricCard("读取", "—", "暂无运行数据"),
+            "write": MetricCard("写入", "—", "暂无运行数据"),
+            "disk": MetricCard("磁盘", "—", "暂无运行数据"),
+        }
+        for card in self.metric_cards.values():
+            metrics.addWidget(card, 1)
+        layout.addLayout(metrics)
         self.resource_label = QLabel("资源：暂无运行数据")
+        self.resource_label.setObjectName("helperText")
         layout.addWidget(self.resource_label)
         self.cpu_plot = None
         self.memory_plot = None
@@ -166,23 +193,32 @@ class TaskPage(QWidget):
         self.resource_cpu: list[float] = []
         self.resource_memory: list[float] = []
         if pg is not None:
-            resource_row = QHBoxLayout()
+            resource_group = QGroupBox("资源曲线")
+            resource_row = QHBoxLayout(resource_group)
             self.cpu_plot = pg.PlotWidget(title="CPU 使用率")
             self.cpu_plot.setMinimumHeight(110)
             self.cpu_plot.setMaximumHeight(155)
             self.cpu_plot.setLabel("left", "CPU", units="%")
             self.cpu_plot.setLabel("bottom", "运行时间", units="s")
-            self.cpu_curve = self.cpu_plot.plot(pen=pg.mkPen("#3daee9", width=2))
+            self.cpu_curve = self.cpu_plot.plot(pen=pg.mkPen("#2563EB", width=2))
             self.memory_plot = pg.PlotWidget(title="内存使用")
             self.memory_plot.setMinimumHeight(110)
             self.memory_plot.setMaximumHeight(155)
             self.memory_plot.setLabel("left", "RSS", units="GiB")
             self.memory_plot.setLabel("bottom", "运行时间", units="s")
-            self.memory_curve = self.memory_plot.plot(pen=pg.mkPen("#e67e22", width=2))
+            self.memory_curve = self.memory_plot.plot(pen=pg.mkPen("#7C3AED", width=2))
+            for plot in (self.cpu_plot, self.memory_plot):
+                plot.setBackground("#FFFFFF")
+                plot.showGrid(x=True, y=True, alpha=0.15)
+                for axis_name in ("left", "bottom"):
+                    axis = plot.getAxis(axis_name)
+                    axis.setPen("#CBD5E1")
+                    axis.setTextPen("#64748B")
             resource_row.addWidget(self.cpu_plot)
             resource_row.addWidget(self.memory_plot)
-            layout.addLayout(resource_row)
-        layout.addWidget(QLabel("本次任务涉及的磁盘"))
+            layout.addWidget(resource_group)
+        disk_group = QGroupBox("本次任务涉及的磁盘")
+        disk_layout = QVBoxLayout(disk_group)
         self.disk_table = QTableWidget(0, 7)
         self.disk_table.setHorizontalHeaderLabels(
             ("用途", "设备", "挂载点", "已用", "可用", "读取", "写入")
@@ -202,26 +238,33 @@ class TaskPage(QWidget):
             )
         self.disk_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.disk_table.setMaximumHeight(125)
-        layout.addWidget(self.disk_table)
+        disk_layout.addWidget(self.disk_table)
+        layout.addWidget(disk_group)
+        log_group = QGroupBox("运行日志")
+        log_layout = QVBoxLayout(log_group)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("检查和写入任务的运行日志会显示在这里。")
-        layout.addWidget(self.log, 1)
+        log_layout.addWidget(self.log)
+        layout.addWidget(log_group, 1)
         actions = QHBoxLayout()
         self.cancel = _button("请求取消", self._cancel_requested)
+        self.cancel.setObjectName("dangerButton")
         self.cancel.setEnabled(False)
         actions.addWidget(self.cancel)
         actions.addStretch(1)
         actions.addWidget(_button("清空日志", self.log.clear))
         actions.addWidget(_button("清空历史", self.clear_history))
         layout.addLayout(actions)
+        history_group = QGroupBox("任务历史（当前会话）")
+        history_layout = QVBoxLayout(history_group)
         self.history_table = QTableWidget(0, 4)
         self.history_table.setHorizontalHeaderLabels(("开始时间", "任务", "状态", "耗时"))
         self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.setMaximumHeight(170)
-        layout.addWidget(QLabel("任务历史（当前会话）"))
-        layout.addWidget(self.history_table)
+        history_layout.addWidget(self.history_table)
+        layout.addWidget(history_group)
         self.cancel_callback: Callable[[], None] | None = None
 
     def _disable_task_logs(self, exc: BaseException) -> None:
@@ -316,6 +359,8 @@ class TaskPage(QWidget):
         self.resource_times.clear()
         self.resource_cpu.clear()
         self.resource_memory.clear()
+        for card in self.metric_cards.values():
+            card.set_value("—", "等待运行数据")
         self.disk_table.setRowCount(0)
         if self.cpu_curve is not None:
             self.cpu_curve.setData([], [])
@@ -364,10 +409,24 @@ class TaskPage(QWidget):
             )
             for column, value in enumerate(values):
                 self.disk_table.setItem(row, column, QTableWidgetItem(value))
+        read_rate = float(sample.get("read_mib_s", 0.0))
+        write_rate = float(sample.get("write_mib_s", 0.0))
+        free_gib = sum(float(disk.get("free_gib", 0.0)) for disk in disks)
+        self.metric_cards["cpu"].set_value(
+            f"{cpu_cores:.2f} 核", f"整机占用 {cpu:.1f}%"
+        )
+        self.metric_cards["memory"].set_value(
+            f"{memory:.2f} GiB", f"采样时间 {elapsed:.1f} s"
+        )
+        self.metric_cards["read"].set_value(f"{read_rate:.1f} MiB/s", "当前读取速率")
+        self.metric_cards["write"].set_value(f"{write_rate:.1f} MiB/s", "当前写入速率")
+        self.metric_cards["disk"].set_value(
+            f"{free_gib:.1f} GiB", f"{len(disks)} 个挂载点可用空间"
+        )
         self.resource_label.setText(
             f"资源：CPU {cpu_cores:.2f} 核 / 整机 {cpu:.1f}%；RSS {memory:.2f} GiB；"
-            f"读取 {float(sample.get('read_mib_s', 0.0)):.1f} MiB/s；"
-            f"写入 {float(sample.get('write_mib_s', 0.0)):.1f} MiB/s；"
+            f"读取 {read_rate:.1f} MiB/s；"
+            f"写入 {write_rate:.1f} MiB/s；"
             f"磁盘 {len(disks)} 个"
         )
         self._event("resource", sample)
@@ -525,9 +584,17 @@ class InspectionPage(QWidget):
         self.result: InspectionResult | None = None
         self.time_result: TimeInspectionResult | None = None
         root = QVBoxLayout(self)
-        title = QLabel("数据检查模块")
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(12)
+        title = QLabel("数据检查")
         title.setObjectName("pageTitle")
         root.addWidget(title)
+        subtitle = QLabel("先确认输入和时间规则，再执行全文件结构检查。")
+        subtitle.setObjectName("pageSubtitle")
+        root.addWidget(subtitle)
+        self.stepper = Stepper(("输入数据", "时间规则", "结构结果"))
+        self.stepper.set_current(0)
+        root.addWidget(self.stepper)
         root.addWidget(QLabel("必须先确认文件名与 time 维度如何共同构建完整日期，之后才能检查数据结构和进入转换。"))
 
         inputs = QGroupBox("检查输入")
@@ -598,11 +665,16 @@ class InspectionPage(QWidget):
         actions.addStretch(1)
         root.addLayout(actions)
 
+        status_row = QHBoxLayout()
+        self.status_badge = StatusBadge("未检查", "neutral")
         self.status = QLabel("尚未检查。")
-        root.addWidget(self.status)
+        status_row.addWidget(self.status_badge)
+        status_row.addWidget(self.status, 1)
+        root.addLayout(status_row)
         self.report = QTextBrowser()
         self.report.setOpenExternalLinks(False)
         root.addWidget(self.report, 1)
+        self._set_status("尚未检查。", "neutral", 0)
         self.path.textChanged.connect(self._invalidate_time_check)
         self.input_kind.currentIndexChanged.connect(self._input_kind_changed)
         self.engine.currentIndexChanged.connect(self._invalidate_time_check)
@@ -612,6 +684,20 @@ class InspectionPage(QWidget):
             edit.textChanged.connect(self._invalidate_structure_check)
         for combo in self.time_panel.combos.values():
             combo.currentIndexChanged.connect(self._invalidate_structure_check)
+    def _set_status(self, text: str, status: str = "neutral", step: int | None = None) -> None:
+        self.status.setText(text)
+        self.status_badge.set_status(
+            {
+                "success": "通过",
+                "warning": "需确认",
+                "danger": "失败",
+                "info": "检查中",
+                "neutral": "未开始",
+            }.get(status, "未开始"),
+            status,
+        )
+        if step is not None:
+            self.stepper.set_current(step)
 
     def _input_kind_changed(self, *_args) -> None:
         self._invalidate_time_check()
@@ -640,7 +726,7 @@ class InspectionPage(QWidget):
             QMessageBox.warning(self, "缺少输入", "请选择源数据目录。")
             return
         if self.input_kind.currentData() == "temporary":
-            self.status.setText("正在检查临时任务清单和已验证的中间 Zarr。")
+            self._set_status("正在检查临时任务清单和已验证的中间 Zarr。", "info", 0)
             self.task_requested.emit(
                 "检查临时处理产物",
                 lambda cancel_event: _run_cancelable(
@@ -650,7 +736,7 @@ class InspectionPage(QWidget):
             )
             return
         if self.input_kind.currentData() == "zarr":
-            self.status.setText("正在检查现有 Zarr 元数据。")
+            self._set_status("正在检查现有 Zarr 元数据。", "info", 0)
             self.task_requested.emit(
                 "检查现有 Zarr",
                 lambda cancel_event: _run_cancelable(
@@ -667,7 +753,7 @@ class InspectionPage(QWidget):
             engine=self.engine.currentData(),
             workers=workers,
         )
-        self.status.setText("正在检查文件名和 time 维度信息，请在任务与日志页面查看进度。")
+        self._set_status("正在检查文件名和 time 维度信息，请在任务与日志页面查看进度。", "info", 1)
         self.task_requested.emit(
             "检查文件时间维度信息",
             lambda cancel_event: inspect_time_metadata(
@@ -682,14 +768,14 @@ class InspectionPage(QWidget):
     def _zarr_inspection_done(self, result: InspectionResult) -> None:
         self.result = result
         self.report.setPlainText(result.report)
-        self.status.setText("Zarr 检查完成，请进入处理流程选择操作。")
+        self._set_status("Zarr 检查完成，请进入处理流程选择操作。", "success", 2)
         self.save_button.setEnabled(False)
         self.zarr_result_ready.emit(result)
 
     def _temporary_inspection_done(self, result: InspectionResult) -> None:
         self.result = result
         self.report.setPlainText(result.report)
-        self.status.setText("临时处理产物可用，请进入处理流程继续执行。")
+        self._set_status("临时处理产物可用，请进入处理流程继续执行。", "success", 2)
         self.save_button.setEnabled(False)
         self.zarr_result_ready.emit(result)
 
@@ -699,7 +785,7 @@ class InspectionPage(QWidget):
         self.time_panel.set_result(result)
         self.mapping_group.setEnabled(result.time_dimension.exists)
         self.confirm_time_button.setEnabled(True)
-        self.status.setText("时间信息检查完成，请确认完整时间来源或组合字段。")
+        self._set_status("时间信息检查完成，请确认完整时间来源或组合字段。", "warning", 1)
 
     def _request_structure_inspection(self) -> None:
         if self.time_result is None:
@@ -729,7 +815,7 @@ class InspectionPage(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "时间规则不完整", str(exc))
             return
-        self.status.setText("正在检查变量、空间网格和属性，请在任务与日志页面查看进度。")
+        self._set_status("正在检查变量、空间网格和属性，请在任务与日志页面查看进度。", "info", 2)
         self.task_requested.emit(
             "检查数据结构",
             lambda cancel_event: inspect_source(config, cancel_event=cancel_event),
@@ -740,9 +826,9 @@ class InspectionPage(QWidget):
         self.result = result
         self.report.setPlainText(result.report)
         if result.warnings:
-            self.status.setText("检查完成，但存在警告：" + "；".join(result.warnings))
+            self._set_status("检查完成，但存在警告：" + "；".join(result.warnings), "warning", 2)
         else:
-            self.status.setText("检查通过，可以进入转换模块。")
+            self._set_status("检查通过，可以进入转换模块。", "success", 2)
         self.save_button.setEnabled(True)
         self.result_ready.emit(result)
 
@@ -757,7 +843,7 @@ class InspectionPage(QWidget):
         self.mapping_group.setEnabled(False)
         self.save_button.setEnabled(False)
         self.report.clear()
-        self.status.setText("检查参数已改变，请重新检查文件时间维度信息。")
+        self._set_status("检查参数已改变，请重新检查文件时间维度信息。", "warning", 0)
         if had_result:
             self.result_invalidated.emit()
 
@@ -766,7 +852,7 @@ class InspectionPage(QWidget):
             return
         self.result = None
         self.save_button.setEnabled(False)
-        self.status.setText("结构检查参数已改变，请重新检查数据结构。")
+        self._set_status("结构检查参数已改变，请重新检查数据结构。", "warning", 2)
         self.result_invalidated.emit()
 
     def _save_snapshot(self) -> None:
@@ -821,7 +907,7 @@ class InspectionPage(QWidget):
         self.result = result
         self.report.setPlainText(result.report)
         self.save_button.setEnabled(True)
-        self.status.setText("检查快照已导入，可以直接进入转换模块。")
+        self._set_status("检查快照已导入，可以直接进入转换模块。", "success", 2)
         self.result_ready.emit(result)
 
 
@@ -840,10 +926,15 @@ class ConversionPage(QWidget):
         self.inspection: InspectionResult | None = None
         self.preview: ConversionPreview | None = None
         root = QVBoxLayout(self)
-        title = QLabel("转换模块")
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(12)
+        title = QLabel("转换")
         title.setObjectName("pageTitle")
         root.addWidget(title)
-        root.addWidget(QLabel("使用已确认的数据检查结果，将 NetCDF/HDF/TIFF 转换为 Zarr v3。"))
+        subtitle = QLabel("使用已确认的数据检查结果，将 NetCDF/HDF/TIFF 转换为 Zarr v3。")
+        subtitle.setObjectName("pageSubtitle")
+        root.addWidget(subtitle)
+
 
         self.input_status = QLabel("请先在数据检查模块完成检查。")
         root.addWidget(self.input_status)
@@ -930,7 +1021,7 @@ class ConversionPage(QWidget):
         root.addLayout(actions)
         self.status = QLabel("等待检查结果。")
         root.addWidget(self.status)
-        self.plan_report = QTextBrowser()
+        self.plan_report = PlanSummary()
         root.addWidget(self.plan_report, 1)
 
     @staticmethod
@@ -1744,11 +1835,21 @@ class PipelinePage(QWidget):
         self.plan = None
         self.recovery = None
         root = QVBoxLayout(self)
-        title = QLabel("统一处理流程")
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(12)
+        title = QLabel("处理流程")
         title.setObjectName("pageTitle")
         root.addWidget(title)
+        subtitle = QLabel("将转换、重采样、重分块和重压缩组合为一份最终产品计划。")
+        subtitle.setObjectName("pageSubtitle")
+        root.addWidget(subtitle)
+        self.stepper = Stepper(("选择操作", "配置参数", "确认计划"))
+        self.stepper.set_current(0)
+        root.addWidget(self.stepper)
 
-        operations = QGroupBox("处理流程")
+
+        operations = QGroupBox("处理配方")
+        operations.setObjectName("operationCard")
         operations_layout = QHBoxLayout(operations)
         self.conversion_checkbox = QCheckBox("转换")
         self.conversion_checkbox.setChecked(True)
@@ -1944,15 +2045,18 @@ class PipelinePage(QWidget):
         actions.addWidget(self.run_button)
         actions.addStretch(1)
         settings_layout.addLayout(actions)
+        status_row = QHBoxLayout()
+        self.status_badge = StatusBadge("未开始", "neutral")
         self.status = QLabel("等待数据检查结果。")
-        settings_layout.addWidget(self.status)
+        status_row.addWidget(self.status_badge)
+        status_row.addWidget(self.status, 1)
+        settings_layout.addLayout(status_row)
         settings_layout.addStretch(1)
 
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setWidget(settings)
-        self.report = QTextBrowser()
-        self.report.setPlaceholderText("尚未生成处理计划。")
+        self.report = PlanSummary()
         content = QSplitter(Qt.Orientation.Horizontal)
         content.addWidget(self.settings_scroll)
         content.addWidget(self.report)
@@ -1969,6 +2073,20 @@ class PipelinePage(QWidget):
             checkbox.toggled.connect(self._invalidate_plan)
         self._connect_plan_invalidation()
         self._set_enabled(False)
+    def _set_workflow_status(self, text: str, status: str = "neutral", step: int | None = None) -> None:
+        self.status.setText(text)
+        self.status_badge.set_status(
+            {
+                "success": "已完成",
+                "warning": "需确认",
+                "danger": "失败",
+                "info": "处理中",
+                "neutral": "未开始",
+            }.get(status, "未开始"),
+            status,
+        )
+        if step is not None:
+            self.stepper.set_current(step)
 
     @staticmethod
     def _storage_combo() -> QComboBox:
@@ -2076,7 +2194,7 @@ class PipelinePage(QWidget):
         self.plan = None
         self.run_button.setEnabled(False)
         if had_plan:
-            self.status.setText("参数已变更，请重新生成处理计划。")
+            self._set_workflow_status("参数已变更，请重新生成处理计划。", "warning", 1)
 
     def _set_enabled(self, enabled: bool) -> None:
         self.general_group.setEnabled(enabled)
@@ -2174,9 +2292,9 @@ class PipelinePage(QWidget):
                 self.run_button.setText("继续执行")
                 self.run_button.setEnabled(True)
                 self.report.setPlainText(result.recovery.report)
-                self.status.setText("恢复计划已载入，可直接继续执行；修改参数后需重新生成计划。")
+                self._set_workflow_status("恢复计划已载入，可直接继续执行；修改参数后需重新生成计划。", "success", 2)
             else:
-                self.status.setText("现有 Zarr 检查结果已载入，请至少选择一项处理操作。")
+                self._set_workflow_status("现有 Zarr 检查结果已载入，请至少选择一项处理操作。", "info", 0)
             return
         self.conversion_checkbox.setChecked(True)
         self.conversion_group.setVisible(True)
@@ -2222,7 +2340,7 @@ class PipelinePage(QWidget):
         if len(info.times):
             self.time_start.setDate(_qdate(info.times[0]))
             self.time_end.setDate(_qdate(info.times[-1]))
-        self.status.setText("检查结果已载入，请选择处理操作并生成计划。")
+        self._set_workflow_status("检查结果已载入，请选择处理操作并生成计划。", "info", 0)
         self._set_enabled(True)
 
     def clear_inspection(self) -> None:
@@ -2231,7 +2349,7 @@ class PipelinePage(QWidget):
         self.plan = None
         self.run_button.setEnabled(False)
         self.variables.setRowCount(0)
-        self.status.setText("检查参数已改变，请返回数据检查页面重新检查。")
+        self._set_workflow_status("检查参数已改变，请返回数据检查页面重新检查。", "warning", 0)
         self._set_enabled(False)
 
     def _update_operation_state(self, *_args) -> None:
@@ -2488,10 +2606,10 @@ class PipelinePage(QWidget):
                 f"操作决策：\n{decisions}"
                 + (f"\n覆盖提醒：{plan.coverage_warning}" if plan.coverage_warning else "")
             )
-        self.status.setText("计划已生成，请确认报告后开始处理。")
+        self._set_workflow_status("计划已生成，请确认报告后开始处理。", "success", 2)
 
     def _run_done(self, result) -> None:
-        self.status.setText(f"一条龙处理完成：{result.get('output', '')}")
+        self._set_workflow_status(f"一条龙处理完成：{result.get('output', '')}", "success", 2)
         self.report.append(f"\n执行结果：{result}")
 
 
@@ -2501,6 +2619,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.path_settings = path_settings or PathPickerSettings()
+        self.session_state = GuiSessionState()
         self.setWindowTitle(f"快速 Zarr 转换器 v{__version__}")
         self.resize(1280, 820)
         self._apply_modern_theme()
@@ -2523,11 +2642,19 @@ class MainWindow(QMainWindow):
             ("任务与日志", self.task_page),
         ]
         self.navigation = QListWidget()
-        self.navigation.setFixedWidth(150)
+        self.navigation.setObjectName("mainNavigation")
+        self.navigation.setMinimumWidth(214)
+        self.navigation.setMaximumWidth(250)
+        self.navigation.setSpacing(2)
         self.stack = QStackedWidget()
         self.task_page_index = len(pages) - 1
         for index, (label, page) in enumerate(pages):
-            self.navigation.addItem(QListWidgetItem(label))
+            item = QListWidgetItem(label)
+            item.setForeground(QBrush(QColor("#FFFFFF")))
+            item_font = item.font()
+            item_font.setWeight(QFont.Weight.Bold)
+            item.setFont(item_font)
+            self.navigation.addItem(item)
             if index == 0:
                 container = QScrollArea()
                 container.setWidgetResizable(True)
@@ -2542,23 +2669,60 @@ class MainWindow(QMainWindow):
         self.navigation.item(0).setText("数据检查")
         self.navigation.item(4).setText("处理流程")
         self.navigation.item(5).setText("任务中心")
-        self.navigation.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.navigation.currentRowChanged.connect(self._navigation_changed)
         self.navigation.setCurrentRow(0)
         # Conversion depends on a source inspection; Zarr optimization has
         # its own Zarr input and is intentionally usable independently.
         for index in (1, 4):
             self._set_nav_enabled(index, False)
-        # v1.4 makes the composable workflow the primary entry point.  The
-        # legacy pages stay instantiated for API and automation compatibility,
-        # but are removed from the visual navigation surface.
+        # Legacy pages stay instantiated for API and automation compatibility,
+        # but only the three product-level pages remain visible in navigation.
         for index in (1, 2, 3):
             self.navigation.item(index).setHidden(True)
 
+        nav_panel = QFrame()
+        nav_panel.setObjectName("navPanel")
+        nav_layout = QVBoxLayout(nav_panel)
+        nav_layout.setContentsMargins(10, 14, 10, 12)
+        brand = QLabel("快速 Zarr\n转换器")
+        brand.setObjectName("brandLabel")
+        nav_layout.addWidget(brand)
+        nav_layout.addWidget(self.navigation, 1)
+        nav_version = QLabel(f"v{__version__}")
+        nav_version.setObjectName("navVersion")
+        nav_layout.addWidget(nav_version)
+
         splitter = QSplitter()
-        splitter.addWidget(self.navigation)
+        splitter.addWidget(nav_panel)
         splitter.addWidget(self.stack)
         splitter.setStretchFactor(1, 1)
-        self.setCentralWidget(splitter)
+        splitter.setSizes([226, 1000])
+        self.context_bar = QLabel("输入：未选择    ·    当前阶段：数据检查    ·    任务：无")
+        self.context_bar.setObjectName("topContext")
+        self.action_bar = QFrame()
+        self.action_bar.setObjectName("actionBar")
+        action_bar = self.action_bar
+        action_layout = QHBoxLayout(action_bar)
+        action_layout.setContentsMargins(16, 8, 16, 8)
+        self.action_hint = QLabel("先完成数据检查，再进入处理流程。")
+        self.action_hint.setObjectName("actionHint")
+        self.action_back = QPushButton("返回")
+        self.action_back.setObjectName("secondaryButton")
+        self.action_primary = QPushButton("检查输入")
+        self.action_primary.setObjectName("primaryAction")
+        action_layout.addWidget(self.action_hint, 1)
+        action_layout.addWidget(self.action_back)
+        action_layout.addWidget(self.action_primary)
+        self.action_back.clicked.connect(self._back_action)
+        self.action_primary.clicked.connect(self._primary_action)
+        shell = QWidget()
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        shell_layout.addWidget(self.context_bar)
+        shell_layout.addWidget(splitter, 1)
+        shell_layout.addWidget(action_bar)
+        self.setCentralWidget(shell)
         self._make_menu()
 
         self.inspection_page.task_requested.connect(self._task_requested)
@@ -2570,39 +2734,80 @@ class MainWindow(QMainWindow):
         self.inspection_page.zarr_result_ready.connect(self._workflow_zarr_ready)
         self.inspection_page.result_invalidated.connect(self._inspection_invalidated)
         self.rechunk_page.result_ready.connect(self._zarr_ready)
+        self._update_context_bar()
+
+    def _navigation_changed(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+        page_names = {0: "数据检查", 4: "处理流程", 5: "任务中心"}
+        self.session_state.current_page = {
+            0: "inspection",
+            4: "workflow",
+            5: "task",
+        }.get(index, self.session_state.current_page)
+        stage = page_names.get(index, "数据检查")
+        source = self.source_result or self.zarr_result
+        source_text = str(source.path) if source is not None else "未选择"
+        task_text = self.session_state.task_label if self.session_state.task_running else "无"
+        if hasattr(self, "context_bar"):
+            self.context_bar.setText(
+                f"输入：{source_text}    ·    当前阶段：{stage}    ·    任务：{task_text}"
+            )
+        self._update_action_bar()
+
+    def _update_action_bar(self) -> None:
+        if not hasattr(self, "action_primary"):
+            return
+        index = self.navigation.currentRow()
+        if index == 0:
+            self.action_hint.setText("完成输入和时间规则检查后，处理流程会自动解锁。")
+            self.action_back.setEnabled(False)
+            self.action_primary.setText("检查输入")
+            self.action_primary.setEnabled(bool(self.inspection_page.path.text().strip()))
+        elif index == 4:
+            self.action_hint.setText("确认右侧计划摘要后，再开始写入最终 Zarr。")
+            self.action_back.setEnabled(True)
+            self.action_primary.setText("开始处理" if self.pipeline_page.plan is not None else "生成处理计划")
+            self.action_primary.setEnabled(self.pipeline_page.inspection is not None)
+        elif index == self.task_page_index:
+            self.action_hint.setText("任务中心显示当前任务、资源指标、日志和会话历史。")
+            self.action_back.setEnabled(self.pipeline_page.inspection is not None)
+            self.action_primary.setText("返回处理流程")
+            self.action_primary.setEnabled(self.pipeline_page.inspection is not None)
+        else:
+            self.action_hint.setText("当前页面为兼容入口。")
+            self.action_back.setEnabled(True)
+            self.action_primary.setText("返回数据检查")
+            self.action_primary.setEnabled(True)
+
+    def _back_action(self) -> None:
+        index = self.navigation.currentRow()
+        if index == self.task_page_index:
+            self.navigation.setCurrentRow(4 if self.pipeline_page.inspection is not None else 0)
+        else:
+            self.navigation.setCurrentRow(0)
+
+    def _primary_action(self) -> None:
+        index = self.navigation.currentRow()
+        if index == 0:
+            self.inspection_page._request_time_inspection()
+        elif index == 4:
+            if self.pipeline_page.plan is None:
+                self.pipeline_page._request_preview()
+            else:
+                self.pipeline_page._request_run()
+        elif index == self.task_page_index:
+            self.navigation.setCurrentRow(4 if self.pipeline_page.inspection is not None else 0)
+        else:
+            self.navigation.setCurrentRow(0)
+    def _update_context_bar(self) -> None:
+        self._navigation_changed(self.navigation.currentRow())
 
     def _apply_modern_theme(self) -> None:
-        """Install a restrained Fusion/QSS theme without changing behavior."""
+        """Install the v1.6.8 semantic Fusion/QSS theme."""
         app = QApplication.instance()
-        if app is None:
-            return
-        app.setStyle("Fusion")
-        app.setStyleSheet(
-            """
-            QWidget { font-size: 13px; color: #111827; }
-            QWidget:disabled { color: #4b5563; }
-            QMainWindow { background: #f5f7fb; }
-            QLabel, QCheckBox, QRadioButton { color: #111827; }
-            QListWidget { background: #17212b; color: #f1f5f9; border: 0; padding: 12px 6px; }
-            QListWidget::item { padding: 11px 14px; margin: 2px 0; border-radius: 6px; }
-            QListWidget::item:selected { background: #1d63c6; color: #ffffff; }
-            QListWidget::item:disabled { color: #aebdca; }
-            QGroupBox { border: 1px solid #c7d2df; border-radius: 6px; margin-top: 14px; padding: 12px; background: white; color: #111827; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #193b5a; }
-            QPushButton { background: #1d63c6; color: #ffffff; border: 0; border-radius: 5px; padding: 7px 14px; }
-            QPushButton:hover { background: #174fa0; }
-            QPushButton:disabled { background: #cbd5e1; color: #374151; }
-            QPushButton#pathPickerAuxButton { background: #e8eef5; color: #193b5a; border: 1px solid #b8c5d3; }
-            QPushButton#pathPickerAuxButton:hover { background: #cbd5e1; }
-            QPushButton#pathPickerAuxButton:checked { background: #c7d2df; }
-            QPushButton#pathPickerAuxButton:focus, QLineEdit:focus { border: 2px solid #1d63c6; }
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QPlainTextEdit, QTextEdit, QTextBrowser, QTableWidget { border: 1px solid #b8c5d3; border-radius: 4px; background: #ffffff; color: #111827; padding: 4px; }
-            QHeaderView::section { background: #e8eef5; color: #172033; border: 0; border-right: 1px solid #c7d2df; border-bottom: 1px solid #c7d2df; padding: 5px; }
-            QToolTip { color: #111827; background: #fffbea; border: 1px solid #9aa8b8; }
-            QProgressBar { border: 1px solid #c9d4df; border-radius: 4px; text-align: center; background: white; }
-            QProgressBar::chunk { background: #27ae60; }
-            """
-        )
+        if app is not None:
+            apply_theme(app)
+
 
     def _make_menu(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
@@ -2623,15 +2828,18 @@ class MainWindow(QMainWindow):
     def _inspection_invalidated(self) -> None:
         self.source_result = None
         self.zarr_result = None
+        self.session_state.invalidate_inspection()
         self.pipeline_page.clear_inspection()
         for index in (1, 4):
             self._set_nav_enabled(index, False)
         self.navigation.item(1).setText("转换")
         self.navigation.item(4).setText("处理流程")
         self.navigation.setCurrentRow(0)
+        self._update_context_bar()
 
     def _source_ready(self, result: InspectionResult) -> None:
         self.source_result = result
+        self.session_state.set_inspection(result)
         self.conversion_page.set_inspection(result)
         self.pipeline_page.set_inspection(result)
         for index in (1, 4):
@@ -2639,18 +2847,22 @@ class MainWindow(QMainWindow):
         self.navigation.item(1).setText("转换 ✓")
         self.navigation.item(4).setText("处理流程 ✓")
         self.navigation.setCurrentRow(4)
+        self._update_context_bar()
 
     def _workflow_zarr_ready(self, result: InspectionResult) -> None:
         self.zarr_result = result
+        self.session_state.set_inspection(result)
         self.pipeline_page.set_inspection(result)
         self._set_nav_enabled(4, True)
         self.navigation.item(4).setText("处理流程 ✓")
         self.navigation.setCurrentRow(4)
+        self._update_context_bar()
 
     def _zarr_ready(self, result: InspectionResult) -> None:
         self.zarr_result = result
+        self.session_state.set_inspection(result)
         self.navigation.item(2).setText("Zarr 优化 ✓")
-
+        self._update_context_bar()
     def _set_nav_enabled(self, index: int, enabled: bool) -> None:
         item = self.navigation.item(index)
         flags = item.flags()
@@ -2702,6 +2914,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             QMessageBox.warning(self, "已有任务运行", "请等待当前任务完成或先请求取消。")
             return
+        self.session_state.start_task(label)
         self.navigation.setCurrentRow(self.task_page_index)
         worker = TaskWorker(
             function,
@@ -2710,6 +2923,7 @@ class MainWindow(QMainWindow):
         )
         self.worker = worker
         self.task_page.started(label, worker.request_cancel)
+        self._update_context_bar()
         worker.log.connect(self.task_page.append)
         worker.resource.connect(self.task_page.update_resource)
         worker.progress.connect(self.task_page.update_progress)
@@ -2717,14 +2931,20 @@ class MainWindow(QMainWindow):
         def succeeded(result: Any) -> None:
             try:
                 callback(result)
+                self.session_state.finish_task("completed")
                 self.task_page.completed("任务完成。")
+                self._update_context_bar()
             except Exception as exc:  # noqa: BLE001
+                self.session_state.finish_task("failed")
                 self.task_page.append(f"结果处理失败：{exc}")
                 self.task_page.failed()
+                self._update_context_bar()
 
         def failed(details: str) -> None:
+            self.session_state.finish_task("failed")
             self.task_page.append(details)
             self.task_page.failed()
+            self._update_context_bar()
             summary = next(
                 (line.strip() for line in reversed(details.splitlines()) if line.strip()),
                 "未知错误",
@@ -2732,8 +2952,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "任务失败", summary)
 
         def cancelled() -> None:
+            self.session_state.finish_task("cancelled")
             self.task_page.append("任务已取消。")
             self.task_page.cancelled()
+            self._update_context_bar()
 
         worker.succeeded.connect(succeeded)
         worker.failed.connect(failed)

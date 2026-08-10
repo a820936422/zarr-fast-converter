@@ -7,16 +7,20 @@ from pathlib import Path
 from typing import Any, Literal
 
 from PySide6.QtCore import QSettings, Qt, Signal
-from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QFileDialog,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QInputDialog,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
     QLineEdit,
-    QMenu,
     QPushButton,
+    QVBoxLayout,
     QWidget,
 )
+from .path_chooser import PathChooserDialog
 
 
 PathPickerMode = Literal["directory", "open_file", "save_file"]
@@ -35,16 +39,49 @@ class FavoritePath:
 
 
 class PathPickerSettings:
-    """Non-fatal QSettings storage for favorite and recently used directories."""
+    """Non-fatal QSettings storage for favorite and recent directories."""
 
     ORGANIZATION = "fast-nc-zarr"
     APPLICATION = "快速 Zarr 转换器"
-    ROOT_KEY = "pathPicker/v1"
+    ROOT_KEY = "pathPicker/v2"
+    LEGACY_ROOT_KEY = "pathPicker/v1"
     MAX_RECENT_DIRECTORIES = 12
 
     def __init__(self, settings: QSettings | None = None) -> None:
         self.settings = settings or QSettings(self.ORGANIZATION, self.APPLICATION)
         self.last_error: str | None = None
+        self._migrate_legacy_settings()
+
+    @staticmethod
+    def _has_value(value: Any) -> bool:
+        return value not in (None, "", [], (), {})
+
+    def _migrate_legacy_settings(self) -> None:
+        """Copy v1 settings once without deleting the user's old values."""
+        try:
+            values: dict[str, Any] = {}
+            for suffix in ("favorites", "recentDirectories"):
+                current = self.settings.value(self._key(suffix), None)
+                legacy = self.settings.value(
+                    f"{self.LEGACY_ROOT_KEY}/{suffix}", None
+                )
+                if not self._has_value(current) and self._has_value(legacy):
+                    values[self._key(suffix)] = legacy
+
+            all_keys = getattr(self.settings, "allKeys", None)
+            if callable(all_keys):
+                prefix = f"{self.LEGACY_ROOT_KEY}/lastDirectory/"
+                for key in all_keys():
+                    if not str(key).startswith(prefix):
+                        continue
+                    suffix = str(key)[len(self.LEGACY_ROOT_KEY) + 1 :]
+                    target = self._key(suffix)
+                    if not self._has_value(self.settings.value(target, None)):
+                        values[target] = self.settings.value(key, "")
+            if values:
+                self._set_values(values)
+        except Exception as exc:  # noqa: BLE001 - settings are non-fatal
+            self.last_error = str(exc)
 
     @staticmethod
     def normalize_path(value: str | os.PathLike[str]) -> str:
@@ -340,14 +377,146 @@ class PathPickerSettings:
             return str(Path.home())
 
 
+class FavoriteManagerDialog(QDialog):
+    """Searchable favorite manager used by every path field."""
+
+    def __init__(self, settings: PathPickerSettings, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.path_settings = settings
+        self.selected_path = ""
+        self.setWindowTitle("管理路径收藏")
+        self.setMinimumSize(620, 420)
+
+        layout = QVBoxLayout(self)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索收藏名称或完整路径")
+        self.search.setAccessibleName("搜索路径收藏")
+        layout.addWidget(self.search)
+
+        self.list = QListWidget()
+        self.list.setAccessibleName("路径收藏列表")
+        self.list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        layout.addWidget(self.list, 1)
+
+        actions = QHBoxLayout()
+        self.use_button = QPushButton("使用")
+        self.use_button.setObjectName("secondaryButton")
+        self.rename_button = QPushButton("重命名")
+        self.rename_button.setObjectName("secondaryButton")
+        self.move_up_button = QPushButton("上移")
+        self.move_up_button.setObjectName("secondaryButton")
+        self.move_down_button = QPushButton("下移")
+        self.move_down_button.setObjectName("secondaryButton")
+        self.remove_button = QPushButton("删除")
+        self.remove_button.setObjectName("dangerButton")
+        for button in (
+            self.use_button,
+            self.rename_button,
+            self.move_up_button,
+            self.move_down_button,
+            self.remove_button,
+        ):
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        close_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_box.rejected.connect(self.reject)
+        layout.addWidget(close_box)
+        self.search.textChanged.connect(self._refresh)
+        self.list.currentItemChanged.connect(self._update_actions)
+        self.list.itemDoubleClicked.connect(lambda _item: self._use_selected())
+        self.use_button.clicked.connect(self._use_selected)
+        self.rename_button.clicked.connect(self._rename_selected)
+        self.move_up_button.clicked.connect(lambda: self._move_selected(-1))
+        self.move_down_button.clicked.connect(lambda: self._move_selected(1))
+        self.remove_button.clicked.connect(self._remove_selected)
+        self._refresh()
+
+    def _favorites(self) -> tuple[FavoritePath, ...]:
+        query = self.search.text().strip().casefold()
+        favorites = self.path_settings.favorites()
+        if not query:
+            return favorites
+        return tuple(
+            item
+            for item in favorites
+            if query in item.name.casefold() or query in item.path.casefold()
+        )
+
+    def _refresh(self) -> None:
+        self.list.clear()
+        for favorite in self._favorites():
+            available = self.path_settings.directory_available(favorite.path)
+            marker = "可访问" if available else "不可访问"
+            item = QListWidgetItem(f"{favorite.name}  ·  {favorite.path}  ·  {marker}")
+            item.setData(Qt.ItemDataRole.UserRole, favorite.path)
+            item.setToolTip(favorite.path)
+            self.list.addItem(item)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        self._update_actions()
+
+    def _selected(self) -> FavoritePath | None:
+        item = self.list.currentItem()
+        if item is None:
+            return None
+        path = item.data(Qt.ItemDataRole.UserRole)
+        return self.path_settings.favorite(str(path)) if path else None
+
+    def _update_actions(self, *_args) -> None:
+        favorite = self._selected()
+        enabled = favorite is not None
+        for button in (
+            self.use_button,
+            self.rename_button,
+            self.move_up_button,
+            self.move_down_button,
+            self.remove_button,
+        ):
+            button.setEnabled(enabled)
+        if favorite is not None:
+            favorites = self.path_settings.favorites()
+            self.move_up_button.setEnabled(favorite.order > 0)
+            self.move_down_button.setEnabled(favorite.order < len(favorites) - 1)
+
+    def _use_selected(self) -> None:
+        favorite = self._selected()
+        if favorite is None:
+            return
+        self.selected_path = favorite.path
+        self.accept()
+
+    def _rename_selected(self) -> None:
+        favorite = self._selected()
+        if favorite is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "重命名收藏", "显示名称", QLineEdit.EchoMode.Normal, favorite.name
+        )
+        if accepted and name.strip():
+            self.path_settings.rename_favorite(favorite.path, name)
+            self._refresh()
+
+    def _move_selected(self, offset: int) -> None:
+        favorite = self._selected()
+        if favorite is not None and self.path_settings.move_favorite(favorite.path, offset):
+            self._refresh()
+
+    def _remove_selected(self) -> None:
+        favorite = self._selected()
+        if favorite is not None:
+            self.path_settings.remove_favorite(favorite.path)
+            self._refresh()
+
+
 class PathPicker(QWidget):
-    """Reusable path editor with browsing, favorites, and recent directories."""
+    """Reusable path editor with browsing and directory status."""
 
     textChanged = Signal(str)
     textEdited = Signal(str)
     editingFinished = Signal()
     returnPressed = Signal()
-    favoriteChanged = Signal(str, bool)
 
     def __init__(
         self,
@@ -375,31 +544,22 @@ class PathPicker(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
         self.line_edit = QLineEdit()
         self.line_edit.setAccessibleName(accessible_name)
-        self.browse_button = QPushButton("浏览…")
+        self.path_status = QLabel("未设置")
+        self.path_status.setObjectName("pathStatus")
+        self.path_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.path_status.setMinimumWidth(58)
+        self.browse_button = QPushButton("浏览")
         self.browse_button.setObjectName("pathPickerAuxButton")
         self.browse_button.setAccessibleName(f"浏览{accessible_name}")
         self.browse_button.setToolTip(f"浏览并选择{accessible_name}")
-        self.favorites_button = QPushButton("收藏夹")
-        self.favorites_button.setObjectName("pathPickerAuxButton")
-        self.favorites_button.setAccessibleName(f"打开{accessible_name}收藏夹")
-        self.favorites_button.setToolTip("选择收藏或最近使用的目录")
-        self.favorites_menu = QMenu(self.favorites_button)
-        self.favorites_menu.setAccessibleName(f"{accessible_name}收藏与最近目录")
-        self.favorites_button.setMenu(self.favorites_menu)
-        self.star_button = QPushButton("☆")
-        self.star_button.setObjectName("pathPickerAuxButton")
-        self.star_button.setCheckable(True)
-        self.star_button.setAccessibleName(f"收藏当前{accessible_name}")
-        self.star_button.setToolTip("收藏当前目录")
-        for button in (self.browse_button, self.favorites_button, self.star_button):
-            button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.browse_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         layout.addWidget(self.line_edit, 1)
+        layout.addWidget(self.path_status)
         layout.addWidget(self.browse_button)
-        layout.addWidget(self.favorites_button)
-        layout.addWidget(self.star_button)
         self.setFocusProxy(self.line_edit)
         super().setAccessibleName(accessible_name)
 
@@ -408,9 +568,7 @@ class PathPicker(QWidget):
         self.line_edit.editingFinished.connect(self._editing_finished)
         self.line_edit.returnPressed.connect(self.returnPressed.emit)
         self.browse_button.clicked.connect(self.browse)
-        self.star_button.clicked.connect(self.toggle_favorite)
-        self.favorites_menu.aboutToShow.connect(self.rebuild_menu)
-        self._update_star()
+        self._update_path_status()
 
     @property
     def persistence_error(self) -> str | None:
@@ -434,8 +592,6 @@ class PathPicker(QWidget):
     def setReadOnly(self, value: bool) -> None:
         self.line_edit.setReadOnly(value)
         self.browse_button.setEnabled(not value)
-        self.favorites_button.setEnabled(not value)
-        self.star_button.setEnabled(not value and bool(self._favorite_target()))
 
     def isReadOnly(self) -> bool:
         return self.line_edit.isReadOnly()
@@ -452,11 +608,9 @@ class PathPicker(QWidget):
         if hasattr(self, "line_edit"):
             self.line_edit.setAccessibleName(value)
             self.browse_button.setAccessibleName(f"浏览{value}")
-            self.favorites_button.setAccessibleName(f"打开{value}收藏夹")
-            self.star_button.setAccessibleName(f"收藏当前{value}")
 
     def _text_changed(self, value: str) -> None:
-        self._update_star()
+        self._update_path_status(value)
         self.textChanged.emit(value)
 
     def _editing_finished(self) -> None:
@@ -465,158 +619,40 @@ class PathPicker(QWidget):
             self.path_settings.remember_selection(self.role, value, self.mode)
         self.editingFinished.emit()
 
-    def _favorite_target(self) -> str:
-        return self.path_settings.directory_for_path(self.text().strip(), self.mode)
-
-    def _update_star(self) -> None:
-        target = self._favorite_target()
-        favorite = self.path_settings.favorite(target) if target else None
-        checked = favorite is not None
-        self.star_button.setChecked(checked)
-        self.star_button.setText("★" if checked else "☆")
-        self.star_button.setEnabled(bool(target) and not self.line_edit.isReadOnly())
-        self.star_button.setAccessibleName(
-            ("取消收藏当前" if checked else "收藏当前") + self.accessibleName()
-        )
-        self.star_button.setToolTip("取消收藏当前目录" if checked else "收藏当前目录")
-
-    def toggle_favorite(self, _checked: bool | None = None) -> None:
-        target = self._favorite_target()
-        if not target:
-            self._update_star()
-            return
-        if self.path_settings.favorite(target) is None:
-            self.path_settings.add_favorite(target)
-            is_favorite = True
+    def _update_path_status(self, value: str | None = None) -> None:
+        text = self.text().strip() if value is None else value.strip()
+        if not text:
+            status, label = "neutral", "未设置"
         else:
-            self.path_settings.remove_favorite(target)
-            is_favorite = False
-        self.path_settings.remember_directory(self.role, target)
-        self._update_star()
-        self.favoriteChanged.emit(target, is_favorite)
+            directory = self.path_settings.directory_for_path(text, self.mode)
+            available = self.path_settings.directory_available(directory)
+            status, label = ("success", "可访问") if available else ("warning", "待验证")
+        self.path_status.setText(label)
+        self.path_status.setProperty("status", status)
+        self.path_status.style().unpolish(self.path_status)
+        self.path_status.style().polish(self.path_status)
+        self.path_status.update()
+
+    def _select_path(self, start: str) -> str:
+        dialog = PathChooserDialog(
+            self.path_settings,
+            role=self.role,
+            dialog_title=self.dialog_title,
+            start=start,
+            mode=self.mode,
+            file_filter=self.file_filter,
+            manager_factory=FavoriteManagerDialog,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            return dialog.selected_path
+        return ""
 
     def browse(self) -> None:
         start = self.path_settings.dialog_start(self.role, self.text().strip(), self.mode)
-        if self.mode == "directory":
-            value = QFileDialog.getExistingDirectory(self, self.dialog_title, start)
-        elif self.mode == "open_file":
-            value = QFileDialog.getOpenFileName(
-                self, self.dialog_title, start, self.file_filter
-            )[0]
-        else:
-            value = QFileDialog.getSaveFileName(
-                self, self.dialog_title, start, self.file_filter
-            )[0]
+        value = self._select_path(start)
         if not value:
             return
         self.setText(value)
         self.path_settings.remember_selection(self.role, value, self.mode)
-
-    def _use_directory(self, directory: str) -> None:
-        normalized = self.path_settings.normalize_path(directory)
-        if not normalized:
-            return
-        if self.mode == "directory":
-            value = normalized
-        else:
-            current = self.path_settings.normalize_path(self.text().strip())
-            name = Path(current).name if current else ""
-            value = str(Path(normalized) / name) if name else normalized
-        self.setText(value)
-        self.path_settings.remember_directory(self.role, normalized)
-        self.line_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
-
-    @staticmethod
-    def _menu_label(name: str, path: str, *, available: bool) -> str:
-        marker = "" if available else "（不可访问）"
-        return f"{name}{marker} — {path}"
-
-    def _add_directory_action(
-        self, menu: QMenu, name: str, path: str, *, recent: bool = False
-    ) -> QAction:
-        available = self.path_settings.directory_available(path)
-        label = self._menu_label(name, path, available=available)
-        action = menu.addAction(label)
-        action.setToolTip(
-            ("最近使用目录：" if recent else "收藏目录：")
-            + path
-            + ("；当前不可访问，收藏已保留。" if not available else "")
-        )
-        action.triggered.connect(
-            lambda _checked=False, selected=path: self._use_directory(selected)
-        )
-        return action
-
-    def rebuild_menu(self) -> None:
-        self.favorites_menu.clear()
-        favorites = self.path_settings.favorites()
-        if favorites:
-            self.favorites_menu.addSection("收藏目录")
-            for favorite in favorites:
-                self._add_directory_action(
-                    self.favorites_menu, favorite.name, favorite.path
-                )
-        else:
-            empty = self.favorites_menu.addAction("尚无收藏目录")
-            empty.setEnabled(False)
-
-        favorite_ids = {
-            self.path_settings._identity(item.path) for item in favorites
-        }
-        recent = [
-            path
-            for path in self.path_settings.recent_directories()
-            if self.path_settings._identity(path) not in favorite_ids
-        ]
-        if recent:
-            self.favorites_menu.addSeparator()
-            self.favorites_menu.addSection("最近使用")
-            for path in recent:
-                self._add_directory_action(
-                    self.favorites_menu,
-                    self.path_settings._default_name(path),
-                    path,
-                    recent=True,
-                )
-
-        target = self._favorite_target()
-        current = self.path_settings.favorite(target) if target else None
-        self.favorites_menu.addSeparator()
-        toggle_text = "取消收藏当前目录" if current is not None else "收藏当前目录"
-        toggle = self.favorites_menu.addAction(toggle_text)
-        toggle.setEnabled(bool(target))
-        toggle.triggered.connect(self.toggle_favorite)
-
-        if current is not None:
-            rename = self.favorites_menu.addAction("重命名当前收藏…")
-            rename.triggered.connect(lambda: self._rename_current(current))
-            move_up = self.favorites_menu.addAction("上移当前收藏")
-            move_up.setEnabled(current.order > 0)
-            move_up.triggered.connect(
-                lambda: self._move_current(current.path, -1)
-            )
-            move_down = self.favorites_menu.addAction("下移当前收藏")
-            move_down.setEnabled(current.order < len(favorites) - 1)
-            move_down.triggered.connect(
-                lambda: self._move_current(current.path, 1)
-            )
-
-        if self.path_settings.recent_directories():
-            clear_recent = self.favorites_menu.addAction("清除最近目录")
-            clear_recent.triggered.connect(self.path_settings.clear_recent_directories)
-
-    def _rename_current(self, favorite: FavoritePath) -> None:
-        name, accepted = QInputDialog.getText(
-            self,
-            "重命名收藏",
-            "显示名称",
-            QLineEdit.EchoMode.Normal,
-            favorite.name,
-        )
-        if accepted and name.strip():
-            self.path_settings.rename_favorite(favorite.path, name)
-            self.rebuild_menu()
-
-    def _move_current(self, path: str, offset: int) -> None:
-        self.path_settings.move_favorite(path, offset)
-        self.rebuild_menu()
+        self._update_path_status(value)

@@ -14,6 +14,7 @@ if "microsoft" in platform.release().lower():
 from PySide6.QtWidgets import QApplication
 
 from .fonts import configure_application_font
+from .theme import apply_theme
 from .main_window import MainWindow
 
 
@@ -22,8 +23,8 @@ def main(argv: list[str] | None = None) -> int:
     application = QApplication(sys.argv if argv is None else argv)
     application.setApplicationName("快速 Zarr 转换器")
     application.setOrganizationName("fast-nc-zarr")
-    application.setStyle("Fusion")
     configure_application_font(application)
+    apply_theme(application)
     window = MainWindow()
     window.show()
     return application.exec()

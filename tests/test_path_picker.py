@@ -11,15 +11,16 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, Qt
-from PySide6.QtTest import QTest
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 
 from fast_nc_zarr.gui.main_window import MainWindow  # noqa: E402
+from fast_nc_zarr.gui.path_chooser import PathChooserDialog  # noqa: E402
 from fast_nc_zarr.gui.path_picker import (  # noqa: E402
+    FavoriteManagerDialog,
     PathPicker,
     PathPickerSettings,
 )
@@ -58,42 +59,34 @@ class PathPickerTests(unittest.TestCase):
             settings=store,
         )
 
-    def test_keyboard_star_toggle_and_cross_instance_persistence(self) -> None:
+    def test_embedded_chooser_favorite_persists_without_path_buttons(self) -> None:
         favorite = self.root / "favorite"
         favorite.mkdir()
         first_store = PathPickerSettings(self.settings())
-        first = self.picker(first_store)
-        first.setText(str(favorite))
-        first.show()
-        self.application.processEvents()
-
-        self.assertEqual(first.text(), str(favorite))
-        self.assertTrue(first.line_edit.accessibleName())
-        self.assertTrue(first.browse_button.accessibleName())
-        self.assertTrue(first.favorites_button.accessibleName())
-        self.assertTrue(first.star_button.accessibleName())
-        first.star_button.setFocus(Qt.FocusReason.TabFocusReason)
-        QTest.keyClick(first.star_button, Qt.Key.Key_Space)
-        self.application.processEvents()
-
-        self.assertTrue(first.star_button.isChecked())
-        persisted = first_store.favorite(favorite)
-        self.assertIsNotNone(persisted)
-        json.dumps(persisted.to_dict())
+        first = PathChooserDialog(
+            first_store,
+            role="inspection_input",
+            dialog_title="选择测试目录",
+            start=str(self.root),
+            mode="directory",
+        )
+        first.file_dialog.setDirectory(str(favorite))
+        first._toggle_current_favorite()
+        self.assertIsNotNone(first_store.favorite(favorite))
         first.close()
 
         second_store = PathPickerSettings(self.settings())
-        second = self.picker(second_store)
-        second.setText(str(favorite))
-        self.assertTrue(second.star_button.isChecked())
-        self.assertEqual(second_store.last_directory("inspection_input"), str(favorite))
-
-        second.show()
-        second.star_button.setFocus(Qt.FocusReason.TabFocusReason)
-        QTest.keyClick(second.star_button, Qt.Key.Key_Space)
-        self.application.processEvents()
-        self.assertFalse(second.star_button.isChecked())
-        self.assertIsNone(PathPickerSettings(self.settings()).favorite(favorite))
+        second = PathChooserDialog(
+            second_store,
+            role="inspection_input",
+            dialog_title="选择测试目录",
+            start=str(favorite),
+            mode="directory",
+        )
+        self.assertTrue(any("favorite" in second.location_list.item(index).text() for index in range(second.location_list.count())))
+        second.file_dialog.setDirectory(str(favorite))
+        second._toggle_current_favorite()
+        self.assertIsNone(second_store.favorite(favorite))
         second.close()
 
     def test_display_name_order_and_unavailable_favorite_are_retained(self) -> None:
@@ -112,18 +105,17 @@ class PathPickerTests(unittest.TestCase):
         favorites = restored.favorites()
         self.assertEqual([item.name for item in favorites], ["Fast disk", "First"])
         self.assertEqual(favorites[0].path, str(second_path))
-        picker = self.picker(restored)
-        picker.setText(str(second_path))
-        picker.rebuild_menu()
-        unavailable_actions = [
-            action.text()
-            for action in picker.favorites_menu.actions()
-            if "Fast disk" in action.text()
-        ]
-        self.assertEqual(len(unavailable_actions), 1)
-        self.assertIn("不可访问", unavailable_actions[0])
+        dialog = PathChooserDialog(
+            restored,
+            role="inspection_input",
+            dialog_title="选择测试目录",
+            start=str(self.root),
+            mode="directory",
+        )
+        texts = [dialog.location_list.item(index).text() for index in range(dialog.location_list.count())]
+        self.assertTrue(any("Fast disk" in text and "不可访问" in text for text in texts))
         self.assertIsNotNone(restored.favorite(second_path))
-        picker.close()
+        dialog.close()
 
     def test_browse_starts_from_available_favorite_and_remembers_role(self) -> None:
         favorite = self.root / "favorite"
@@ -134,17 +126,93 @@ class PathPickerTests(unittest.TestCase):
         store.add_favorite(favorite, name="Favorite")
         picker = self.picker(store, role="pipeline_temporary")
 
-        with patch(
-            "fast_nc_zarr.gui.path_picker.QFileDialog.getExistingDirectory",
-            return_value=str(chosen),
-        ) as dialog:
+        with patch.object(picker, "_select_path", return_value=str(chosen)) as chooser:
             picker.browse()
 
-        self.assertEqual(dialog.call_args.args[2], str(favorite))
+        self.assertEqual(chooser.call_args.args[0], str(favorite))
+
         self.assertEqual(picker.text(), str(chosen))
         self.assertEqual(store.last_directory("pipeline_temporary"), str(chosen))
         self.assertEqual(store.recent_directories()[0], str(chosen))
         picker.close()
+    def test_v1_settings_migrate_without_deleting_legacy_values(self) -> None:
+        favorite = self.root / "legacy-favorite"
+        favorite.mkdir()
+        settings = self.settings()
+        legacy_favorites = json.dumps(
+            [{"path": str(favorite), "name": "Legacy", "order": 0}],
+            ensure_ascii=False,
+        )
+        settings.setValue("pathPicker/v1/favorites", legacy_favorites)
+        settings.setValue("pathPicker/v1/recentDirectories", json.dumps([str(favorite)]))
+        settings.setValue("pathPicker/v1/lastDirectory/inspection_input", str(favorite))
+        settings.sync()
+
+        store = PathPickerSettings(settings)
+
+        self.assertEqual(store.ROOT_KEY, "pathPicker/v2")
+        self.assertEqual(store.favorites()[0].name, "Legacy")
+        self.assertEqual(store.last_directory("inspection_input"), str(favorite))
+        self.assertTrue(settings.value("pathPicker/v1/favorites"))
+        self.assertTrue(settings.value("pathPicker/v2/favorites"))
+
+    def test_favorite_manager_filters_and_returns_selected_path(self) -> None:
+        first = self.root / "first"
+        second = self.root / "second"
+        first.mkdir()
+        second.mkdir()
+        store = PathPickerSettings(self.settings())
+        store.add_favorite(first, name="Fast SSD")
+        store.add_favorite(second, name="Archive")
+        dialog = FavoriteManagerDialog(store)
+
+        self.assertEqual(dialog.list.count(), 2)
+        dialog.search.setText("SSD")
+        self.assertEqual(dialog.list.count(), 1)
+        dialog._use_selected()
+        self.assertEqual(dialog.selected_path, str(first))
+        dialog.close()
+
+    def test_path_field_has_only_status_and_browse_controls(self) -> None:
+        directory = self.root / "available"
+        directory.mkdir()
+        picker = self.picker(PathPickerSettings(self.settings()))
+        picker.setText(str(directory))
+        self.assertEqual(picker.path_status.text(), "可访问")
+        self.assertTrue(picker.browse_button.accessibleName())
+        self.assertFalse(hasattr(picker, "favorites_button"))
+        self.assertFalse(hasattr(picker, "manage_button"))
+        self.assertFalse(hasattr(picker, "star_button"))
+        picker.close()
+
+
+    def test_embedded_chooser_shows_favorites_and_recent_directories(self) -> None:
+        favorite = self.root / "favorite-in-dialog"
+        recent = self.root / "recent-in-dialog"
+        favorite.mkdir()
+        recent.mkdir()
+        store = PathPickerSettings(self.settings())
+        store.add_favorite(favorite, name="常用目录")
+        store.remember_directory("inspection_input", recent)
+
+        dialog = PathChooserDialog(
+            store,
+            role="inspection_input",
+            dialog_title="选择测试目录",
+            start=str(self.root),
+            mode="directory",
+        )
+        texts = [dialog.location_list.item(index).text() for index in range(dialog.location_list.count())]
+        self.assertIn("收藏目录", texts)
+        self.assertTrue(any("常用目录" in text for text in texts))
+        self.assertIn("最近浏览", texts)
+        self.assertTrue(any("recent-in-dialog" in text for text in texts))
+        dialog._location_activated(dialog.location_list.item(1))
+        self.assertEqual(dialog.selected_path, str(favorite))
+        dialog.file_dialog.setDirectory(str(recent))
+        dialog._toggle_current_favorite()
+        self.assertIsNotNone(store.favorite(recent))
+        dialog.close()
 
     def test_main_window_path_fields_keep_line_edit_compatible_contract(self) -> None:
         store = PathPickerSettings(self.settings())
