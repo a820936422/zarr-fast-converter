@@ -1,0 +1,14 @@
+[package]
+name = "fast-nc-zarr-zarr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Zarr v3 inspection and chunk I/O for the native backend"
+
+[dependencies]
+zarrs_filesystem.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ndarray.workspace = true
+zarrs.workspace = true

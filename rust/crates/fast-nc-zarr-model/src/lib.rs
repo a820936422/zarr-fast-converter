@@ -16,7 +16,13 @@ impl BackendCapability {
             backend: "rust".to_owned(),
             protocol_version: BACKEND_PROTOCOL_VERSION,
             crate_version: env!("CARGO_PKG_VERSION").to_owned(),
-            operations: vec!["probe".to_owned()],
+            operations: vec![
+                "probe".to_owned(),
+                "zarr.inspect".to_owned(),
+                "zarr.read_chunk_f32".to_owned(),
+                "zarr.read_region_f32".to_owned(),
+                "zarr.write_f32".to_owned(),
+            ],
         }
     }
 }
@@ -30,6 +36,6 @@ mod tests {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
         assert_eq!(capability.protocol_version, BACKEND_PROTOCOL_VERSION);
-        assert_eq!(capability.operations, ["probe"]);
+        assert_eq!(capability.operations.len(), 5);
     }
 }

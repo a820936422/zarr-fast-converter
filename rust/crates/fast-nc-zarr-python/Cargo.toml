@@ -12,4 +12,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 fast-nc-zarr-model.workspace = true
 pyo3.workspace = true
+fast-nc-zarr-zarr.workspace = true
 serde_json.workspace = true

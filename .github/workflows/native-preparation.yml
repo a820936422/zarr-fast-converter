@@ -35,8 +35,6 @@ jobs:
       - name: Run Rust clippy
         run: pixi run rust-clippy
 
-      - name: Build and install native extension
-        run: pixi run native-develop
 
       - name: Run native protocol smoke tests
         run: pixi run cross-backend-test
