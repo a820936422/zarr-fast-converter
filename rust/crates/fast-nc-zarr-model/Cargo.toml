@@ -1,0 +1,9 @@
+[package]
+name = "fast-nc-zarr-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Stable protocol types shared by the Fast NC Zarr backends"
+
+[dependencies]
+serde.workspace = true

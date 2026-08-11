@@ -14,3 +14,8 @@ build/
 # Local converter scratch stores
 .fast_nc_zarr_*
 *.zarr.tmp/
+
+
+# Rust/Cargo and PyO3 native build products
+/target/
+src/fast_nc_zarr/_native*.so

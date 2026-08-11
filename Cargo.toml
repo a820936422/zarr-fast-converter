@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "rust/crates/fast-nc-zarr-model",
+    "rust/crates/fast-nc-zarr-python",
+]
+
+[workspace.package]
+version = "1.6.9"
+edition = "2021"
+rust-version = "1.83"
+
+[workspace.dependencies]
+fast-nc-zarr-model = { path = "rust/crates/fast-nc-zarr-model" }
+pyo3 = { version = "0.29", features = ["extension-module"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
