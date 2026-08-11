@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from .models import ConversionPlan, Inventory, OutputLayout, Selection
-from .system import available_memory, physical_cpu_count, storage_profile
+from .system import EffectiveResourceBudget, effective_resource_budget, storage_profile
 
 MIB = 1024**2
 
@@ -122,7 +122,13 @@ def initial_plan(
     output: Path,
     *,
     reserve_gib: float = 2.0,
+    resource_budget: EffectiveResourceBudget | None = None,
 ) -> ConversionPlan:
+    budget = resource_budget or effective_resource_budget(
+        source=inventory.input_dir,
+        output=output,
+        reserve_memory_bytes=int(max(0.0, float(reserve_gib)) * 1024**3),
+    )
     compatible, reason = direct_compatible(inventory, selection)
     if not compatible:
         chunk_time = min(selection.shape[0], 16)
@@ -131,56 +137,55 @@ def initial_plan(
         chunk_bytes = chunk_time * cy * cx * largest_item
         memory_workers = max(
             1,
-            available_memory(reserve_gib) // max(256 * MIB, chunk_bytes * 4),
+            budget.memory_budget_bytes // max(256 * MIB, chunk_bytes * 4),
         )
         return ConversionPlan(
             "dask",
-            min(physical_cpu_count(), 4, int(memory_workers)),
+            min(budget.worker_ceiling, int(memory_workers)),
             chunk_time,
             cy,
             cx,
-            rationale=(reason, "回退路径同样按可用内存限制 chunk 和进程数"),
+            rationale=(reason, "回退路径按统一有效资源预算限制 chunk 和进程数"),
         )
 
     kind = workload_kind(inventory)
-    source = storage_profile(inventory.input_dir)
-    destination = storage_profile(output)
+    source = budget.source_storage or storage_profile(inventory.input_dir)
+    destination = budget.output_storage or storage_profile(output)
     same_device = source.device != "unknown" and source.device == destination.device
-    cpus = physical_cpu_count()
+    cpus = max(1, int(budget.worker_ceiling))
     nt, _, _ = selection.shape
     rationale = [f"输入形态：{kind}"]
-    if source.rotational:
-        rationale.append("源位于机械硬盘")
+    if source.medium:
+        rationale.append(f"源存储 profile：{source.medium}/{source.filesystem}")
     if same_device:
-        rationale.append("源和目标位于同一文件系统，限制并发随机 I/O")
+        rationale.append("源和目标同设备；仅作为 benchmark context，不静态限制 worker")
 
     if kind == "many-small-files":
         chunk_time = 1
         strategy = "file"
         target_mib = 4
-        workers = min(cpus, 2 if same_device and source.rotational else 4)
-        batch = 2 if source.rotational else 4
+        workers = cpus
+        batch = 4
     elif kind == "large-files":
         native_t = _common_native(inventory, "time", 16)
         chunk_time = min(nt, max(8, min(64, native_t)))
         strategy = "chunk"
         target_mib = 64
-        workers = min(cpus, 3 if same_device and source.rotational else cpus)
+        workers = cpus
         batch = 1
     else:
         typical_t = max(1, inventory.median_times_per_file)
         chunk_time = min(nt, max(1, min(32, typical_t)))
         strategy = "chunk"
         target_mib = 32
-        workers = min(cpus, 3 if same_device and source.rotational else cpus)
+        workers = cpus
         batch = 1
 
     cy, cx = spatial_chunks(inventory, selection, chunk_time, target_mib)
     chunk_bytes = chunk_time * cy * cx * max(
         inventory.variables[name].itemsize for name in selection.variables
     )
-    memory_limit = available_memory(reserve_gib)
-    memory_workers = max(1, memory_limit // max(128 * MIB, chunk_bytes * 3))
+    memory_workers = max(1, budget.memory_budget_bytes // max(128 * MIB, chunk_bytes * 3))
     workers = max(1, min(workers, int(memory_workers)))
     return ConversionPlan(
         strategy,
@@ -202,6 +207,7 @@ def resolve_conversion_plan(
     chunks: tuple[int, int, int] | None = None,
     max_workers: int | None = None,
     reserve_gib: float = 2.0,
+    resource_budget: EffectiveResourceBudget | None = None,
 ) -> ConversionPlan:
     """Resolve all non-benchmark conversion overrides in one place.
 
@@ -216,6 +222,7 @@ def resolve_conversion_plan(
         selection,
         output,
         reserve_gib=reserve_gib,
+        resource_budget=resource_budget,
     )
     if chunks is not None:
         if len(chunks) != 3 or any(int(value) <= 0 for value in chunks):
@@ -258,6 +265,7 @@ def fixed_layout_candidate_plans(
     max_workers: int | None = None,
     reserve_gib: float = 2.0,
     worker_chunk_bytes: int | None = None,
+    resource_budget: EffectiveResourceBudget | None = None,
 ) -> list[ConversionPlan]:
     """Vary execution concurrency without changing a supplied storage layout."""
 
@@ -266,7 +274,11 @@ def fixed_layout_candidate_plans(
     if max_workers is not None and int(max_workers) <= 0:
         raise ValueError("max_workers 必须是正整数。")
 
-    cpu_limit = physical_cpu_count()
+    budget = resource_budget or effective_resource_budget(
+        source=inventory.input_dir,
+        reserve_memory_bytes=int(max(0.0, float(reserve_gib)) * 1024**3),
+    )
+    cpu_limit = int(budget.worker_ceiling)
     if max_workers is not None:
         cpu_limit = min(cpu_limit, int(max_workers))
     largest_item = max(
@@ -281,18 +293,12 @@ def fixed_layout_candidate_plans(
     if worker_chunk_bytes is not None:
         chunk_bytes = max(chunk_bytes, max(1, int(worker_chunk_bytes)))
     estimated_worker = max(128 * MIB, chunk_bytes * 3)
-    memory_limit = max(1, available_memory(reserve_gib) // estimated_worker)
+    memory_limit = max(1, budget.memory_budget_bytes // estimated_worker)
     worker_limit = max(1, min(cpu_limit, int(memory_limit)))
 
-    # Always measure at least three distinct worker counts when the declared
-    # CPU, memory and user limits allow it.  Powers of two cover larger hosts
-    # without turning a fixed-layout tune into an exhaustive search.
-    worker_values = set(range(1, min(worker_limit, 4) + 1))
-    value = 8
-    while value < worker_limit:
-        worker_values.add(value)
-        value *= 2
-    worker_values.update((min(base.workers, worker_limit), worker_limit))
+    # Fixed layouts must expose every safe worker count to the benchmark;
+    # storage profiles are context, not a static cap.
+    worker_values = set(range(1, worker_limit + 1))
 
     _, ny, nx = selection.shape
     spatial_chunks = math.ceil(ny / base.chunk_lat) * math.ceil(nx / base.chunk_lon)
@@ -333,22 +339,26 @@ def candidate_plans(
     *,
     max_workers: int | None = None,
     reserve_gib: float = 2.0,
+    resource_budget: EffectiveResourceBudget | None = None,
 ) -> list[ConversionPlan]:
-    base = initial_plan(inventory, selection, output, reserve_gib=reserve_gib)
+    base = initial_plan(
+        inventory,
+        selection,
+        output,
+        reserve_gib=reserve_gib,
+        resource_budget=resource_budget,
+    )
     if base.strategy == "dask":
         return [base]
-    cpu_limit = min(max_workers or physical_cpu_count(), physical_cpu_count())
-    source = storage_profile(inventory.input_dir)
-    destination = storage_profile(output)
-    same_rotational = (
-        source.rotational is True
-        and source.device != "unknown"
-        and source.device == destination.device
+    budget = resource_budget or effective_resource_budget(
+        source=inventory.input_dir,
+        output=output,
+        reserve_memory_bytes=int(max(0.0, float(reserve_gib)) * 1024**3),
     )
-    worker_values = {1, base.workers, min(cpu_limit, 2), min(cpu_limit, 4), cpu_limit}
-    if not same_rotational:
-        worker_values.discard(1)
-    worker_values = sorted(value for value in worker_values if value >= 1)
+    cpu_limit = int(budget.worker_ceiling)
+    if max_workers is not None:
+        cpu_limit = min(cpu_limit, int(max_workers))
+    worker_values = list(range(1, max(1, cpu_limit) + 1))
 
     kind = workload_kind(inventory)
     if kind == "many-small-files":
@@ -365,8 +375,9 @@ def candidate_plans(
         targets = [16, 32, 64, 128]
         batches = [1]
 
-    candidates: list[ConversionPlan] = [base]
-    candidates.append(replace(base, workers=max(worker_values)))
+    candidates: list[ConversionPlan] = [
+        replace(base, workers=workers) for workers in worker_values
+    ]
     # Filename-time products with one slice per file can benefit from a
     # file-centric plan even when the general balanced profile starts with a
     # chunk plan.  Keep this after the worker candidate so a short tune budget
@@ -416,7 +427,7 @@ def candidate_plans(
             128 * MIB,
             item.chunk_time * item.chunk_lat * item.chunk_lon * largest_item * 3,
         )
-        memory_workers = max(1, available_memory(reserve_gib) // estimated_worker)
+        memory_workers = max(1, budget.memory_budget_bytes // estimated_worker)
         item = replace(item, workers=min(item.workers, int(memory_workers)))
         key = (
             item.strategy,
@@ -432,9 +443,10 @@ def candidate_plans(
         if key not in seen:
             seen.add(key)
             unique.append(item)
-    # Balanced and many-small profiles need a few more orthogonal candidates
-    # (especially task batching); the tune budget still limits how many are
-    # actually benchmarked.  Large-file profiles stay compact because each
-    # trial can touch much more data.
+    # Never truncate the 1..worker-ceiling parallelism sweep; the budget
+    # controls how many trials run, while the manifest must expose all safe
+    # worker candidates.  Only orthogonal layout candidates are compacted.
     limit = 14 if kind != "large-files" else 12
+    if len(worker_values) >= limit:
+        return unique
     return unique[:limit]

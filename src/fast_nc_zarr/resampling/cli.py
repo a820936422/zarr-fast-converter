@@ -99,8 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--space-workers",
         type=_space_workers_arg,
         default="auto",
-        help="并行处理空间块的进程数；默认 auto，最多使用 6 个进程。",
+        help="并行处理空间块的进程数；默认 auto，受有效 CPU、内存和文件描述符约束后实测。",
     )
+    parser.add_argument(
+        "--tuning-objective",
+        choices=("speed", "balanced", "compact"),
+        default="balanced",
+        help="空间并发调优目标。",
+    )
+    parser.add_argument("--tune-budget", type=float, default=60.0)
     parser.add_argument(
         "--temporary-dir",
         type=Path,
@@ -149,6 +156,8 @@ def _interactive_args() -> argparse.Namespace:
         time_block="auto",
         compute_workers=2,
         space_workers="auto",
+        tuning_objective="balanced",
+        tune_budget=60.0,
         temporary_dir=(
             Path(value)
             if (value := input("可选中间处理目录（回车使用输出目录旁临时目录）：").strip())
@@ -193,6 +202,8 @@ def run(args: argparse.Namespace) -> int:
         time_block=args.time_block,
         compute_workers=args.compute_workers,
         space_workers=args.space_workers,
+        tuning_objective=args.tuning_objective,
+        tune_budget=args.tune_budget,
         temporary_dir=args.temporary_dir,
         overwrite=args.overwrite,
         validate=not args.no_validate,

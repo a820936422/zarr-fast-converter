@@ -15,9 +15,9 @@ class WorkerAutotuneTests(unittest.TestCase):
     def test_pipeline_chunking_defaults_to_auto(self) -> None:
         self.assertEqual(PipelineChunkingOptions().workers, "auto")
 
-    def test_candidates_are_bounded_and_include_parallel_options(self) -> None:
+    def test_candidates_include_every_safe_parallel_option(self) -> None:
         self.assertEqual(worker_candidates(1), (1,))
-        self.assertEqual(worker_candidates(6), (1, 2, 4, 6))
+        self.assertEqual(worker_candidates(6), (1, 2, 3, 4, 5, 6))
 
     def test_cpu_bound_sample_selects_two_or_more(self) -> None:
         trials = tuple(
@@ -33,7 +33,7 @@ class WorkerAutotuneTests(unittest.TestCase):
         selected, _reason = select_worker_trial(trials)
         self.assertEqual(selected, 2)
 
-    def test_failed_candidate_conservatively_stops_at_one(self) -> None:
+    def test_failed_candidates_do_not_block_higher_parallel_options(self) -> None:
         def runner(workers: int) -> dict[str, float | int]:
             if workers != 1:
                 raise OSError("simulated failure")
@@ -51,8 +51,8 @@ class WorkerAutotuneTests(unittest.TestCase):
         )
         self.assertEqual(report.selected_workers, 1)
         self.assertEqual(report.trials[1].status, "failed")
-        self.assertEqual(report.trials[2].status, "skipped_after_failure")
-        self.assertIn("candidates", report.to_dict())
+        self.assertEqual(report.trials[2].status, "failed")
+        self.assertEqual(report.rejected_candidates, (2, 4))
 
 
 if __name__ == "__main__":

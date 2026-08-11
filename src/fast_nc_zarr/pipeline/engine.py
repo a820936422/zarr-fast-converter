@@ -19,9 +19,9 @@ from ..application.services import (
     run_rechunk,
     run_resample,
 )
-from ..publication import publish_staging, validate_publish_target
+from ..publication import preflight_writable, publish_staging, validate_publish_target
 from ..selection import selected_logical_bytes
-from ..system import runtime_resource_snapshot
+from ..system import effective_resource_budget, runtime_resource_snapshot
 from ..resampling.engine import (
     _build_regridder,
     _mask_missing,
@@ -34,6 +34,7 @@ from ..resampling.models import GridInfo, ResampleConfig
 from ..resampling.replacements import apply_replacement_rules, parse_replacement_rules
 from ..validation import validate_semantic_samples
 from .models import (
+    MANIFEST_SCHEMA_VERSION,
     PipelineConfig,
     PipelinePaths,
     PipelinePlan,
@@ -63,6 +64,18 @@ def _write_manifest(path: Path, payload: dict) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+def _write_event(path: Path, event: str, payload: dict[str, object] | None = None) -> None:
+    """Append a best-effort machine-readable stage event."""
+
+    record = {"timestamp": time.time(), "event": str(event), **(payload or {})}
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
+            handle.flush()
+    except OSError:
+        # Telemetry must not turn a valid data product into a failed task.
+        return
 
 def _apply_runtime_compression(
     manifest: dict,
@@ -155,7 +168,19 @@ def _paths(config: PipelineConfig) -> PipelinePaths:
         converted=root / "source-crop.zarr",
         resampled=root / "resampled.zarr",
         final_staging=output.parent / f".{output.name}.pipeline-{uuid4().hex}.tmp",
+        events=root / "events.jsonl",
     )
+
+def _preflight_paths(paths: PipelinePaths, output_parent: Path) -> dict[str, dict[str, object]]:
+    try:
+        return {
+            "temporary": preflight_writable(paths.root.parent, "一条龙临时"),
+            "output": preflight_writable(output_parent, "一条龙输出"),
+        }
+    except (OSError, ValueError) as exc:
+        raise PipelineExecutionError(
+            f"一条龙开始前目录可写性预检失败：{exc}"
+        ) from exc
 
 def _nearest_existing(path: Path) -> Path:
     current = path.expanduser().resolve()
@@ -565,9 +590,16 @@ def _run_zarr_pipeline(
     progress: bool = True,
 ) -> dict[str, object]:
     paths = _paths(config)
+    preflight = _preflight_paths(
+        paths,
+        Path(config.general.output).expanduser().resolve().parent,
+    )
     paths.root.mkdir(parents=True, exist_ok=False)
+    _write_event(paths.events, "started", {"job_id": paths.root.name})
     output = Path(config.general.output).expanduser().resolve()
     resources = _pipeline_resource_snapshot(inspection, config, paths)
+    resource_budget = effective_resource_budget(resources)
+    _write_event(paths.events, "resource", {"resource_budget": resource_budget.to_dict()})
     if progress:
         _print_resource_snapshot(resources)
     requested_operations = {
@@ -585,14 +617,29 @@ def _run_zarr_pipeline(
     if plan.finalization_required:
         physical_stages.append("finalization")
     manifest = {
-        "schema_version": 5,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "job_id": paths.root.name,
         "status": "running",
         "source": str(inspection.path),
+        "preflight": preflight,
         "input_kind": getattr(inspection, "kind", "zarr"),
         "output": str(output),
         "temporary_root": str(paths.root),
+        "events": str(paths.events),
         "resource_snapshot": resources.to_dict(),
+        "resource_budget": resource_budget.to_dict(),
+        "storage_profiles": {
+            "source": resource_budget.source_storage.to_dict(redact_paths=True) if resource_budget.source_storage else None,
+            "temporary": resource_budget.temporary_storage.to_dict(redact_paths=True) if resource_budget.temporary_storage else None,
+            "output": resource_budget.output_storage.to_dict(redact_paths=True) if resource_budget.output_storage else None,
+        },
+        "candidate_trials": {},
+        "selection": {},
+        "resolved_plans": {},
+        "worker_memory_semantics": {
+            "per_worker_peak_is_inclusive": True,
+            "aggregate_parallel_peak_is_per_worker_peak_times_workers": True,
+        },
         "cleanup_intermediate": bool(config.general.cleanup_intermediate),
         "needs_resample": bool(plan.needs_resample),
         "direct_finalization": bool(plan.direct_finalization),
@@ -669,7 +716,10 @@ def _run_zarr_pipeline(
                     time_block=options.time_block,
                     compute_workers=options.compute_workers,
                     space_workers=options.space_workers,
+                    tuning_objective=options.tuning_objective,
+                    tune_budget=options.tune_budget,
                     temporary_dir=paths.root,
+                    resource_budget=effective_resource_budget(resources),
                     output_layout=plan.output_layout,
                     before_replacements=parse_replacement_rules(
                         options.before_conditions, options.before_results
@@ -689,6 +739,10 @@ def _run_zarr_pipeline(
                 else "published_as_final",
                 "metrics": resample_metrics,
             }
+            manifest["candidate_trials"]["resampling"] = resample_metrics.get("tuning", {})
+            manifest["selection"]["resampling"] = resample_metrics.get("tuning", {}).get("selection_reason")
+            manifest["resolved_plans"]["resampling"] = resample_metrics.get("resolved_plan", {})
+            _write_event(paths.events, "tuning", {"stage": "resampling", "selection": manifest["selection"]["resampling"]})
             _write_manifest(paths.manifest, manifest)
             if resuming:
                 if plan.resample_plan is None:
@@ -762,6 +816,7 @@ def _run_zarr_pipeline(
                     compression_shuffle=config.compression.shuffle,
                     compression_objective=config.compression.objective,
                     compression_tune_budget=config.compression.tune_budget,
+                    resource_budget=effective_resource_budget(resources),
                 ),
                 cancel_event=cancel_event,
             )
@@ -773,6 +828,17 @@ def _run_zarr_pipeline(
             if plan.needs_resample and config.general.cleanup_intermediate:
                 shutil.rmtree(current)
                 manifest["stages"]["resampling"]["status"] = "validated_and_cleaned"
+        if plan.finalization_required:
+            manifest["candidate_trials"]["finalization"] = finalization_metrics.get("worker_tuning", {})
+            manifest["selection"]["finalization"] = {
+                "tuning_objective": finalization_metrics.get("tuning_objective"),
+                "worker_tuning": finalization_metrics.get("worker_tuning", {}),
+            }
+            manifest["resolved_plans"]["finalization"] = {
+                "resource_budget": finalization_metrics.get("resource_budget"),
+                "selected_compression": finalization_metrics.get("selected_compression"),
+            }
+            _write_event(paths.events, "tuning", {"stage": "finalization", "selection": manifest["selection"]["finalization"]})
         semantic_validation = _semantic_validation(output, config, progress=progress)
         manifest["semantic_validation"] = semantic_validation
         final_output_bytes = int(
@@ -817,6 +883,7 @@ def _run_zarr_pipeline(
         manifest["logical_io"] = logical_io
         manifest["status"] = "succeeded"
         manifest["elapsed"] = time.perf_counter() - started
+        _write_event(paths.events, "finished", {"status": "succeeded", "elapsed": manifest["elapsed"]})
         _write_manifest(paths.manifest, manifest)
         return {
             "output": str(output),
@@ -837,6 +904,7 @@ def _run_zarr_pipeline(
         manifest["status"] = "failed"
         manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started
+        _write_event(paths.events, "finished", {"status": "failed", "stage": current_stage, "error": str(exc)})
         manifest["error"] = str(exc)
         _write_manifest(paths.manifest, manifest)
         if isinstance(exc, PipelineExecutionError):
@@ -868,8 +936,12 @@ def run_pipeline(
         )
     paths = _paths(config)
     _check_raw_storage_capacity(inspection, plan, paths)
+    preflight = _preflight_paths(paths, paths.final_staging.parent)
     paths.root.mkdir(parents=True, exist_ok=False)
     resources = _pipeline_resource_snapshot(inspection, config, paths)
+    resource_budget = effective_resource_budget(resources)
+    _write_event(paths.events, "started", {"job_id": paths.root.name})
+    _write_event(paths.events, "resource", {"resource_budget": resource_budget.to_dict()})
     if progress:
         _print_resource_snapshot(resources)
     requested_operations = {
@@ -887,14 +959,29 @@ def run_pipeline(
     if plan.finalization_required:
         physical_stages.append("finalization")
     manifest = {
-        "schema_version": 5,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "job_id": paths.root.name,
         "status": "running",
         "source": str(inspection.path),
         "input_kind": "raw" if getattr(inspection, "kind", None) == "source" else getattr(inspection, "kind", "unknown"),
+        "preflight": preflight,
         "output": str(Path(config.general.output).expanduser().resolve()),
         "temporary_root": str(paths.root),
+        "events": str(paths.events),
         "resource_snapshot": resources.to_dict(),
+        "resource_budget": resource_budget.to_dict(),
+        "storage_profiles": {
+            "source": resource_budget.source_storage.to_dict(redact_paths=True) if resource_budget.source_storage else None,
+            "temporary": resource_budget.temporary_storage.to_dict(redact_paths=True) if resource_budget.temporary_storage else None,
+            "output": resource_budget.output_storage.to_dict(redact_paths=True) if resource_budget.output_storage else None,
+        },
+        "candidate_trials": {},
+        "selection": {},
+        "resolved_plans": {},
+        "worker_memory_semantics": {
+            "per_worker_peak_is_inclusive": True,
+            "aggregate_parallel_peak_is_per_worker_peak_times_workers": True,
+        },
         "cleanup_intermediate": bool(config.general.cleanup_intermediate),
         "needs_resample": bool(plan.needs_resample),
         "direct_finalization": bool(plan.direct_finalization),
@@ -935,6 +1022,17 @@ def run_pipeline(
             if conversion_is_final
             else paths.converted
         )
+        conversion_budget = effective_resource_budget(
+            resources,
+            reserve_memory_bytes=int(
+                max(0.0, float(config.conversion.reserve_memory_gib)) * 1024**3
+            ),
+            requested=(
+                config.conversion.max_workers
+                if not config.conversion.auto_tune
+                else None
+            ),
+        )
         conversion_config = ConversionConfig(
             output=conversion_output,
             time_start=config.general.time_start,
@@ -947,6 +1045,8 @@ def run_pipeline(
             variable_names=conversion.variable_names,
             variable_transforms=conversion.variable_transforms,
             auto_tune=conversion.auto_tune,
+            tuning_objective=config.conversion.tuning_objective,
+            resource_budget=conversion_budget,
             tune_budget=conversion.tune_budget,
             max_workers=conversion.max_workers,
             reserve_memory_gib=conversion.reserve_memory_gib,
@@ -977,6 +1077,10 @@ def run_pipeline(
             "metrics": conversion_metrics,
             "plan": asdict(conversion_plan),
         }
+        manifest["candidate_trials"]["conversion"] = conversion_metrics.get("tuning", {})
+        manifest["selection"]["conversion"] = conversion_metrics.get("tuning", {}).get("selection_reason")
+        manifest["resolved_plans"]["conversion"] = asdict(conversion_plan)
+        _write_event(paths.events, "tuning", {"stage": "conversion", "selection": manifest["selection"]["conversion"]})
         if not conversion_is_final:
             manifest["resume"]["checkpoints"]["conversion"] = {
                 "path": "source-crop.zarr",
@@ -1019,6 +1123,8 @@ def run_pipeline(
                 target_lon_descending=False,
                 overwrite=False,
                 validate=config.validate,
+                tuning_objective=resampling.tuning_objective,
+                tune_budget=resampling.tune_budget,
                 tile_size=resampling.tile_size,
                 # The conversion planner has already resolved a safe time
                 # batch for its temporary layout.  Do not independently
@@ -1031,6 +1137,7 @@ def run_pipeline(
                 ),
                 compute_workers=resampling.compute_workers,
                 space_workers=resampling.space_workers,
+                resource_budget=effective_resource_budget(resources),
                 temporary_dir=paths.root,
                 output_layout=plan.output_layout if resampling_is_final else None,
                 before_replacements=parse_replacement_rules(
@@ -1088,9 +1195,11 @@ def run_pipeline(
                     overwrite=config.general.overwrite,
                     require_zarr_v3=True,
                 )
-                manifest["stages"]["resampling"]["status"] = (
-                    "published_as_final"
-                )
+                manifest["stages"]["resampling"]["status"] = "published_as_final"
+            manifest["candidate_trials"]["resampling"] = resample_metrics.get("tuning", {})
+            manifest["selection"]["resampling"] = resample_metrics.get("tuning", {}).get("selection_reason")
+            manifest["resolved_plans"]["resampling"] = resample_metrics.get("resolved_plan", {})
+            _write_event(paths.events, "tuning", {"stage": "resampling", "selection": manifest["selection"]["resampling"]})
             _write_manifest(paths.manifest, manifest)
             current = final_target if resampling_is_final else resample_output
             if config.general.cleanup_intermediate:
@@ -1137,6 +1246,7 @@ def run_pipeline(
                 compression_shuffle=config.compression.shuffle,
                 compression_objective=config.compression.objective,
                 compression_tune_budget=config.compression.tune_budget,
+                resource_budget=effective_resource_budget(resources),
                 storage_overrides={
                     "source": config.general.source_storage,
                     "temporary": config.general.temporary_storage,
@@ -1158,6 +1268,16 @@ def run_pipeline(
             if config.general.cleanup_intermediate:
                 shutil.rmtree(current, ignore_errors=False)
                 manifest["stages"]["resampling" if plan.needs_resample else "conversion"]["status"] = "validated_and_cleaned"
+        manifest["candidate_trials"]["finalization"] = rechunk_metrics.get("worker_tuning", {})
+        manifest["selection"]["finalization"] = {
+            "tuning_objective": rechunk_metrics.get("tuning_objective"),
+            "worker_tuning": rechunk_metrics.get("worker_tuning", {}),
+        }
+        manifest["resolved_plans"]["finalization"] = {
+            "resource_budget": rechunk_metrics.get("resource_budget"),
+            "selected_compression": rechunk_metrics.get("selected_compression"),
+        }
+        _write_event(paths.events, "tuning", {"stage": "finalization", "selection": manifest["selection"]["finalization"]})
         semantic_validation = _semantic_validation(
             Path(config.general.output).expanduser().resolve(),
             config,
@@ -1196,6 +1316,7 @@ def run_pipeline(
         manifest["logical_io"] = logical_io
         manifest["status"] = "succeeded"
         manifest["elapsed"] = time.perf_counter() - started
+        _write_event(paths.events, "finished", {"status": "succeeded", "elapsed": manifest["elapsed"]})
         _write_manifest(paths.manifest, manifest)
         if progress:
             print(f"一条龙处理完成：{config.general.output}")
@@ -1218,6 +1339,7 @@ def run_pipeline(
         manifest["status"] = "failed"
         manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started
+        _write_event(paths.events, "finished", {"status": "failed", "stage": current_stage, "error": str(exc)})
         manifest["error"] = str(exc)
         _write_manifest(paths.manifest, manifest)
         if isinstance(exc, PipelineExecutionError):

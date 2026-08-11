@@ -23,7 +23,7 @@ python -m fast_nc_zarr.resampling --help
 
 1. 检查 Zarr 元数据、变量、坐标规则性、分辨率、chunks 和 codec。
 2. 根据 `source` 或 `global` 范围建立目标网格。
-3. 自动规划目标 tile、时间 block、源窗口和 worker；也可手动指定。
+3. 根据统一 `EffectiveResourceBudget` 规划目标 tile、时间 block、compute/space worker 候选；内存和物理 chunk ownership 是硬边界，存储 profile 只作 benchmark 上下文。
 4. 将缺失值和 `_FillValue` 掩码后执行 xESMF。
 5. 可在采样前后应用值替换规则。
 6. 写入与最终 chunks 对齐的空间块，避免进程并发改写同一 chunk。
@@ -77,7 +77,7 @@ pixi run resample -- --input /data/input.zarr --output /data/output.zarr --resol
 
 当计算 time block 小于最终 time chunk 时，每个空间任务独占一个或一组完整的最终物理 chunk，并将各时间批次填入受内存预算约束的堆缓冲或任务专属 memmap；填满后每个物理 chunk 只编码写入一次。这样不需要完整的时间中转 Zarr，也不会让多个进程并发读改写同一 chunk。memmap 在成功、取消和异常路径都会清理。
 
-输入属性、时间坐标和可兼容 codec 会被保留；显式最终布局由一条龙规划器下推时，重采样器直接写目标 chunks/codec。指标会记录 owner buffer、memmap 使用和避免的中转逻辑字节。
+输入属性、时间坐标和可兼容 codec 会被保留；显式最终布局由一条龙规划器下推时，重采样器直接写目标 chunks/codec。指标会分别记录 per-worker 与 aggregate parallel peak、owner buffer、memmap 使用和避免的中转逻辑字节；`--tuning-objective` 可选择 speed、balanced 或 compact。
 
 ## Python 入口
 

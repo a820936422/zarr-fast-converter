@@ -45,6 +45,7 @@ from ..rechunking.engine import run_rechunk as core_run_rechunk
 from ..rechunking.inspection import format_inspection, inspect_store
 from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo
 from ..rechunking.planning import DEFAULT_TARGET_MIB, plan_chunks
+from ..system import EffectiveResourceBudget
 from ..resampling.engine import (
     format_plan as format_resample_plan,
     plan_resample as core_plan_resample,
@@ -248,6 +249,8 @@ class ConversionConfig:
     variable_transforms: dict[str, VariableTransform] = field(default_factory=dict)
     auto_tune: bool = False
     tune_budget: float = 60.0
+    tuning_objective: Literal["speed", "balanced", "compact"] = "balanced"
+    resource_budget: EffectiveResourceBudget | None = None
     max_workers: int | None = None
     reserve_memory_gib: float = 2.0
     chunks: tuple[int, int, int] | None = None
@@ -272,7 +275,7 @@ class RechunkConfig:
     target_mib: float = DEFAULT_TARGET_MIB
     custom_chunks: tuple[int, int, int] | None = None
     compression: str = "none"
-    workers: int | str = 1
+    workers: int | str = "auto"
     overwrite: bool = False
     validate: bool = True
     # ``compression_only`` is retained for callers of the previous two-page
@@ -287,6 +290,8 @@ class RechunkConfig:
     compression_shuffle: str = "auto"
     compression_objective: str = "balanced"
     compression_tune_budget: float = 60.0
+    tuning_objective: Literal["speed", "balanced", "compact"] = "balanced"
+    resource_budget: EffectiveResourceBudget | None = None
     storage_overrides: dict[str, str] = field(default_factory=dict)
 
 
@@ -664,6 +669,7 @@ def preview_conversion(
         reserve_gib=config.reserve_memory_gib,
         chunks=config.chunks,
         max_workers=config.max_workers,
+        resource_budget=config.resource_budget,
     )
     logical = (
         filename_logical_bytes(inventory, selection, config.variable_transforms)
@@ -693,6 +699,8 @@ def run_conversion(
             plan=preview.plan,
             auto_tune=config.auto_tune,
             tune_budget=config.tune_budget,
+            tuning_objective=config.tuning_objective,
+            resource_budget=config.resource_budget,
             max_workers=config.max_workers,
             reserve_gib=config.reserve_memory_gib,
             overwrite=config.overwrite,
@@ -706,6 +714,8 @@ def run_conversion(
         output,
         auto_tune=config.auto_tune,
         tune_budget=config.tune_budget,
+        tuning_objective=config.tuning_objective,
+        resource_budget=config.resource_budget,
         max_workers=config.max_workers,
         reserve_gib=config.reserve_memory_gib,
         overwrite=config.overwrite,
@@ -783,6 +793,8 @@ def run_rechunk(
         temporary_dir=config.temporary_dir,
         compression_objective=config.compression_objective,
         compression_tune_budget_seconds=config.compression_tune_budget,
+        tuning_objective=config.tuning_objective,
+        resource_budget=config.resource_budget,
         storage_overrides=config.storage_overrides,
     )
 

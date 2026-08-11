@@ -9,6 +9,7 @@ import numpy as np
 
 from ..rechunking.models import DatasetInfo, VariableInfo
 from .models import AutoTileDecision, ComputeDType, GridInfo, TargetGrid
+from ..system import EffectiveResourceBudget
 
 
 MIB = 1024**2
@@ -95,33 +96,47 @@ def resolve_owner_buffer_budget(
     pressure_cap = min(int(available * 0.05), int(total * 0.025))
     return max(0, min(256 * MIB, remaining // workers, pressure_cap // workers))
 
-
 def resolve_auto_space_workers(
     *,
     compute_workers: int,
     available_bytes: int | None = None,
     total_bytes: int | None = None,
-    maximum: int = 6,
+    maximum: int | None = None,
+    resource_budget: EffectiveResourceBudget | None = None,
 ) -> int:
-    """Choose a bounded number of independent spatial worker processes.
-
-    xESMF/ESMF work is CPU-heavy, so independent processes are much more
-    effective than adding more Dask threads to one tile.  The limit is kept
-    deliberately modest because every process owns an xESMF regridder and a
-    decoded source window.  The memory cap is only a guardrail; the detailed
-    tile estimate is still responsible for selecting the tile size.
-    """
+    """Choose spatial workers from effective resources, not storage type."""
 
     detected_available, detected_total = _memory_limits()
     available = max(
         256 * MIB,
-        int(detected_available if available_bytes is None else available_bytes),
+        int(
+            resource_budget.memory_available_bytes
+            if resource_budget is not None
+            else detected_available
+            if available_bytes is None
+            else available_bytes
+        ),
     )
-    total = max(256 * MIB, int(detected_total if total_bytes is None else total_bytes))
-    cpu_limit = max(1, min(int(maximum), int(os.cpu_count() or 1)))
-    # Keep enough headroom for the controller, filesystem cache and native
-    # libraries. The detailed tile model adds decoded arrays and weights; this
-    # baseline represents the ESMF process before those explicit buffers.
+    total = max(
+        256 * MIB,
+        int(
+            resource_budget.memory_total_bytes
+            if resource_budget is not None
+            else detected_total
+            if total_bytes is None
+            else total_bytes
+        ),
+    )
+    cpu_limit = max(
+        1,
+        int(
+            resource_budget.worker_ceiling
+            if resource_budget is not None
+            else os.cpu_count() or 1
+        ),
+    )
+    if maximum is not None:
+        cpu_limit = min(cpu_limit, max(1, int(maximum)))
     per_process = (4.0 + 0.25 * max(0, int(compute_workers) - 1)) * GIB
     memory_limit = max(1, int((available * 0.60) / per_process))
     total_limit = max(1, int((total * 0.50) / per_process))
@@ -167,6 +182,7 @@ def resolve_auto_time_block(
     method: str,
     skipna: bool,
     compute_dtype: ComputeDType = "source",
+    resource_budget: EffectiveResourceBudget | None = None,
 ) -> int:
     """Choose a bounded vectorized time batch for one spatial tile.
 
@@ -187,7 +203,11 @@ def resolve_auto_time_block(
         if "time" in variable.dims
     ]
     maximum = max(1, min(MAX_AUTO_TIME_BLOCK, min(time_sizes or [1])))
-    available, _total = _memory_limits()
+    available = (
+        resource_budget.memory_available_bytes
+        if resource_budget is not None
+        else _memory_limits()[0]
+    )
     batch_budget = max(256 * MIB, min(512 * MIB, int(available * 0.05)))
     required_per_time: list[int] = []
     for variable in spatial_variables:
@@ -495,15 +515,31 @@ def resolve_auto_tile_size(
     compute_dtype: ComputeDType = "source",
     available_bytes: int | None = None,
     total_bytes: int | None = None,
+    resource_budget: EffectiveResourceBudget | None = None,
 ) -> AutoTileDecision:
     """Choose the largest candidate whose estimated working set fits budget."""
 
     detected_available, detected_total = _memory_limits()
     available = max(
         256 * MIB,
-        int(detected_available if available_bytes is None else available_bytes),
+        int(
+            resource_budget.memory_available_bytes
+            if resource_budget is not None
+            else detected_available
+            if available_bytes is None
+            else available_bytes
+        ),
     )
-    total = max(256 * MIB, int(detected_total if total_bytes is None else total_bytes))
+    total = max(
+        256 * MIB,
+        int(
+            resource_budget.memory_total_bytes
+            if resource_budget is not None
+            else detected_total
+            if total_bytes is None
+            else total_bytes
+        ),
+    )
     budget = _memory_budget(available, total)
     candidates = _candidate_sizes(target)
     estimates = [

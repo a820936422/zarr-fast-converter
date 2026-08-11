@@ -19,9 +19,10 @@ import zarr
 
 from ..metadata import sanitize_cf_references
 from ..rechunking.models import DatasetInfo, VariableInfo
-from ..publication import publish_staging
+from ..publication import preflight_writable, publish_staging
 from ..runtime import configure_process_runtime, spawn_context
 from ..writer import compressor_from_spec
+from ..system import effective_resource_budget
 from .autotune import (
     resolve_auto_space_workers,
     resolve_auto_tile_size,
@@ -148,7 +149,6 @@ def _resolve_temporary_root(
         raise ResampleExecutionError("临时处理目录不能位于输出 Zarr 内部。")
     if root.exists() and not root.is_dir():
         raise ResampleExecutionError(f"临时处理路径不是目录：{root}")
-    root.mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -1554,6 +1554,11 @@ def plan_resample(
     config_path = Path(config.input).expanduser().resolve()
     if inspection.info.path != config_path:
         raise ValueError("重采样检查结果与配置中的输入路径不一致，请重新检查输入。")
+    resource_budget = config.resource_budget or effective_resource_budget(
+        source=config_path,
+        temporary=config.temporary_dir,
+        output=Path(config.output).expanduser().resolve().parent,
+    )
     if config.method not in RESAMPLING_METHODS:
         raise ValueError(
             "重采样方法必须是：" + ", ".join(RESAMPLING_METHODS)
@@ -1564,6 +1569,10 @@ def plan_resample(
         )
     if config.statistics_policy not in {"auto", "sample", "exact"}:
         raise ValueError("统计策略必须是 auto、sample 或 exact。")
+    if config.tuning_objective not in {"speed", "balanced", "compact"}:
+        raise ValueError("重采样调优目标必须是 speed、balanced 或 compact。")
+    if float(config.tune_budget) < 0:
+        raise ValueError("重采样调优预算不能为负数。")
     if not np.isfinite(float(config.na_thres)) or not 0 <= float(config.na_thres) <= 1:
         raise ValueError("na_thres 必须位于 0 到 1 之间。")
     if config.tile_size != "auto":
@@ -1594,6 +1603,7 @@ def plan_resample(
             method=config.method,
             skipna=config.skipna,
             compute_dtype=config.compute_dtype,
+            resource_budget=resource_budget,
         )
     else:
         try:
@@ -1602,9 +1612,20 @@ def plan_resample(
             raise ValueError("time_block 必须是正整数或 auto。") from exc
         if selected_time_block <= 0:
             raise ValueError("time_block 必须是正整数或 auto。")
+    try:
+        requested_compute_workers = int(config.compute_workers)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("compute_workers 必须是正整数。") from exc
+    if requested_compute_workers <= 0:
+        raise ValueError("compute_workers 必须是正整数。")
+    selected_compute_workers = min(
+        requested_compute_workers,
+        max(1, int(resource_budget.worker_ceiling)),
+    )
     if config.space_workers == "auto":
         selected_space_workers = resolve_auto_space_workers(
-            compute_workers=int(config.compute_workers),
+            compute_workers=selected_compute_workers,
+            resource_budget=resource_budget,
         )
     else:
         try:
@@ -1613,9 +1634,6 @@ def plan_resample(
             raise ValueError("space_workers 必须是正整数或 auto。") from exc
         if selected_space_workers <= 0:
             raise ValueError("space_workers 必须是正整数或 auto。")
-    for name in ("compute_workers",):
-        if int(getattr(config, name)) <= 0:
-            raise ValueError(f"{name} 必须是正整数。")
     target = build_target_grid(
         inspection.grid,
         config.resolution,
@@ -1625,13 +1643,17 @@ def plan_resample(
         lat_descending=config.target_lat_descending,
         lon_descending=config.target_lon_descending,
     )
+    tuning_trials: list[dict[str, object]] = []
     auto_tile = None
     if config.tile_size == "auto":
         worker_candidates = (
-            range(selected_space_workers, 0, -1)
+            range(1, selected_space_workers + 1)
+            if config.tuning_objective == "compact" and config.space_workers == "auto"
+            else range(selected_space_workers, 0, -1)
             if config.space_workers == "auto"
             else (selected_space_workers,)
         )
+        selected_candidate = None
         for candidate_workers in worker_candidates:
             candidate = resolve_auto_tile_size(
                 inspection.info,
@@ -1640,15 +1662,31 @@ def plan_resample(
                 method=config.method,
                 skipna=config.skipna,
                 time_block=selected_time_block,
-                compute_workers=int(config.compute_workers),
+                compute_workers=selected_compute_workers,
                 space_workers=candidate_workers,
                 compute_dtype=config.compute_dtype,
+                resource_budget=resource_budget,
             )
-            auto_tile = candidate
-            if candidate.fits_budget or candidate_workers == 1:
-                selected_space_workers = candidate_workers
-                break
-        assert auto_tile is not None
+            tuning_trials.append(
+                {
+                    "candidate_id": int(candidate_workers),
+                    "space_workers": int(candidate_workers),
+                    "estimated_aggregate_parallel_peak_bytes": int(candidate.estimated_peak_bytes),
+                    "estimated_per_worker_peak_bytes": int(
+                        candidate.estimated_peak_bytes / max(1, int(candidate_workers))
+                    ),
+                    "fits_memory_budget": bool(candidate.fits_budget),
+                    "status": "ok" if candidate.fits_budget else "rejected_memory",
+                    "reason": candidate.warning,
+                }
+            )
+            if selected_candidate is None and (
+                candidate.fits_budget or candidate_workers == 1
+            ):
+                selected_candidate = (candidate_workers, candidate)
+        if selected_candidate is None:
+            raise ValueError("没有可用的重采样空间worker候选。")
+        selected_space_workers, auto_tile = selected_candidate
         selected_tile_size = auto_tile.tile_size
     else:
         assert manual_tile_size is not None
@@ -1681,10 +1719,21 @@ def plan_resample(
         reserved_bytes=(
             auto_tile.estimated_peak_bytes if auto_tile is not None else None
         ),
+        available_bytes=(
+            resource_budget.memory_available_bytes
+            if resource_budget is not None
+            else None
+        ),
+        total_bytes=(
+            resource_budget.memory_total_bytes
+            if resource_budget is not None
+            else None
+        ),
     )
     return ResamplePlan(
         inspection=inspection,
         target=target,
+        tune_budget=float(config.tune_budget),
         method=config.method,
         skipna=config.skipna,
         na_thres=float(config.na_thres),
@@ -1693,12 +1742,15 @@ def plan_resample(
         tile_size=selected_tile_size,
         time_block=selected_time_block,
         time_block_requested=config.time_block,
-        compute_workers=int(config.compute_workers),
+        compute_workers=selected_compute_workers,
         space_workers=selected_space_workers,
         tile_size_requested=config.tile_size,
         space_workers_requested=config.space_workers,
+        tuning_objective=config.tuning_objective,
+        tuning_trials=tuple(tuning_trials),
         auto_tile=auto_tile,
         owner_buffer_budget_bytes=owner_buffer_budget_bytes,
+        resource_budget=resource_budget,
         output_layout=config.output_layout,
         before_replacements=config.before_replacements,
         after_replacements=config.after_replacements,
@@ -1942,11 +1994,13 @@ def run_resample(
     if source_path != plan.inspection.info.path:
         raise ResampleExecutionError("输入检查结果与执行输入路径不一致。")
     _prepare_target(target_path, config.overwrite)
+    preflight_writable(target_path.parent, "重采样输出")
     temporary_root = _resolve_temporary_root(
         source_path,
         target_path,
         config.temporary_dir,
     )
+    preflight_writable(temporary_root, "重采样临时")
     staging = target_path.parent / f".{target_path.name}.resample-{uuid4().hex}.tmp"
     workdir = temporary_root / f".{target_path.name}.weights-{uuid4().hex}.tmp"
     started = time.perf_counter()
@@ -2207,22 +2261,57 @@ def run_resample(
                 {
                     "available_bytes": runtime_plan.auto_tile.available_bytes,
                     "budget_bytes": runtime_plan.auto_tile.budget_bytes,
-                    "estimated_worker_peak_bytes": runtime_plan.auto_tile.estimated_peak_bytes,
-                    "estimated_parallel_peak_bytes": (
+                    "estimated_per_worker_peak_bytes": (
                         runtime_plan.auto_tile.estimated_peak_bytes
-                        * min(runtime_plan.space_workers, total_tiles)
+                        // max(1, int(runtime_plan.space_workers))
                     ),
+                    "estimated_aggregate_parallel_peak_bytes": runtime_plan.auto_tile.estimated_peak_bytes,
                     "fits_budget": runtime_plan.auto_tile.fits_budget,
                     "warning": runtime_plan.auto_tile.warning,
                     "owner_buffer_budget_bytes_per_worker": (
                         runtime_plan.owner_buffer_budget_bytes
                     ),
-                    "owner_buffer_peak_bytes": int(
+                    "observed_per_worker_peak_bytes": int(
                         tile_timing["owner_buffer_peak_bytes"]
                     ),
+                    "observed_aggregate_parallel_peak_bytes": int(
+                        tile_timing["owner_buffer_peak_bytes"]
+                    ) * max(1, int(runtime_plan.space_workers)),
                     "owner_memmap_bytes": int(tile_timing["owner_memmap_bytes"]),
                 }
                 if runtime_plan.auto_tile is not None
+                else None
+            ),
+            "resolved_plan": {
+                "tile_size": int(runtime_plan.tile_size),
+                "time_block": int(runtime_plan.time_block),
+                "time_block_requested": runtime_plan.time_block_requested,
+                "compute_workers": int(runtime_plan.compute_workers),
+                "space_workers": int(runtime_plan.space_workers),
+                "space_workers_requested": runtime_plan.space_workers_requested,
+                "method": runtime_plan.method,
+                "compute_dtype": runtime_plan.compute_dtype,
+                "tuning_objective": runtime_plan.tuning_objective,
+                "tune_budget": float(runtime_plan.tune_budget),
+            },
+            "tuning": {
+                "objective": runtime_plan.tuning_objective,
+                "budget_seconds": float(runtime_plan.tune_budget),
+                "candidate_trials": list(runtime_plan.tuning_trials),
+                "selected_candidate_id": int(runtime_plan.space_workers),
+                "selection_reason": (
+                    "按有效资源和物理chunk ownership筛选空间worker；"
+                    "内存安全优先，真实阶段记录实际耗时"
+                ),
+                "rejected_candidates": [
+                    item
+                    for item in runtime_plan.tuning_trials
+                    if item.get("status") != "ok"
+                ],
+            },
+            "resource_budget": (
+                runtime_plan.resource_budget.to_dict()
+                if runtime_plan.resource_budget is not None
                 else None
             ),
             "temporary_dir": str(temporary_root),

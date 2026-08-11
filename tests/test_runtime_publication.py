@@ -12,6 +12,7 @@ import numpy as np
 from fast_nc_zarr.engine import convert
 from fast_nc_zarr.models import FileRecord, Inventory, Selection, VariableSpec
 from fast_nc_zarr.publication import (
+    preflight_writable,
     publish_staging,
     validate_publish_target,
 )
@@ -121,6 +122,18 @@ class RuntimePublicationTests(unittest.TestCase):
         link.symlink_to(plain, target_is_directory=True)
         with self.assertRaisesRegex(ValueError, "符号链接"):
             validate_publish_target(link, overwrite=True, operation="测试")
+    def test_preflight_probes_nested_directory_and_cleans_probe(self) -> None:
+        requested = ROOT / "new" / "nested"
+        result = preflight_writable(requested, "测试")
+        self.assertTrue(result["writable"])
+        self.assertTrue(requested.is_dir())
+        self.assertEqual(list(requested.glob("*.probe")), [])
+
+    def test_preflight_rejects_file_as_directory(self) -> None:
+        file_path = ROOT / "not-a-directory"
+        file_path.write_text("x", encoding="utf-8")
+        with self.assertRaises(NotADirectoryError):
+            preflight_writable(file_path / "child", "测试")
 
     def test_conversion_failure_keeps_existing_store_untouched(self) -> None:
         input_dir = ROOT / "input"

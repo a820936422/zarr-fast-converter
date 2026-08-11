@@ -25,7 +25,6 @@ from fast_nc_zarr.models import (
     VariableOutputLayout,
     VariableTransform,
 )
-from fast_nc_zarr.models import StorageProfile
 from fast_nc_zarr.selection import make_selection
 
 
@@ -80,22 +79,13 @@ class FilenameModeTests(unittest.TestCase):
             scan.missing_times,
         )
 
-    def test_automatic_workers_limit_rotational_large_collections(self) -> None:
-        class FakePath:
-            def stat(self):
-                return SimpleNamespace(st_size=14 * 1024**2)
-
-        files = [FakePath() for _ in range(8008)]
-        profile = StorageProfile(
-            path=Path("/media/owen/机械硬盘"),
-            device="/dev/sdb1",
-            rotational=True,
-            filesystem="ext4",
-        )
-        with patch("fast_nc_zarr.inspection.storage_profile", return_value=profile), patch(
-            "fast_nc_zarr.inspection.physical_cpu_count", return_value=16
+    def test_automatic_workers_follow_effective_resource_ceiling(self) -> None:
+        files = [Path(f"/media/source/file-{index}.nc") for index in range(8008)]
+        with patch(
+            "fast_nc_zarr.inspection.effective_resource_budget",
+            return_value=SimpleNamespace(worker_ceiling=16),
         ):
-            self.assertEqual(choose_inspection_workers(files), 2)
+            self.assertEqual(choose_inspection_workers(files), 16)
 
     def test_multiple_changing_date_fields_are_not_guessed(self) -> None:
         folder = ROOT / "ambiguous"
@@ -247,14 +237,10 @@ class FilenameModeTests(unittest.TestCase):
         scan = scan_filename_times(folder)
         inventory = inspect_filename_inventory(scan, workers=1, progress=False)
         output = ROOT / "linked-chunks-output.zarr"
-        with (
-            patch(
-                "fast_nc_zarr.filename_mode.tune",
-                side_effect=lambda *args, **kwargs: (args[3][0], []),
-            ) as tune_mock,
-            patch("fast_nc_zarr.planner.physical_cpu_count", return_value=4),
-            patch("fast_nc_zarr.planner.available_memory", return_value=8 * 1024**3),
-        ):
+        with patch(
+            "fast_nc_zarr.filename_mode.tune",
+            side_effect=lambda *args, **kwargs: (args[3][0], []),
+        ) as tune_mock:
             plan, _ = convert_filename(
                 inventory,
                 make_selection(inventory),

@@ -218,11 +218,7 @@ class EndToEndTests(unittest.TestCase):
             return tune(*args, **kwargs)
 
         tuned_output = ROOT / "fixed-layout-tuned.zarr"
-        with (
-            patch("fast_nc_zarr.planner.physical_cpu_count", return_value=4),
-            patch("fast_nc_zarr.planner.available_memory", return_value=8 * 1024**3),
-            patch("fast_nc_zarr.engine.tune", side_effect=capture_tune),
-        ):
+        with patch("fast_nc_zarr.engine.tune", side_effect=capture_tune):
             chosen, metrics = convert(
                 inventory,
                 selection,

@@ -8,6 +8,7 @@ import numpy as np
 
 from ..models import OutputLayout
 from ..rechunking.models import DatasetInfo
+from ..system import EffectiveResourceBudget
 from .replacements import ReplacementRules
 
 
@@ -102,6 +103,9 @@ class ResampleConfig:
     time_block: TimeBlock = "auto"
     compute_workers: int = 2
     space_workers: SpaceWorkers = "auto"
+    tuning_objective: Literal["speed", "balanced", "compact"] = "balanced"
+    tune_budget: float = 60.0
+    resource_budget: EffectiveResourceBudget | None = None
     temporary_dir: Path | None = None
     output_layout: OutputLayout | None = None
     before_replacements: ReplacementRules = field(default_factory=ReplacementRules)
@@ -151,9 +155,13 @@ class ResamplePlan:
     compute_workers: int = 2
     space_workers: int = 1
     tile_size_requested: TileSize = "auto"
+    tuning_objective: Literal["speed", "balanced", "compact"] = "balanced"
+    tune_budget: float = 60.0
+    tuning_trials: tuple[dict[str, object], ...] = ()
     space_workers_requested: SpaceWorkers = "auto"
     auto_tile: AutoTileDecision | None = None
     owner_buffer_budget_bytes: int = 0
+    resource_budget: EffectiveResourceBudget | None = None
     output_layout: OutputLayout | None = None
     before_replacements: ReplacementRules = field(default_factory=ReplacementRules)
     after_replacements: ReplacementRules = field(default_factory=ReplacementRules)

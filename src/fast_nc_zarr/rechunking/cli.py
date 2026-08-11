@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workers",
         type=int,
-        help="并行 worker 上限；程序会依据内存和源/目标磁盘类型自动限制。",
+        help="并行 worker 上限；未指定时在有效资源上限内进入真实自动调优。",
     )
     parser.add_argument("--overwrite", action="store_true", help="覆盖已有 Zarr v3 输出。")
     parser.add_argument("--no-validate", action="store_true", help="跳过输出抽样逐值校验。")
@@ -192,7 +192,7 @@ def run(args: argparse.Namespace) -> int:
         info,
         strategy,
         target_mib=args.target_chunk_mib,
-        workers=args.workers or default_workers(),
+        workers=(None if args.workers is None else args.workers),
         custom_chunks=custom,
     )
     print(format_plan(plan, info))
@@ -218,7 +218,7 @@ def run(args: argparse.Namespace) -> int:
         interactive=interactive,
         overwrite=args.overwrite,
     )
-    workers = max(1, int(args.workers or default_workers()))
+    workers = "auto" if args.workers is None else max(1, int(args.workers))
     metrics = run_rechunk(
         args.input,
         output,

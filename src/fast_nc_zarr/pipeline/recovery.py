@@ -10,6 +10,7 @@ from ..models import VariableTransform
 from ..rechunking.inspection import inspect_store
 from ..rechunking.models import DatasetInfo
 from .models import (
+    MANIFEST_SCHEMA_VERSION,
     PipelineChunkingOptions,
     PipelineCompressionOptions,
     PipelineConfig,
@@ -128,6 +129,7 @@ def _restore_config(
             },
             variable_transforms=transforms,
             auto_tune=bool(conversion.get("auto_tune", True)),
+            tuning_objective=str(conversion.get("tuning_objective", "balanced")),
             tune_budget=float(conversion.get("tune_budget", 60.0)),
             max_workers=(
                 int(conversion["max_workers"])
@@ -149,6 +151,8 @@ def _restore_config(
             compute_dtype=str(resampling.get("compute_dtype", "source")),
             tile_size=_as_auto_int(resampling.get("tile_size", "auto")),
             time_block=_as_auto_int(resampling.get("time_block", "auto")),
+            tuning_objective=str(resampling.get("tuning_objective", "balanced")),
+            tune_budget=float(resampling.get("tune_budget", 60.0)),
             compute_workers=int(resampling.get("compute_workers", 2)),
             space_workers=_as_auto_int(resampling.get("space_workers", "auto")),
             before_conditions=str(resampling.get("before_conditions", "")),
@@ -257,6 +261,12 @@ def inspect_pipeline_recovery(path: Path) -> PipelineRecovery:
     for manifest_path in manifests:
         try:
             payload = _json(manifest_path)
+            schema = payload.get("schema_version")
+            if schema != MANIFEST_SCHEMA_VERSION:
+                raise PipelineRecoveryError(
+                    f"任务清单 schema_version={schema!r}，当前恢复器要求 "
+                    f"schema_version={MANIFEST_SCHEMA_VERSION}；不会静默迁移旧清单。"
+                )
             if payload.get("status") not in {"failed", "cancelled"}:
                 raise PipelineRecoveryError(
                     f"任务状态为 {payload.get('status')!r}，不是失败或取消任务。"
@@ -330,7 +340,7 @@ def mark_recovery_succeeded(
         payload["error_history"] = error_history
     else:
         payload.pop("failed_stage", None)
-    payload["schema_version"] = 5
+    payload["schema_version"] = MANIFEST_SCHEMA_VERSION
     payload["status"] = "resumed_succeeded"
     payload["resume_result"] = {
         "output": result.get("output"),

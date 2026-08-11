@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Sequence
 
 import numpy as np
 import psutil
 
+from ..system import worker_ceiling
 from .models import ChunkPlan, DatasetInfo, Strategy
+
 
 
 MIN_TARGET_MIB = 32.0
@@ -16,7 +17,7 @@ DEFAULT_TARGET_MIB = 128.0
 
 
 def default_workers() -> int:
-    return max(1, min(os.cpu_count() or 1, 4))
+    return max(1, int(worker_ceiling()))
 
 
 def _effective_target(

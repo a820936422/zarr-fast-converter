@@ -20,9 +20,9 @@ import zarr
 
 from ..metadata import sanitize_cf_references
 from ..models import StorageProfile
-from ..publication import publish_staging
+from ..publication import preflight_writable, publish_staging
 from ..runtime import bounded_process_map
-from ..system import RuntimeResourceSnapshot, runtime_resource_snapshot, storage_profile
+from ..system import EffectiveResourceBudget, RuntimeResourceSnapshot, effective_resource_budget, runtime_resource_snapshot, storage_profile
 from .autotune import (
     WorkerTuneReport,
     benchmark_worker_candidates,
@@ -106,7 +106,7 @@ def _resolve_temporary_root(
     target: Path,
     temporary_dir: str | Path | None,
 ) -> Path:
-    """Resolve and create the directory used for intermediate Zarr stores."""
+    """Resolve the directory used for intermediate Zarr stores."""
 
     root = (
         target.parent
@@ -117,7 +117,6 @@ def _resolve_temporary_root(
         raise RechunkExecutionError("临时处理目录不能是输入或输出 Zarr 本身。")
     if root.exists() and not root.is_dir():
         raise RechunkExecutionError(f"临时处理路径不是目录：{root}")
-    root.mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -233,31 +232,10 @@ def _safe_workers(
     # Reserve most available memory for the OS, xarray and codec buffers.
     memory_workers = max(1, int(available * 0.10 / source_bytes))
     detected_cpu = os.cpu_count() or 1 if cpu_cap is None else max(1, int(cpu_cap))
-    cpu_limit = min(detected_cpu, 8)
+    cpu_limit = detected_cpu
     return max(1, min(requested, cpu_limit, memory_workers))
 
 
-_CONSERVATIVE_FILESYSTEMS = frozenset(
-    {
-        "9p",
-        "afs",
-        "ceph",
-        "cifs",
-        "glusterfs",
-        "lustre",
-        "nfs",
-        "nfs4",
-        "smb",
-        "smb2",
-        "smb3",
-        "sshfs",
-    }
-)
-
-
-def _conservative_filesystem(filesystem: str) -> bool:
-    value = str(filesystem).strip().lower()
-    return value in _CONSERVATIVE_FILESYSTEMS or value.startswith("fuse")
 
 
 def _parallel_workers(
@@ -267,14 +245,9 @@ def _parallel_workers(
     *,
     source_profile: StorageProfile | None = None,
     target_profile: StorageProfile | None = None,
+    worker_ceiling: int | None = None,
 ) -> tuple[int, str]:
-    """Choose a bounded process count from shared storage profiles.
-
-    Network and userspace filesystems are deliberately conservative: adding
-    processes there often increases metadata round trips rather than useful
-    throughput.  Local SSDs retain the CPU-derived allowance, while rotational
-    media keep the existing seek-avoidance caps.
-    """
+    """Return the resource-bounded ceiling and storage benchmark context."""
 
     requested = max(1, int(requested))
     source_profile = source_profile or storage_profile(source)
@@ -284,28 +257,14 @@ def _parallel_workers(
         and target_profile.device != "unknown"
         and source_profile.device == target_profile.device
     )
-    base = min(requested, 8, os.cpu_count() or 1)
-    conservative = tuple(
-        profile.medium if profile.medium == "network" else profile.filesystem
-        for profile in (source_profile, target_profile)
-        if profile.medium == "network"
-        or (
-            profile.override == "auto"
-            and _conservative_filesystem(profile.filesystem)
-        )
+    detected_ceiling = max(1, int(worker_ceiling or (os.cpu_count() or 1)))
+    base = max(1, min(requested, detected_ceiling))
+    context = (
+        f"source={source_profile.medium}/{source_profile.filesystem}; "
+        f"target={target_profile.medium}/{target_profile.filesystem}; "
+        f"same_device={same_device}"
     )
-    if conservative:
-        media = ", ".join(dict.fromkeys(conservative))
-        return max(1, min(base, 2)), f"检测到保守存储（{media}），限制为 2 个进程"
-    if same_device and (
-        source_profile.rotational is True or target_profile.rotational is True
-    ):
-        return max(1, min(base, 2)), "源和目标位于同一块机械硬盘，限制为 2 个进程"
-    if source_profile.rotational is True or target_profile.rotational is True:
-        return max(1, min(base, 3)), "检测到机械硬盘，限制为 3 个进程"
-    if same_device:
-        return max(1, min(base, 4)), "源和目标同设备，限制为 4 个进程"
-    return max(1, base), "源和目标设备可并行，按内存和 CPU 使用进程"
+    return base, f"存储 profile 仅作为实测上下文（{context}），未静态限制 worker"
 
 
 def _json_signature(value: object) -> str:
@@ -1413,17 +1372,28 @@ def _stage_resource_ceiling(
     resources: RuntimeResourceSnapshot,
     *,
     stage_peak_bytes: int,
+    resource_budget: EffectiveResourceBudget | None = None,
 ) -> int:
     requested_limit = None if requested == "auto" else max(1, int(requested))
     detected = resources.worker_ceiling(
         max(1, int(stage_peak_bytes)),
         requested=requested_limit,
     )
+    effective_ceiling = (
+        min(int(resources.cpu.worker_ceiling), int(resource_budget.worker_ceiling))
+        if resource_budget is not None
+        else int(resources.cpu.worker_ceiling)
+    )
+    available_bytes = (
+        int(resource_budget.memory_budget_bytes)
+        if resource_budget is not None
+        else resources.memory.effective_available_bytes
+    )
     return _safe_workers(
         info,
-        detected,
-        available_bytes=resources.memory.effective_available_bytes,
-        cpu_cap=resources.cpu.worker_ceiling,
+        min(detected, effective_ceiling),
+        available_bytes=available_bytes,
+        cpu_cap=effective_ceiling,
     )
 
 
@@ -1444,6 +1414,8 @@ def _tune_source_workers(
     target_profile: StorageProfile | None = None,
     shards: dict[str, tuple[int, ...]] | None = None,
     require_time_ownership: bool = True,
+    resource_budget: EffectiveResourceBudget | None = None,
+    objective: str = "balanced",
     cancel_event=None,
 ) -> tuple[int, WorkerTuneReport]:
     source_bytes = max(
@@ -1459,6 +1431,7 @@ def _tune_source_workers(
         requested,
         resources,
         stage_peak_bytes=max(64 * 1024**2, source_bytes * 4),
+        resource_budget=resource_budget,
     )
     storage_workers, storage_reason = _parallel_workers(
         source_path,
@@ -1466,6 +1439,11 @@ def _tune_source_workers(
         safe,
         source_profile=source_profile,
         target_profile=target_profile,
+        worker_ceiling=(
+            resource_budget.worker_ceiling
+            if resource_budget is not None
+            else resources.cpu.worker_ceiling
+        ),
     )
     safe = min(safe, storage_workers)
     if require_time_ownership is False:
@@ -1481,6 +1459,7 @@ def _tune_source_workers(
             safe_ceiling=safe,
             storage_reason=storage_reason,
             selected_reason="显式 workers 是硬上限，未运行自动实测",
+            objective=objective,
         )
 
     sample_count = min(max(1, owner_count), max(8, safe * 4), 32)
@@ -1528,6 +1507,7 @@ def _tune_source_workers(
             sample_tasks=len(tasks),
             sample_logical_bytes=0,
             budget_seconds=budget_seconds,
+            objective=str(objective),
             cancel_event=cancel_event,
         )
     finally:
@@ -1552,22 +1532,37 @@ def _tune_stage2_workers(
     resources: RuntimeResourceSnapshot,
     requested: int | str,
     budget_seconds: float,
+    resource_budget: EffectiveResourceBudget | None = None,
+    objective: str = "balanced",
     cancel_event=None,
     source_profile: StorageProfile | None = None,
     target_profile: StorageProfile | None = None,
 ) -> tuple[int, WorkerTuneReport, dict[str, tuple[int, ...]]]:
+    effective_ceiling = (
+        int(resource_budget.worker_ceiling)
+        if resource_budget is not None
+        else int(resources.cpu.worker_ceiling)
+    )
+    available_bytes = (
+        int(resource_budget.memory_budget_bytes)
+        if resource_budget is not None
+        else resources.memory.effective_available_bytes
+    )
     preliminary, peak_bytes = _stage2_safe_workers(
         info,
         plan,
         region_chunks,
         compression,
-        resources.cpu.worker_ceiling,
-        available_bytes=resources.memory.effective_available_bytes,
+        effective_ceiling,
+        available_bytes=available_bytes,
     )
     requested_limit = None if requested == "auto" else max(1, int(requested))
-    safe = resources.worker_ceiling(
-        max(1, peak_bytes),
-        requested=requested_limit,
+    safe = min(
+        resources.worker_ceiling(
+            max(1, peak_bytes),
+            requested=requested_limit,
+        ),
+        effective_ceiling,
     )
     storage_workers, storage_reason = _parallel_workers(
         intermediate,
@@ -1575,6 +1570,7 @@ def _tune_stage2_workers(
         safe,
         source_profile=source_profile,
         target_profile=target_profile,
+        worker_ceiling=effective_ceiling,
     )
     safe = min(safe, preliminary, storage_workers)
     sample_regions = _stage2_benchmark_regions(info, plan, region_chunks)
@@ -1582,7 +1578,7 @@ def _tune_stage2_workers(
         info,
         plan,
         sample_regions,
-        max(1, min(8, max(2, safe))),
+        max(1, max(2, safe)),
     )
     safe = min(safe, max(1, len(tasks)))
     if requested != "auto":
@@ -1593,6 +1589,7 @@ def _tune_stage2_workers(
             safe_ceiling=safe,
             storage_reason=storage_reason,
             selected_reason="显式 workers 是硬上限，未运行自动实测",
+            objective=objective,
         ), sample_regions
     candidates = worker_candidates(safe)
     tune_root = staging_parent / f".{staging_parent.name}.stage2-worker-tune-{uuid4().hex}.tmp"
@@ -1629,6 +1626,7 @@ def _tune_stage2_workers(
             sample_tasks=len(tasks),
             sample_logical_bytes=0,
             budget_seconds=budget_seconds,
+            objective=str(objective),
             cancel_event=cancel_event,
         )
     finally:
@@ -2282,7 +2280,7 @@ def run_rechunk(
     info: DatasetInfo,
     plan: ChunkPlan,
     compression: CompressionPlan,
-    workers: int | str = 1,
+    workers: int | str = "auto",
     overwrite: bool = False,
     progress: bool = True,
     validate: bool = True,
@@ -2291,6 +2289,8 @@ def run_rechunk(
     tune_budget_seconds: float = 60.0,
     compression_objective: str = "balanced",
     compression_tune_budget_seconds: float = 60.0,
+    tuning_objective: str = "balanced",
+    resource_budget: EffectiveResourceBudget | None = None,
     storage_overrides: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Rechunk and optionally recompress a complete Zarr v3 store."""
@@ -2311,6 +2311,7 @@ def run_rechunk(
         raise RechunkExecutionError("输入检查结果与执行输入路径不一致。")
     _prepare_target(target, overwrite)
     temporary_root = _resolve_temporary_root(source_path, target, temporary_dir)
+    preflight_writable(temporary_root, "重分块临时")
     # The final staging store stays beside the requested output.  Publication
     # remains an atomic rename for every execution path, including byte copy.
     staging = target.parent / f".{target.name}.rechunk-{uuid4().hex}.tmp"
@@ -2321,12 +2322,17 @@ def run_rechunk(
         output=target.parent,
         storage_overrides=storage_overrides,
     )
+    resource_budget = resource_budget or effective_resource_budget(
+        resources,
+        reserve_memory_bytes=0,
+    )
     worker_tuning: dict[str, dict[str, object]] = {}
     compression_tuning: dict[str, object] | None = None
     tune_budget = max(0.0, float(tune_budget_seconds))
     # Apply the bounded budget independently so a slow stage 1 sample cannot
     # starve the required stage 2 region measurement.
     stage_budget = max(0.0, tune_budget)
+    preflight_writable(target.parent, "重分块输出")
     started = time.perf_counter()
     execution_path = "two_stage"
     dataset = None
@@ -2436,10 +2442,10 @@ def run_rechunk(
                 cancel_event=cancel_event,
             )
             worker_tuning["stage1"] = skipped_worker_report(
-                "stage1", "等价复制路径不需要 worker"
+                "stage1", "等价复制路径不需要 worker", objective=tuning_objective
             ).to_dict()
             worker_tuning["stage2"] = skipped_worker_report(
-                "stage2", "等价复制路径不需要 worker"
+                "stage2", "等价复制路径不需要 worker", objective=tuning_objective
             ).to_dict()
         elif direct_chunks:
             execution_path = "single_stage"
@@ -2458,6 +2464,8 @@ def run_rechunk(
                 source_profile=resources.source_storage,
                 target_profile=resources.output_storage,
                 require_time_ownership=True,
+                objective=tuning_objective,
+                resource_budget=resource_budget,
                 cancel_event=cancel_event,
             )
             worker_tuning["direct"] = direct_report.to_dict()
@@ -2467,7 +2475,11 @@ def run_rechunk(
                 _direct_region_chunks(info),
                 compression,
                 effective_workers,
-                available_bytes=resources.memory.effective_available_bytes,
+                available_bytes=(
+                    resource_budget.memory_budget_bytes
+                    if resource_budget is not None
+                    else resources.memory.effective_available_bytes
+                ),
             )
             device_reason = direct_report.storage_reason
             if progress:
@@ -2538,6 +2550,8 @@ def run_rechunk(
                 target_profile=resources.temporary_storage,
                 shards=intermediate_shards,
                 require_time_ownership=plan.strategy == "time",
+                objective=tuning_objective,
+                resource_budget=resource_budget,
                 cancel_event=cancel_event,
             )
             worker_tuning["stage1"] = stage1_report.to_dict()
@@ -2660,6 +2674,8 @@ def run_rechunk(
                 resources,
                 workers,
                 stage_budget,
+                resource_budget=resource_budget,
+                objective=tuning_objective,
                 source_profile=resources.temporary_storage,
                 target_profile=resources.output_storage,
                 cancel_event=cancel_event,
@@ -2672,7 +2688,11 @@ def run_rechunk(
                 stage2_region_chunks,
                 compression,
                 stage2_workers,
-                available_bytes=resources.memory.effective_available_bytes,
+                available_bytes=(
+                    resource_budget.memory_budget_bytes
+                    if resource_budget is not None
+                    else resources.memory.effective_available_bytes
+                ),
             )
             stage2_workers = min(stage2_workers, _stage2_workers_for_peak)
             parallel_stage2 = (
@@ -2755,6 +2775,8 @@ def run_rechunk(
             "requested_workers": workers,
             "worker_tuning": worker_tuning,
             "resource_snapshot": resources.to_dict(),
+            "resource_budget": resource_budget.to_dict(),
+            "tuning_objective": tuning_objective,
             "compression_tuning": compression_tuning,
             "selected_compression": compression.to_dict(),
         }

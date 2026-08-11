@@ -9,6 +9,8 @@ from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo
 from ..resampling.models import ResamplePlan, TargetGrid
 
 
+MANIFEST_SCHEMA_VERSION = 6
+
 @dataclass(frozen=True)
 class PipelineGeneralConfig:
     """Source selection, publication and temporary-store policy."""
@@ -42,6 +44,7 @@ class PipelineConversionOptions:
     variable_transforms: dict[str, VariableTransform] = field(default_factory=dict)
     auto_tune: bool = True
     tune_budget: float = 60.0
+    tuning_objective: Literal["speed", "balanced", "compact"] = "balanced"
     max_workers: int | None = None
     reserve_memory_gib: float = 2.0
 
@@ -57,6 +60,8 @@ class PipelineResamplingOptions:
     time_block: int | Literal["auto"] = "auto"
     compute_workers: int = 2
     space_workers: int | Literal["auto"] = "auto"
+    tuning_objective: Literal["speed", "balanced", "compact"] = "balanced"
+    tune_budget: float = 60.0
     before_conditions: str = ""
     before_results: str = ""
     after_conditions: str = ""
@@ -227,3 +232,4 @@ class PipelinePaths:
     converted: Path
     resampled: Path
     final_staging: Path
+    events: Path

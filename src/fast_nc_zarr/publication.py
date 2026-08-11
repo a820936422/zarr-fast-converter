@@ -47,6 +47,40 @@ def validate_publish_target(
     target.parent.mkdir(parents=True, exist_ok=True)
     return target
 
+def preflight_writable(path: Path, operation: str) -> dict[str, object]:
+    """Probe directory creation and a durable write before long-running work."""
+
+    requested = Path(path).expanduser().resolve(strict=False)
+    existing = requested
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    if existing.exists() and not existing.is_dir():
+        raise NotADirectoryError(f"{operation}路径不是目录：{existing}")
+    requested.mkdir(parents=True, exist_ok=True)
+    probe_parent = requested
+    probe = probe_parent / f".fast-nc-zarr-{operation}-preflight-{uuid4().hex}.probe"
+    try:
+        with probe.open("wb") as handle:
+            handle.write(b"ok")
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory_fd = os.open(probe_parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            probe.unlink()
+        except FileNotFoundError:
+            pass
+    return {
+        "requested": str(requested),
+        "probe_parent": str(probe_parent),
+        "writable": True,
+        "operation": str(operation),
+    }
+
 
 def make_staging_path(target: Path, operation: str) -> Path:
     return target.parent / f".{target.name}.{operation}-{uuid4().hex}.tmp"

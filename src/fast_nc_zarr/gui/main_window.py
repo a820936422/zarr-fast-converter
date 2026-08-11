@@ -2464,6 +2464,16 @@ class PipelinePage(QWidget):
                 variable_transforms=variable_transforms,
                 auto_tune=self.auto_tune.isChecked(),
                 tune_budget=self.tune_budget.value(),
+                tuning_objective=(
+                    recovery_config.conversion.tuning_objective
+                    if recovery_config is not None
+                    else "balanced"
+                ),
+                reserve_memory_gib=(
+                    recovery_config.conversion.reserve_memory_gib
+                    if recovery_config is not None
+                    else 2.0
+                ),
                 max_workers=self.max_workers.value() or None,
             ),
             operations=PipelineOperations(
@@ -2496,6 +2506,16 @@ class PipelinePage(QWidget):
                     recovered_resampling.space_workers
                     if recovered_resampling is not None
                     else "auto"
+                ),
+                tuning_objective=(
+                    recovered_resampling.tuning_objective
+                    if recovered_resampling is not None
+                    else "balanced"
+                ),
+                tune_budget=(
+                    recovered_resampling.tune_budget
+                    if recovered_resampling is not None
+                    else 60.0
                 ),
                 before_conditions=self.before_conditions.text().strip(),
                 before_results=self.before_results.text().strip(),

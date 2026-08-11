@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import resource as _resource
 import tempfile
 from typing import Literal, cast
 
@@ -18,6 +19,7 @@ except ImportError:  # pragma: no cover - the project environment includes psuti
 
 MIB = 1024**2
 GIB = 1024**3
+FD_PER_WORKER = 64
 _PROC_ROOT = Path("/proc")
 _SYS_ROOT = Path("/sys")
 _CGROUP_ROOT = _SYS_ROOT / "fs/cgroup"
@@ -151,6 +153,7 @@ class RuntimeResourceSnapshot:
     source_storage: StorageProfile | None = None
     temporary_storage: StorageProfile | None = None
     output_storage: StorageProfile | None = None
+    fd_soft_limit: int | None = None
 
     def worker_ceiling(
         self,
@@ -179,7 +182,10 @@ class RuntimeResourceSnapshot:
             self.memory.effective_available_bytes - reserve_memory_bytes,
         )
         memory_limit = max(1, usable_memory // memory_per_worker_bytes)
-        ceiling = max(1, min(self.cpu.worker_ceiling, memory_limit))
+        limits = [self.cpu.worker_ceiling, memory_limit]
+        if self.fd_soft_limit is not None:
+            limits.append(max(1, int(self.fd_soft_limit) // FD_PER_WORKER))
+        ceiling = max(1, min(limits))
         if requested is not None:
             ceiling = min(ceiling, requested)
         return ceiling
@@ -197,6 +203,7 @@ class RuntimeResourceSnapshot:
             "cpu": cpu,
             "memory": memory,
             "wsl": wsl,
+            "fd_soft_limit": self.fd_soft_limit,
             "storage": {
                 "source": (
                     self.source_storage.to_dict(redact_paths=True)
@@ -215,6 +222,143 @@ class RuntimeResourceSnapshot:
                 ),
             },
         }
+@dataclass(frozen=True)
+class EffectiveResourceBudget:
+    """Unified, serializable resource contract shared by all backends."""
+
+    cpu_physical: int
+    cpu_logical: int
+    cpu_effective: int
+    memory_available_bytes: int
+    memory_total_bytes: int
+    memory_budget_bytes: int
+    fd_soft_limit: int | None
+    worker_ceiling: int
+    source_storage: StorageProfile | None = None
+    temporary_storage: StorageProfile | None = None
+    output_storage: StorageProfile | None = None
+    same_device_roles: tuple[str, ...] = ()
+    limit_reasons: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a manifest-safe resource contract with redacted paths."""
+
+        return {
+            "cpu_physical": self.cpu_physical,
+            "cpu_logical": self.cpu_logical,
+            "cpu_effective": self.cpu_effective,
+            "memory_available_bytes": self.memory_available_bytes,
+            "memory_total_bytes": self.memory_total_bytes,
+            "memory_budget_bytes": self.memory_budget_bytes,
+            "fd_soft_limit": self.fd_soft_limit,
+            "worker_ceiling": self.worker_ceiling,
+            "source_storage": (
+                self.source_storage.to_dict(redact_paths=True)
+                if self.source_storage is not None
+                else None
+            ),
+            "temporary_storage": (
+                self.temporary_storage.to_dict(redact_paths=True)
+                if self.temporary_storage is not None
+                else None
+            ),
+            "output_storage": (
+                self.output_storage.to_dict(redact_paths=True)
+                if self.output_storage is not None
+                else None
+            ),
+            "same_device_roles": list(self.same_device_roles),
+            "limit_reasons": list(self.limit_reasons),
+        }
+
+
+def _same_device_roles(
+    source: StorageProfile | None,
+    temporary: StorageProfile | None,
+    output: StorageProfile | None,
+) -> tuple[str, ...]:
+    profiles = {
+        "source": source,
+        "temporary": temporary,
+        "output": output,
+    }
+    roles = []
+    items = tuple((name, profile) for name, profile in profiles.items() if profile is not None)
+    for index, (left_name, left) in enumerate(items):
+        if left.device == "unknown":
+            continue
+        for right_name, right in items[index + 1 :]:
+            if right.device != "unknown" and left.device == right.device:
+                roles.append(f"{left_name}+{right_name}")
+    return tuple(roles)
+
+
+def effective_resource_budget(
+    snapshot: RuntimeResourceSnapshot | None = None,
+    *,
+    source: Path | None = None,
+    temporary: Path | None = None,
+    output: Path | None = None,
+    storage_overrides: Mapping[str, StorageOverride | str] | None = None,
+    reserve_memory_bytes: int = 0,
+    memory_per_worker_bytes: int = 512 * MIB,
+    requested: int | None = None,
+) -> EffectiveResourceBudget:
+    """Resolve one effective CPU/memory/FD/storage contract for a task."""
+
+    resources = snapshot or runtime_resource_snapshot(
+        source=source,
+        temporary=temporary,
+        output=output,
+        storage_overrides=storage_overrides,
+    )
+    memory_budget = max(
+        256 * MIB,
+        int(resources.memory.effective_available_bytes) - int(reserve_memory_bytes),
+    )
+    ceiling = resources.worker_ceiling(
+        memory_per_worker_bytes,
+        reserve_memory_bytes=reserve_memory_bytes,
+        requested=requested,
+    )
+    reasons = [
+        f"cpu_effective={resources.cpu.effective_count}",
+        f"memory_budget={memory_budget}",
+    ]
+    if resources.fd_soft_limit is not None:
+        reasons.append(f"fd_soft_limit={resources.fd_soft_limit}")
+    if requested is not None:
+        reasons.append(f"requested={requested}")
+    return EffectiveResourceBudget(
+        cpu_physical=resources.cpu.physical_count,
+        cpu_logical=resources.cpu.logical_count,
+        cpu_effective=resources.cpu.effective_count,
+        memory_available_bytes=resources.memory.effective_available_bytes,
+        memory_total_bytes=resources.memory.effective_total_bytes,
+        memory_budget_bytes=memory_budget,
+        fd_soft_limit=resources.fd_soft_limit,
+        worker_ceiling=ceiling,
+        source_storage=resources.source_storage,
+        temporary_storage=resources.temporary_storage,
+        output_storage=resources.output_storage,
+        same_device_roles=_same_device_roles(
+            resources.source_storage,
+            resources.temporary_storage,
+            resources.output_storage,
+        ),
+        limit_reasons=tuple(reasons),
+    )
+
+
+def _file_descriptor_soft_limit() -> int | None:
+    try:
+        soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+    except (AttributeError, OSError, ValueError):
+        return None
+    if soft == _resource.RLIM_INFINITY:
+        return None
+    return max(0, int(soft))
+
 
 
 def _read_text(path: Path) -> str | None:
@@ -876,6 +1020,7 @@ def runtime_resource_snapshot(
         source_storage=profile("source", source),
         temporary_storage=profile("temporary", temporary_path),
         output_storage=profile("output", output),
+        fd_soft_limit=_file_descriptor_soft_limit(),
     )
 
 

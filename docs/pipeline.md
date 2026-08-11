@@ -85,14 +85,16 @@ GUI 通常通过 `fast_nc_zarr.application.services.preview_pipeline` 和 `run_p
 
 ## Manifest 与恢复
 
-每个任务目录包含 schema version 5 的 `manifest.json`，记录：
+每个任务目录包含 schema version 6 的 `manifest.json`，记录：
 
 - 请求操作、操作决策和实际物理阶段；
-- CPU/内存/cgroup/WSL 与源、临时、输出存储证据及置信度；
-- 源读取窗口、目标 shape、最终布局和运行时选定压缩配置；
+- 统一 `EffectiveResourceBudget`、CPU/内存/cgroup/WSL 与源、临时、输出存储证据及置信度；
+- 临时目录和输出目录写入预检结果、源读取窗口、目标 shape、最终布局和运行时选定压缩配置；
 - conversion/resampling 检查点、stage1/stage2 worker 候选、吞吐、RSS、失败与选择原因；
 - 压缩候选的写入、durable、冷热读取、体积、Pareto 与无损验证结果；
-- 阶段状态、耗时、错误、恢复历史、临时写入和写放大。
+- 每阶段的 candidate trials、selection、resolved plan、per-worker/aggregate 内存语义、状态、耗时、错误、恢复历史、临时写入和写放大。
+
+恢复模块要求 schema version 6；旧版 v5 清单必须显式迁移，不能被静默解释为新版。
 
 失败或取消时保留临时目录。恢复模块验证 manifest、Zarr v3、维度、变量和检查点状态后，从最近的有效阶段继续；成功发布后才按清理策略删除上游临时 store。
 

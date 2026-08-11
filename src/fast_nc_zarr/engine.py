@@ -15,9 +15,10 @@ from .planner import (
     output_layout_plan_chunks,
     resolve_conversion_plan,
 )
-from .publication import make_staging_path, publish_staging, validate_publish_target
+from .publication import make_staging_path, preflight_writable, publish_staging, validate_publish_target
 from .selection import selected_logical_bytes
 from .validation import validate_output
+from .system import EffectiveResourceBudget, effective_resource_budget
 from .writer import direct_write, make_compressor
 
 
@@ -246,6 +247,8 @@ def convert(
     *,
     auto_tune: bool = True,
     tune_budget: float = 60.0,
+    tuning_objective: str = "balanced",
+    resource_budget: EffectiveResourceBudget | None = None,
     max_workers: int | None = None,
     reserve_gib: float = 2.0,
     overwrite: bool = False,
@@ -262,8 +265,15 @@ def convert(
         overwrite=overwrite,
         operation="转换",
     )
+    preflight_writable(output.parent, "转换输出")
     if output == inventory.input_dir:
         raise ValueError("输入目录和输出目录不能相同。")
+    resource_budget = resource_budget or effective_resource_budget(
+        source=inventory.input_dir,
+        output=output,
+        reserve_memory_bytes=int(max(0.0, float(reserve_gib)) * 1024**3),
+        requested=max_workers if not auto_tune else None,
+    )
 
     fixed_layout = chunks is not None or output_layout is not None
     plan_chunks = chunks
@@ -276,6 +286,7 @@ def convert(
         chunks=plan_chunks,
         max_workers=max_workers if not auto_tune or fixed_layout else None,
         reserve_gib=reserve_gib,
+        resource_budget=resource_budget,
     )
     tuning_results = []
     if auto_tune and plan.strategy != "dask":
@@ -291,6 +302,7 @@ def convert(
                     if output_layout is not None
                     else None
                 ),
+                resource_budget=resource_budget,
             )
         else:
             candidates = candidate_plans(
@@ -299,6 +311,7 @@ def convert(
                 output,
                 max_workers=max_workers,
                 reserve_gib=reserve_gib,
+                resource_budget=resource_budget,
             )
         plan, tuning_results = tune(
             inventory,
@@ -306,6 +319,7 @@ def convert(
             output,
             candidates,
             budget_seconds=tune_budget,
+            objective=tuning_objective,
             progress=progress,
             writer_kwargs={
                 "variable_transforms": variable_transforms,
@@ -386,6 +400,45 @@ def convert(
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("任务已取消，未发布输出。")
         publish_staging(staging, output, "convert", overwrite=overwrite)
+        metrics = dict(metrics)
+        successful_trials = [item for item in tuning_results if item.status == "ok"]
+        selected_trial = next(
+            (item for item in successful_trials if item.plan == plan),
+            None,
+        )
+        metrics["resource_budget"] = resource_budget.to_dict()
+        metrics["tuning"] = {
+            "objective": str(tuning_objective),
+            "near_best_threshold": 0.95,
+            "candidate_trials": [item.to_dict() for item in tuning_results],
+            "selected_candidate_id": (
+                selected_trial.candidate_id if selected_trial is not None else None
+            ),
+            "selected_plan": {
+                "strategy": plan.strategy,
+                "workers": plan.workers,
+                "chunks": list(plan.chunks),
+                "task_batch": plan.task_batch,
+                "compression": plan.compression,
+                "compression_level": plan.compression_level,
+                "shuffle": plan.shuffle,
+            },
+            "selection_reason": (
+                f"{tuning_objective} 目标按实测 logical/durable throughput、"
+                "压缩率和 RSS 选择"
+                if tuning_results
+                else "未启用自动调优或执行路径不支持调优"
+            ),
+            "rejected_candidates": [
+                {
+                    "candidate_id": item.candidate_id,
+                    "workers": item.plan.workers,
+                    "reason": item.failure,
+                }
+                for item in tuning_results
+                if item.status != "ok"
+            ],
+        }
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise

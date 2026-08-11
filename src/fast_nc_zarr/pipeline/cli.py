@@ -73,6 +73,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cleanup-intermediate", action="store_true")
     parser.add_argument("--no-tune", action="store_true")
     parser.add_argument("--tune-budget", type=float, default=60.0)
+    parser.add_argument(
+        "--tuning-objective",
+        choices=("speed", "balanced", "compact"),
+        default="balanced",
+        help="转换和最终化 worker 调优目标。",
+    )
+    parser.add_argument("--reserve-memory-gib", type=float, default=2.0)
     parser.add_argument("--max-workers", type=int)
     parser.add_argument("--strategy", choices=("time", "space", "custom"), default="time")
     parser.add_argument("--target-mib", type=float, default=128.0)
@@ -188,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
             variable_names=names,
             auto_tune=not args.no_tune,
             tune_budget=args.tune_budget,
+            tuning_objective=args.tuning_objective,
+            reserve_memory_gib=args.reserve_memory_gib,
             max_workers=args.max_workers,
         ),
         operations=PipelineOperations(
@@ -201,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
             skipna=args.skipna,
             na_thres=args.na_thres,
             compute_dtype=args.compute_dtype,
+            tuning_objective=args.tuning_objective,
+            tune_budget=args.tune_budget,
             before_conditions=args.before_conditions,
             before_results=args.before_results,
             after_conditions=args.after_conditions,

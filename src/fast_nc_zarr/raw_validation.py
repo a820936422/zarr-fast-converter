@@ -124,6 +124,8 @@ def _smoke_convert(inventory, output: Path) -> dict[str, Any]:
         inventory,
         selection,
         output,
+        # Raw validation intentionally uses a bounded smoke workload rather
+        # than production auto-tuning; production conversion remains auto.
         auto_tune=False,
         max_workers=2,
         overwrite=True,
@@ -135,6 +137,8 @@ def _smoke_convert(inventory, output: Path) -> dict[str, Any]:
         "selection": asdict(selection),
         "plan": asdict(plan),
         "metrics": metrics,
+        "mode": "safe_smoke",
+        "worker_policy": "fixed two-worker validation smoke; not production tuning",
         "elapsed": time.perf_counter() - started,
     }
 

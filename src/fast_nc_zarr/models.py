@@ -265,3 +265,33 @@ class BenchmarkResult:
     physical_mib_s: float = 0.0
     compression_ratio: float = 0.0
     sample_count: int = 1
+    status: str = "ok"
+    failure: str | None = None
+    candidate_id: int | None = None
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe candidate trial record for manifests."""
+
+        return {
+            "plan": {
+                "strategy": self.plan.strategy,
+                "workers": self.plan.workers,
+                "chunks": list(self.plan.chunks),
+                "task_batch": self.plan.task_batch,
+                "compression": self.plan.compression,
+                "compression_level": self.plan.compression_level,
+                "shuffle": self.plan.shuffle,
+            },
+            "elapsed": self.elapsed,
+            "logical_bytes": self.logical_bytes,
+            "physical_bytes": self.physical_bytes,
+            "durable_mib_s": self.durable_mib_s,
+            "logical_mib_s": self.logical_mib_s,
+            "physical_mib_s": self.physical_mib_s,
+            "average_cpu": self.average_cpu,
+            "peak_rss": self.peak_rss,
+            "compression_ratio": self.compression_ratio,
+            "status": self.status,
+            "failure": self.failure,
+            "candidate_id": self.candidate_id,
+            "sample_count": self.sample_count,
+        }

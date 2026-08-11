@@ -156,6 +156,7 @@ def tune(
     candidates: list[ConversionPlan],
     *,
     budget_seconds: float = 60.0,
+    objective: str = "balanced",
     progress: bool = True,
     writer: Callable = direct_write,
     writer_kwargs: dict | None = None,
@@ -189,6 +190,7 @@ def tune(
             "cpu_weighted": 0.0,
             "peak_rss": 0,
             "samples": 0,
+            "failures": [],
         }
         for index, plan in enumerate(candidates, 1)
     }
@@ -269,6 +271,9 @@ def tune(
                     completed_any = True
                     next_active.append(index)
                 except Exception as exc:
+                    aggregates[index]["failures"].append(
+                        f"{type(exc).__name__}: {exc}"[:1000]
+                    )
                     if progress:
                         print(
                             f"  [{index}/{len(candidates)} 样本 {sample_round}/{len(samples)}] "
@@ -286,27 +291,46 @@ def tune(
 
         for index, aggregate in aggregates.items():
             completed_samples = int(aggregate["samples"])
-            if not completed_samples:
-                continue
             logical_total = int(aggregate["logical"])
             physical_total = int(aggregate["physical"])
             write_elapsed_total = float(aggregate["write_elapsed"])
             durable_elapsed_total = float(aggregate["durable_elapsed"])
+            failures = tuple(str(item) for item in aggregate["failures"])
+            completed = completed_samples > 0
             result = BenchmarkResult(
                 plan=aggregate["plan"],
                 elapsed=durable_elapsed_total,
                 logical_bytes=logical_total,
                 physical_bytes=physical_total,
-                durable_mib_s=logical_total / max(durable_elapsed_total, 1e-9) / 1024**2,
-                average_cpu=float(aggregate["cpu_weighted"]) / max(write_elapsed_total, 1e-9),
+                durable_mib_s=(
+                    logical_total / max(durable_elapsed_total, 1e-9) / 1024**2
+                    if completed
+                    else 0.0
+                ),
+                average_cpu=(
+                    float(aggregate["cpu_weighted"]) / max(write_elapsed_total, 1e-9)
+                    if completed
+                    else 0.0
+                ),
                 peak_rss=int(aggregate["peak_rss"]),
-                logical_mib_s=logical_total / max(write_elapsed_total, 1e-9) / 1024**2,
-                physical_mib_s=physical_total / max(write_elapsed_total, 1e-9) / 1024**2,
-                compression_ratio=physical_total / max(logical_total, 1),
+                logical_mib_s=(
+                    logical_total / max(write_elapsed_total, 1e-9) / 1024**2
+                    if completed
+                    else 0.0
+                ),
+                physical_mib_s=(
+                    physical_total / max(write_elapsed_total, 1e-9) / 1024**2
+                    if completed
+                    else 0.0
+                ),
+                compression_ratio=(physical_total / max(logical_total, 1) if completed else 0.0),
                 sample_count=completed_samples,
+                status="ok" if completed else "failed",
+                failure=(None if completed else "; ".join(failures) or "候选未在预算内执行"),
+                candidate_id=index,
             )
             results.append(result)
-            if progress:
+            if progress and completed:
                 print(
                     f"  [{index}/{len(candidates)}] {result.plan.label()} -> "
                     f"逻辑 {result.logical_mib_s:.1f} MiB/s，"
@@ -317,17 +341,18 @@ def tune(
                 )
     finally:
         shutil.rmtree(tune_root, ignore_errors=True)
-    if not results:
+    if not any(item.status == "ok" for item in results):
         raise RuntimeError("所有自动调参候选都执行失败。")
     full_logical = logical_bytes_fn(inventory, selection)
     free = shutil.disk_usage(output.parent).free
     feasible = [
         item
         for item in results
-        if full_logical
-            * (item.physical_bytes / max(item.logical_bytes, 1))
-            * COMPRESSION_SAFETY
-            <= free * 0.95
+        if item.status == "ok"
+        and full_logical
+        * (item.physical_bytes / max(item.logical_bytes, 1))
+        * COMPRESSION_SAFETY
+        <= free * 0.95
     ]
     if not feasible:
         smallest = min(
@@ -345,14 +370,64 @@ def tune(
             f"最小方案约 {estimate / 1024**3:.1f} GiB，"
             f"可用 {free / 1024**3:.1f} GiB。"
         )
-    # Production writes only perform the final durability step after all
-    # workers finish, so optimize the end-to-end write speed while retaining
-    # durable_mib_s for observability and safety reporting.
-    best = max(feasible, key=lambda item: item.logical_mib_s)
+    objective = str(objective).strip().lower()
+    if objective not in {"speed", "balanced", "compact"}:
+        raise ValueError("转换调优目标必须是 speed、balanced 或 compact。")
+    fastest = max(feasible, key=lambda item: item.logical_mib_s)
+    near_best = [
+        item
+        for item in feasible
+        if item.logical_mib_s >= fastest.logical_mib_s * 0.95
+    ]
+    if objective == "speed":
+        best = max(
+            near_best,
+            key=lambda item: (
+                item.logical_mib_s,
+                item.durable_mib_s,
+                item.plan.workers,
+            ),
+        )
+        selection_reason = "speed 目标：近似最快候选中偏向更高并发"
+    elif objective == "compact":
+        compact_pool = [
+            item
+            for item in feasible
+            if item.logical_mib_s >= fastest.logical_mib_s * 0.80
+        ]
+        best = min(
+            compact_pool,
+            key=lambda item: (
+                item.compression_ratio,
+                -item.logical_mib_s,
+                item.peak_rss,
+                item.plan.workers,
+            ),
+        )
+        selection_reason = "compact 目标：保持可接受吞吐并优先压缩率和 RSS"
+    else:
+        max_logical = max(item.logical_mib_s for item in near_best)
+        max_durable = max(item.durable_mib_s for item in near_best)
+        max_ratio = max(item.compression_ratio for item in near_best) or 1.0
+        max_rss = max(item.peak_rss for item in near_best) or 1
+
+        def balanced_score(item: BenchmarkResult) -> float:
+            return (
+                0.55 * item.logical_mib_s / max(max_logical, 1e-9)
+                + 0.25 * item.durable_mib_s / max(max_durable, 1e-9)
+                + 0.15 * (1.0 - item.compression_ratio / max_ratio)
+                + 0.05 * (1.0 - item.peak_rss / max_rss)
+            )
+
+        best = max(
+            near_best,
+            key=lambda item: (balanced_score(item), -item.plan.workers),
+        )
+        selection_reason = "balanced 目标：综合逻辑吞吐、耐久吞吐、压缩率和 RSS"
     if progress:
         print(
-            f"自动调参选择：{best.plan.label()}，"
+            f"自动调参选择（{objective}）：{best.plan.label()}，"
             f"逻辑 {best.logical_mib_s:.1f} MiB/s，"
-            f"耐久 {best.durable_mib_s:.1f} MiB/s"
+            f"耐久 {best.durable_mib_s:.1f} MiB/s；{selection_reason}"
         )
     return best.plan, results

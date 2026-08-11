@@ -295,7 +295,7 @@ class RechunkingTests(unittest.TestCase):
                 np.arange(6 * 8 * 10, dtype="int16").reshape(6, 8, 10),
             )
 
-    def test_worker_caps_use_filesystem_and_stage2_peak_memory(self) -> None:
+    def test_worker_ceiling_uses_resources_not_filesystem_type(self) -> None:
         network_source = StorageProfile(Path("/source"), "network-a", False, "9p")
         network_target = StorageProfile(Path("/target"), "network-b", False, "ext4")
         with (
@@ -306,10 +306,11 @@ class RechunkingTests(unittest.TestCase):
             patch("fast_nc_zarr.rechunking.engine.os.cpu_count", return_value=16),
         ):
             network_workers, reason = _parallel_workers(
-                Path("/source"), Path("/target"), 8
+                Path("/source"), Path("/target"), 8, worker_ceiling=8
             )
-        self.assertEqual(network_workers, 2)
+        self.assertEqual(network_workers, 8)
         self.assertIn("9p", reason)
+        self.assertIn("未静态限制", reason)
 
         ssd_source = StorageProfile(Path("/source"), "ssd-a", False, "ext4")
         ssd_target = StorageProfile(Path("/target"), "ssd-b", False, "ext4")
@@ -320,33 +321,20 @@ class RechunkingTests(unittest.TestCase):
             ),
             patch("fast_nc_zarr.rechunking.engine.os.cpu_count", return_value=16),
         ):
-            ssd_workers, _ = _parallel_workers(Path("/source"), Path("/target"), 8)
+            ssd_workers, _ = _parallel_workers(
+                Path("/source"), Path("/target"), 8, worker_ceiling=8
+            )
         self.assertEqual(ssd_workers, 8)
-        overridden_network = StorageProfile(
-            Path("/source"), "network-a", None, "ext4", medium="network", override="network"
+
+        capped, _ = _parallel_workers(
+            Path("/source"),
+            Path("/target"),
+            8,
+            source_profile=network_source,
+            target_profile=network_target,
+            worker_ceiling=3,
         )
-        overridden_ssd = StorageProfile(
-            Path("/target"), "ssd-b", False, "9p", medium="ssd", override="ssd"
-        )
-        with patch("fast_nc_zarr.rechunking.engine.os.cpu_count", return_value=16):
-            limited, _ = _parallel_workers(
-                Path("/source"),
-                Path("/target"),
-                8,
-                source_profile=overridden_network,
-                target_profile=overridden_ssd,
-            )
-            unrestricted, _ = _parallel_workers(
-                Path("/target"),
-                Path("/other"),
-                8,
-                source_profile=overridden_ssd,
-                target_profile=StorageProfile(
-                    Path("/other"), "ssd-c", False, "9p", medium="ssd", override="ssd"
-                ),
-            )
-        self.assertEqual(limited, 2)
-        self.assertEqual(unrestricted, 8)
+        self.assertEqual(capped, 3)
 
     def test_stage2_benchmark_uses_final_time_chunk_geometry(self) -> None:
         info = inspect_store(ROOT / "input.zarr")

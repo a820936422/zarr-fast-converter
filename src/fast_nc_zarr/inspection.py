@@ -11,7 +11,7 @@ import numpy as np
 
 from .models import FileRecord, Inventory, VariableSpec
 from .runtime import bounded_process_map
-from .system import physical_cpu_count, storage_profile
+from .system import effective_resource_budget
 from .time_mapping import FilenameField, TimeRule, resolve_file_times
 
 SUFFIXES = {".nc", ".nc4", ".nc3", ".cdf", ".hdf"}
@@ -506,22 +506,19 @@ def _inspect_file_batch(tasks) -> tuple[FileRecord, ...]:
 
 
 def choose_inspection_workers(files: list[Path], requested: int | None = None) -> int:
-    """Choose metadata workers while accounting for rotational storage.
+    """Choose metadata workers from the effective resource contract.
 
-    Opening thousands of small HDF/NetCDF files is seek-bound on a mechanical
-    disk.  Four concurrent readers, which was the previous default, can make
-    the heads repeatedly jump between file streams and be slower than a
-    smaller queue.  Keep an explicit user request authoritative, but use at
-    most two automatic readers for large collections on rotational media.
+    Storage profiles remain benchmark context; they never pre-emptively cap
+    the candidate ceiling based only on rotational or network media.
     """
-    if requested is not None:
-        return max(1, min(requested, len(files)))
-    cpus = physical_cpu_count()
-    profile = storage_profile(files[0])
-    median_size = int(np.median([item.stat().st_size for item in files]))
-    if profile.rotational and len(files) >= 256 and median_size < 32 * 1024**2:
-        return min(2, cpus, len(files))
-    return min(8, cpus, len(files))
+
+    if not files:
+        return 1
+    budget = effective_resource_budget(
+        source=Path(files[0]),
+        requested=(None if requested is None else max(1, int(requested))),
+    )
+    return max(1, min(len(files), int(budget.worker_ceiling)))
 
 
 def _variable_signature(spec: VariableSpec) -> tuple:

@@ -389,7 +389,15 @@ class PipelineTests(unittest.TestCase):
                 manifest = json.loads(
                     Path(result["manifest"]).read_text(encoding="utf-8")
                 )
-                self.assertEqual(manifest["schema_version"], 5)
+                self.assertEqual(manifest["schema_version"], 6)
+                self.assertTrue(Path(manifest["events"]).is_file())
+                event_types = {
+                    json.loads(line)["event"]
+                    for line in Path(manifest["events"]).read_text(encoding="utf-8").splitlines()
+                }
+                self.assertTrue({"started", "resource", "finished"}.issubset(event_types))
+                self.assertTrue(manifest["preflight"]["temporary"]["writable"])
+                self.assertIn("worker_ceiling", manifest["resource_budget"])
                 self.assertEqual(manifest["input_kind"], "raw")
                 self.assertEqual(
                     manifest["requested_operation_order"],
@@ -405,6 +413,7 @@ class PipelineTests(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(manifest["physical_stages"], ["conversion"])
+                self.assertIn("conversion", manifest["candidate_trials"])
                 self.assertEqual(
                     manifest["requested_operations"],
                     {
@@ -1036,7 +1045,7 @@ class PipelineTests(unittest.TestCase):
             recovered.recovery.manifest_path.read_text(encoding="utf-8")
         )
         self.assertEqual(original_manifest["status"], "resumed_succeeded")
-        self.assertEqual(original_manifest["schema_version"], 5)
+        self.assertEqual(original_manifest["schema_version"], 6)
         self.assertNotIn("error", original_manifest)
         self.assertNotIn("failed_stage", original_manifest)
         self.assertEqual(
