@@ -97,19 +97,71 @@ class RustZarrCrossBackendTests(unittest.TestCase):
         np.testing.assert_array_equal(chunk, [0.0, 2.0, 6.0, 8.0])
 
 
+    def test_rust_rechunk_uses_bounded_parallel_workers(self) -> None:
+        source = f"{self.tempdir.name}/parallel-source.zarr"
+        target = f"{self.tempdir.name}/parallel-target.zarr"
+        values = np.arange(8 * 4 * 4, dtype="float32").reshape(8, 4, 4)
+        dataset = xr.Dataset(
+            {"value": (("time", "lat", "lon"), values)},
+            coords={"time": np.arange(8), "lat": np.arange(4), "lon": np.arange(4)},
+        )
+        dataset.to_zarr(
+            source,
+            mode="w",
+            consolidated=False,
+            zarr_format=3,
+            encoding={"value": {"chunks": (2, 2, 2)}},
+        )
+        dataset.close()
+        metrics = run_rust_rechunk(
+            RustRechunkPlan(
+                source=Path(source),
+                target=Path(target),
+                array_path="/value",
+                target_chunks=(1, 2, 2),
+                requested_workers=4,
+                worker_ceiling=4,
+                memory_budget_bytes=1024 * 1024,
+                codec_concurrent_target=2,
+            )
+        )
+        self.assertGreaterEqual(metrics["resolved_workers"], 1)
+        self.assertLessEqual(metrics["resolved_workers"], 4)
+        self.assertEqual(metrics["codec_concurrent_target"], 2)
+        self.assertEqual(metrics["memory_budget_bytes"], 1024 * 1024)
+        self.assertGreater(metrics["peak_bytes_per_worker"], 0)
+        with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as result:
+            np.testing.assert_array_equal(result["value"].values, values)
+
+    def test_rust_rechunk_pre_cancelled_does_not_publish(self) -> None:
+        import threading
+
+        source = f"{self.tempdir.name}/cancel-source.zarr"
+        target = f"{self.tempdir.name}/cancel-target.zarr"
+        xr.Dataset(
+            {"value": (("time", "lat", "lon"), np.zeros((2, 2, 2), dtype="float32"))}
+        ).to_zarr(source, mode="w", consolidated=False, zarr_format=3)
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(RuntimeError, "任务已取消"):
+            run_rust_rechunk(
+                RustRechunkPlan(
+                    source=Path(source),
+                    target=Path(target),
+                    array_path="/value",
+                    target_chunks=(1, 2, 2),
+                ),
+                cancel_event=cancelled,
+            )
+        self.assertFalse(Path(target).exists())
+
     def test_rust_rechunk_changes_chunks_without_changing_values(self) -> None:
         source = f"{self.tempdir.name}/rechunk-source.zarr"
         target = f"{self.tempdir.name}/rechunk-target.zarr"
         values = np.arange(4 * 3 * 2, dtype="float32").reshape(4, 3, 2)
         dataset = xr.Dataset(
-            {
-                "value": (("time", "lat", "lon"), values),
-            },
-            coords={
-                "time": np.arange(4, dtype="int64"),
-                "lat": np.arange(3, dtype="int64"),
-                "lon": np.arange(2, dtype="int64"),
-            },
+            {"value": (("time", "lat", "lon"), values)},
+            coords={"time": np.arange(4), "lat": np.arange(3), "lon": np.arange(2)},
             attrs={"title": "rust rechunk"},
         )
         dataset.to_zarr(
@@ -128,7 +180,7 @@ class RustZarrCrossBackendTests(unittest.TestCase):
                 target_chunks=(1, 3, 2),
             )
         )
-        self.assertEqual(metrics["resolved_workers"], 1)
+        self.assertGreaterEqual(metrics["resolved_workers"], 1)
         self.assertEqual(metrics["output"], target)
         with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as result:
             np.testing.assert_array_equal(result["value"].values, values)

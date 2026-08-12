@@ -328,6 +328,8 @@ class GuiServiceTests(unittest.TestCase):
         self.assertEqual(metrics["execution_path"], "rust-streaming-target-chunk")
         self.assertEqual(Path(metrics["output"]), output)
         self.assertEqual(metrics["target_chunks"], [1, 3, 4])
+        self.assertGreaterEqual(metrics["resolved_workers"], 1)
+        self.assertGreater(metrics["peak_bytes_per_worker"], 0)
         with xr.open_zarr(
             output, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
         ) as dataset:

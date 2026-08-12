@@ -18,6 +18,12 @@ pub struct RechunkExecutionPlan {
     pub target_chunks: Vec<u64>,
     pub expected_dtype: String,
     pub requested_workers: u32,
+    #[serde(default)]
+    pub worker_ceiling: u32,
+    #[serde(default)]
+    pub memory_budget_bytes: u64,
+    #[serde(default)]
+    pub codec_concurrent_target: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +37,9 @@ pub struct RechunkMetrics {
     pub target_chunk_count: u64,
     pub resolved_workers: u32,
     pub worker_reason: String,
+    pub peak_bytes_per_worker: u64,
+    pub memory_budget_bytes: u64,
+    pub codec_concurrent_target: u32,
 }
 
 impl BackendCapability {

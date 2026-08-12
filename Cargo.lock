@@ -314,6 +314,7 @@ version = "1.6.9"
 dependencies = [
  "fast-nc-zarr-model",
  "ndarray",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror",

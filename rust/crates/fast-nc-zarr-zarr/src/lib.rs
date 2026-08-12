@@ -4,10 +4,13 @@ use std::sync::Arc;
 
 use fast_nc_zarr_model::{RechunkExecutionPlan, RechunkMetrics};
 use ndarray::ArrayD;
+use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
-use zarrs::array::{data_type, Array, ArrayBuilder, ArrayMetadataOptions, ArraySubset};
+use zarrs::array::{
+    data_type, Array, ArrayBuilder, ArrayMetadataOptions, ArraySubset, CodecOptions,
+};
 use zarrs::group::GroupBuilder;
 use zarrs_filesystem::FilesystemStore;
 
@@ -410,7 +413,7 @@ pub fn write_f32_array(
 pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> {
     if plan.expected_dtype != "float32" {
         return Err(ZarrError::message(format!(
-            "P2 Rust rechunk backend only supports expected_dtype=float32, got {}",
+            "P3 Rust rechunk backend only supports expected_dtype=float32, got {}",
             plan.expected_dtype
         )));
     }
@@ -425,7 +428,7 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
     let source_metadata = serialised_metadata(&source_array)?;
     if source_metadata.get("data_type") != Some(&Value::String("float32".to_owned())) {
         return Err(ZarrError::message(
-            "P2 Rust rechunk backend only supports source data_type=float32",
+            "P3 Rust rechunk backend only supports source data_type=float32",
         ));
     }
     if plan.target_chunks.len() != source_array.shape().len() {
@@ -433,6 +436,38 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
             "target_chunks dimensionality does not match source array",
         ));
     }
+
+    let source_shape = source_array.shape().to_vec();
+    let source_chunk_shape = source_array
+        .chunk_shape_usize(&vec![0_u64; source_shape.len()])
+        .map_err(ZarrError::from_display)?;
+    let source_chunk_elements = source_chunk_shape.iter().try_fold(1_u64, |total, value| {
+        total
+            .checked_mul(
+                u64::try_from(*value)
+                    .map_err(|_| ZarrError::message("source chunk shape exceeds u64"))?,
+            )
+            .ok_or_else(|| ZarrError::message("source chunk element count overflows u64"))
+    })?;
+    let target_chunk_elements = checked_product(&plan.target_chunks)? as u64;
+    // Two decoded buffers and two codec-side buffers are the conservative
+    // per-task bound used to cap outer target-chunk parallelism.
+    let peak_bytes_per_worker = source_chunk_elements
+        .checked_add(target_chunk_elements)
+        .and_then(|elements| elements.checked_mul(8))
+        .ok_or_else(|| ZarrError::message("per-worker memory estimate overflows u64"))?;
+
+    let requested_workers = u64::from(plan.requested_workers.max(1));
+    let worker_ceiling = if plan.worker_ceiling == 0 {
+        requested_workers
+    } else {
+        u64::from(plan.worker_ceiling).min(requested_workers)
+    };
+    let memory_limited_workers = if plan.memory_budget_bytes == 0 {
+        worker_ceiling
+    } else {
+        (plan.memory_budget_bytes / peak_bytes_per_worker.max(1)).max(1)
+    };
 
     let target_root = Path::new(&plan.target);
     copy_store_without_array(source_root, target_root, &plan.array_path)?;
@@ -455,38 +490,46 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
             .checked_mul(*value)
             .ok_or_else(|| ZarrError::message("target chunk count overflows u64"))
     })?;
-    let mut chunk_indices = vec![0_u64; target_grid_shape.len()];
-    loop {
-        let subset = target_array
-            .chunk_subset_bounded(&chunk_indices)
-            .map_err(ZarrError::from_display)?;
-        let values: ArrayD<f32> = source_array
-            .retrieve_array_subset(&subset)
-            .map_err(ZarrError::from_display)?;
-        target_array
-            .store_array_subset(&subset, values)
-            .map_err(ZarrError::from_display)?;
-        let shape = target_grid_shape
-            .iter()
-            .map(|value| usize::try_from(*value).unwrap_or(usize::MAX))
-            .collect::<Vec<_>>();
-        let mut index = chunk_indices
-            .iter()
-            .map(|value| usize::try_from(*value).unwrap_or(usize::MAX))
-            .collect::<Vec<_>>();
-        if !increment_index(&mut index, &shape) {
-            break;
-        }
-        chunk_indices = index
-            .into_iter()
-            .map(|value| u64::try_from(value).unwrap_or(u64::MAX))
-            .collect();
-    }
-
-    let source_shape = source_array.shape().to_vec();
-    let source_chunk_shape = source_array
-        .chunk_shape_usize(&vec![0_u64; source_shape.len()])
+    let resolved_workers = worker_ceiling
+        .min(memory_limited_workers)
+        .min(target_grid_count)
+        .max(1);
+    let resolved_workers = usize::try_from(resolved_workers)
+        .map_err(|_| ZarrError::message("resolved worker count exceeds usize"))?;
+    let codec_concurrent_target = if plan.codec_concurrent_target == 0 {
+        1
+    } else {
+        usize::try_from(u64::from(plan.codec_concurrent_target).min(resolved_workers as u64))
+            .map_err(|_| ZarrError::message("codec worker count exceeds usize"))?
+            .max(1)
+    };
+    let codec_options = CodecOptions::default()
+        .with_concurrent_target(codec_concurrent_target)
+        .with_chunk_concurrent_minimum(1);
+    let source_array = source_array.with_codec_options(codec_options);
+    let target_array = target_array.with_codec_options(codec_options);
+    let target_indices = ArraySubset::new_with_shape(target_grid_shape.clone()).indices();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(resolved_workers)
+        .build()
         .map_err(ZarrError::from_display)?;
+
+    pool.install(|| {
+        target_indices
+            .into_par_iter()
+            .try_for_each(|chunk_indices| -> Result<()> {
+                let subset = target_array
+                    .chunk_subset_bounded(&chunk_indices)
+                    .map_err(ZarrError::from_display)?;
+                let values: ArrayD<f32> = source_array
+                    .retrieve_array_subset_opt(&subset, &codec_options)
+                    .map_err(ZarrError::from_display)?;
+                target_array
+                    .store_array_subset_opt(&subset, values, &codec_options)
+                    .map_err(ZarrError::from_display)
+            })
+    })?;
+
     let logical_elements = checked_product(&source_shape)? as u64;
     let logical_bytes = logical_elements
         .checked_mul(4)
@@ -499,10 +542,19 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
         target_chunks: plan.target_chunks.clone(),
         logical_bytes,
         target_chunk_count: target_grid_count,
-        resolved_workers: 1,
+        resolved_workers: u32::try_from(resolved_workers)
+            .map_err(|_| ZarrError::message("resolved worker count exceeds u32"))?,
         worker_reason: format!(
-            "P2 initial implementation owns one target chunk at a time; requested_workers={}",
-            plan.requested_workers
+            "P3 bounded target-chunk pool; requested_workers={}, ceiling={}, memory_limited_workers={}, peak_bytes_per_worker={}, codec_concurrent_target={}",
+            plan.requested_workers.max(1),
+            plan.worker_ceiling,
+            memory_limited_workers,
+            peak_bytes_per_worker,
+            codec_concurrent_target,
         ),
+        peak_bytes_per_worker,
+        memory_budget_bytes: plan.memory_budget_bytes,
+        codec_concurrent_target: u32::try_from(codec_concurrent_target)
+            .map_err(|_| ZarrError::message("codec worker count exceeds u32"))?,
     })
 }

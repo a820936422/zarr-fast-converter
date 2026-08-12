@@ -13,3 +13,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 ndarray.workspace = true
 zarrs.workspace = true
+rayon.workspace = true

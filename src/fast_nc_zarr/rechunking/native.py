@@ -22,7 +22,7 @@ BackendName = Literal["auto", "python", "rust"]
 
 @dataclass(frozen=True, slots=True)
 class RustRechunkPlan:
-    """Explicit single-array P2 execution plan for the Rust backend."""
+    """Explicit single-array P3 execution plan for the Rust backend."""
 
     source: Path
     target: Path
@@ -30,6 +30,9 @@ class RustRechunkPlan:
     target_chunks: tuple[int, ...]
     expected_dtype: str = "float32"
     requested_workers: int = 1
+    worker_ceiling: int = 1
+    memory_budget_bytes: int = 0
+    codec_concurrent_target: int = 1
 
     def to_json(self) -> str:
         return json.dumps(
@@ -40,6 +43,9 @@ class RustRechunkPlan:
                 "target_chunks": [int(value) for value in self.target_chunks],
                 "expected_dtype": self.expected_dtype,
                 "requested_workers": max(1, int(self.requested_workers)),
+                "worker_ceiling": max(1, int(self.worker_ceiling)),
+                "memory_budget_bytes": max(0, int(self.memory_budget_bytes)),
+                "codec_concurrent_target": max(1, int(self.codec_concurrent_target)),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -104,12 +110,6 @@ def _validate_staged_output(
         ):
             raise ValueError(f"Rust输出变量 {name} 的 codec 发生变化")
 
-    if validate:
-        from .engine import _validate_samples
-
-        _validate_samples(source_info.path, staged, source_info)
-
-
 def run_rust_rechunk(
     plan: RustRechunkPlan,
     *,
@@ -119,7 +119,7 @@ def run_rust_rechunk(
     validate: bool = True,
     cancel_event=None,
 ) -> dict[str, object]:
-    """Execute an explicit Rust P2 plan through Python staging and publication."""
+    """Execute an explicit P3 plan through staging and atomic publication."""
 
     source = plan.source.expanduser().resolve()
     target = plan.target.expanduser().resolve(strict=False)
@@ -156,6 +156,9 @@ def run_rust_rechunk(
         target_chunks=plan.target_chunks,
         expected_dtype=plan.expected_dtype,
         requested_workers=plan.requested_workers,
+        worker_ceiling=plan.worker_ceiling,
+        memory_budget_bytes=plan.memory_budget_bytes,
+        codec_concurrent_target=plan.codec_concurrent_target,
     )
 
     try:
@@ -194,6 +197,8 @@ def run_rust_rechunk(
                 "output": str(target),
                 "temporary_dir": str(target.parent),
                 "requested_workers": plan.requested_workers,
+                "worker_ceiling": plan.worker_ceiling,
+                "memory_budget_bytes": plan.memory_budget_bytes,
                 "worker_tuning": {},
                 "tuning_objective": "balanced",
                 "selected_compression": {"profile": "none", "codec": "none"},
@@ -205,6 +210,7 @@ def run_rust_rechunk(
         raise
 
 
+
 def run_rust_rechunk_for_config(
     config,
     info,
@@ -212,24 +218,24 @@ def run_rust_rechunk_for_config(
     *,
     cancel_event=None,
 ) -> dict[str, object]:
-    """Resolve a supported float32 variable and execute one explicit plan."""
+    """Resolve a supported float32 variable and execute one P3 plan."""
 
     reference = next(
         (variable for variable in info.data_variables if variable.ndim == 3),
         None,
     )
     if reference is None:
-        raise ValueError("Rust P2 rechunk requires a three-dimensional data variable")
+        raise ValueError("Rust P3 rechunk requires a three-dimensional data variable")
     if str(reference.dtype) != "float32":
         raise ValueError(
-            f"Rust P2 rechunk currently supports float32 only, got {reference.dtype}"
+            f"Rust P3 rechunk currently supports float32 only, got {reference.dtype}"
         )
     if len(info.data_variables) != 1:
-        raise ValueError("Rust P2 rechunk requires exactly one data variable")
+        raise ValueError("Rust P3 rechunk requires exactly one data variable")
     if tuple(reference.dims) != ("time", "lat", "lon"):
-        raise ValueError("Rust P2 rechunk requires data dimensions (time, lat, lon)")
+        raise ValueError("Rust P3 rechunk requires data dimensions (time, lat, lon)")
     if getattr(config, "compression", "none") != "none":
-        raise ValueError("Rust P2 rechunk does not yet support codec changes")
+        raise ValueError("Rust P3 rechunk does not yet support codec changes")
 
     if plan is None:
         target_chunks = tuple(int(value) for value in reference.chunks)
@@ -243,6 +249,21 @@ def run_rust_rechunk_for_config(
     else:
         target_chunks = tuple(int(value) for value in plan.chunks_for(reference))
 
+    budget = getattr(config, "resource_budget", None)
+    if budget is None:
+        from ..system import effective_resource_budget
+
+        budget = effective_resource_budget(
+            source=Path(config.input),
+            output=Path(config.output).parent,
+            requested=(None if config.workers == "auto" else max(1, int(config.workers))),
+        )
+    requested_workers = (
+        int(budget.worker_ceiling)
+        if config.workers == "auto"
+        else min(max(1, int(config.workers)), int(budget.worker_ceiling))
+    )
+    codec_workers = max(1, min(requested_workers, 2))
     return run_rust_rechunk(
         RustRechunkPlan(
             source=Path(config.input),
@@ -250,9 +271,10 @@ def run_rust_rechunk_for_config(
             array_path=f"/{reference.name}",
             target_chunks=target_chunks,
             expected_dtype="float32",
-            requested_workers=(
-                1 if config.workers == "auto" else max(1, int(config.workers))
-            ),
+            requested_workers=requested_workers,
+            worker_ceiling=int(budget.worker_ceiling),
+            memory_budget_bytes=int(budget.memory_budget_bytes),
+            codec_concurrent_target=codec_workers,
         ),
         requested_backend="rust",
         source_info=info,

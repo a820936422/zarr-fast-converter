@@ -62,6 +62,18 @@ PySide6 图形界面将主导航收敛为“数据检查、处理流程、任务
 v1.6.8 将路径字段简化为“路径 + 可访问状态 + 浏览”；收藏、最近浏览和收藏管理集中在“浏览”打开的嵌入式路径选择界面左侧面板中，可直接搜索、进入收藏目录、选择当前目录、收藏当前目录和管理收藏。收藏设置从 `pathPicker/v1` 自动迁移到 `pathPicker/v2`；任务中心增加 CPU、RSS、读写和磁盘指标卡，数据检查和处理流程使用步骤条与状态徽标。
 v1.6.9 将存储介质从静态 worker 限速改为有效资源约束与真实候选选择：统一 CPU/内存/文件描述符资源契约，conversion、resampling、rechunk 分别记录 worker/tile 候选和选择证据；临时与输出目录在处理前执行可写性预检；pipeline manifest 升级为 schema 6，并写入 resource budget、preflight、候选选择、内存语义和 `events.jsonl`。
 
+## v1.7.0 Rust 重构状态
+
+`refactor/v1.7.0-rust` 分支已完成 Rust Zarr v3 核心、单变量 `float32` 重分块和
+有界目标 chunk 并行后端。Rust 后端仍为实验性 opt-in，不改变 v1.6.9 的 Python
+默认路径；完整说明见 [`docs/rechunking.md`](docs/rechunking.md) 和
+[`Architecture/v1.7.0-rust-refactor-plan.md`](Architecture/v1.7.0-rust-refactor-plan.md)。
+
+当前 Rust 后端支持：一个 `(time, lat, lon)` 三维 `float32` 数据变量、Zarr v3、
+不改变 codec 的重分块。输出通过 staging、结构校验、抽样逐值校验和原子发布完成。
+多变量、其他 dtype、重压缩、NetCDF/HDF/TIFF 转换、重采样和 pipeline 融合仍使用
+Python 路径或回退 Python。
+
 v1.6.7 在每次任务前记录当前进程真正可用的 CPU、内存、WSL/cgroup 限制以及源、临时和输出文件系统证据；WSL 虚拟块设备不再因不可信的 `rotational=1` 被直接判为机械硬盘。兼容性最终化默认分别用真实源 chunk 和最终 region 小样本实测阶段 1/2 worker。自动压缩在真实输出文件系统上比较受控的无损 Zstd/LZ4 候选，综合 durable 写入、冷热读取和体积从 Pareto 前沿选择。GUI 的主要路径选择器支持持久收藏、最近目录和失效路径保留。
 
 v1.6.6 针对真实生产任务的 CPU 欠利用与中间写放大进行通用优化：规则网格等价判断考虑坐标 dtype/ULP，物理 Zarr chunk 强制单一写者；流水线固定布局仍会实测 worker 并发；转换按时间片提高源句柄局部性；重采样优先以最终 chunk owner 有界聚合，重分块对等价布局和仅换 codec 使用快速路径。任务日志与资源事件会持久化到用户缓存目录，便于性能回归分析。

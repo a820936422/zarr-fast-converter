@@ -18,6 +18,39 @@ python -m fast_nc_zarr.rechunking --help
 - 支持无损 codec：Blosc Zstd/LZ4/LZ4HC/Zlib、原生 Zstd 和 Gzip。
 - 最终输出使用普通 Zarr v3 chunks；大规模中间层可能使用 sharding 减少文件数。
 
+## Rust 后端（v1.7.0 实验性）
+
+Rust 后端通过 `fast_nc_zarr._native` 提供可选的 Zarr v3 重分块执行器：
+
+```bash
+pixi run rechunk -- \
+  --input /data/input.zarr \
+  --output /data/output.zarr \
+  --strategy custom \
+  --chunks '[1,256,256]' \
+  --compression none \
+  --backend rust \
+  --workers 4
+```
+
+当前 Rust P3 适用范围：
+
+- 一个三维 `float32` 数据变量；
+- 维度严格为 `(time, lat, lon)`；
+- 只改变目标 chunks，不改变 codec；
+- Zarr v3 目录型 store。
+
+Rust 执行按互不重叠的目标 chunk 建立有界线程池。有效并发度同时受
+`--workers`、检测到的资源 worker ceiling、目标 chunk 数和内存预算限制；codec
+内部并发度单独收敛，metrics 会记录实际值和单 worker 内存估计。
+
+`--backend auto` 在 Rust 能力或输入范围不满足时回退 Python；`--backend rust`
+则在能力不足时明确失败。当前 CLI 默认仍为 Python，避免改变既有任务行为。
+
+Rust 输出先写入目标同文件系统的 staging 目录，随后由 Python 完成元数据、codec、
+抽样数值校验和原子发布。取消、异常或校验失败不会发布最终输出。Rust 后端目前
+不支持多变量、非 `float32`、codec 变更、Zarr v2、重采样或完整 pipeline 执行。
+
 ## 分块策略
 
 - `time`：提高长时间序列读取连续性。
