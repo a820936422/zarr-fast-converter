@@ -64,15 +64,15 @@ v1.6.9 将存储介质从静态 worker 限速改为有效资源约束与真实�
 
 ## v1.7.0 Rust 重构状态
 
-`refactor/v1.7.0-rust` 分支已完成 Rust Zarr v3 核心、单变量 `float32` 重分块和
-有界目标 chunk 并行后端。Rust 后端仍为实验性 opt-in，不改变 v1.6.9 的 Python
-默认路径；完整说明见 [`docs/rechunking.md`](docs/rechunking.md) 和
-[`Architecture/v1.7.0-rust-refactor-plan.md`](Architecture/v1.7.0-rust-refactor-plan.md)。
+`refactor/v1.7.0-rust` 分支已完成 Rust Zarr v3 核心、单变量 `float32` 重分块、
+有界目标 chunk 并行、明确 codec 重压缩和取消/进度协议。Rust 后端仍为实验性 opt-in，
+不改变 v1.6.9 的 Python 默认路径；完整说明见 [`docs/rechunking.md`](docs/rechunking.md)
+和 [`Architecture/v1.7.0-rust-refactor-plan.md`](Architecture/v1.7.0-rust-refactor-plan.md)。
 
-当前 Rust 后端支持：一个 `(time, lat, lon)` 三维 `float32` 数据变量、Zarr v3、
-不改变 codec 的重分块。输出通过 staging、结构校验、抽样逐值校验和原子发布完成。
-多变量、其他 dtype、重压缩、NetCDF/HDF/TIFF 转换、重采样和 pipeline 融合仍使用
-Python 路径或回退 Python。
+Rust 后端当前支持一个 `(time, lat, lon)` 三维 `float32` 数据变量、Zarr v3、目标
+chunks 变更以及明确的 Zstd/Blosc/Gzip codec；输出通过 staging、结构/codec 校验、
+抽样逐值校验和原子发布完成。`--compression auto`、多变量、其他 dtype、
+NetCDF/HDF/TIFF 转换、重采样和完整 pipeline 融合仍使用 Python 路径或回退 Python。
 
 v1.6.7 在每次任务前记录当前进程真正可用的 CPU、内存、WSL/cgroup 限制以及源、临时和输出文件系统证据；WSL 虚拟块设备不再因不可信的 `rotational=1` 被直接判为机械硬盘。兼容性最终化默认分别用真实源 chunk 和最终 region 小样本实测阶段 1/2 worker。自动压缩在真实输出文件系统上比较受控的无损 Zstd/LZ4 候选，综合 durable 写入、冷热读取和体积从 Pareto 前沿选择。GUI 的主要路径选择器支持持久收藏、最近目录和失效路径保留。
 

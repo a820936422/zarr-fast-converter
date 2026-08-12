@@ -28,28 +28,22 @@ pixi run rechunk -- \
   --output /data/output.zarr \
   --strategy custom \
   --chunks '[1,256,256]' \
-  --compression none \
+  --compression-codec zstd \
+  --compression-level 1 \
   --backend rust \
   --workers 4
 ```
 
-当前 Rust P3 适用范围：
+当前 Rust 适用范围：一个三维 `float32` 数据变量、维度严格为
+`(time, lat, lon)`、Zarr v3 目录型 store；可以改变目标 chunks，并在显式 codec
+配置下执行无损 Zstd、Blosc 或 Gzip 重压缩。`--compression auto` 仍由 Python
+调优器执行，能力不足时 `--backend auto` 回退 Python，`--backend rust` 明确失败。
 
-- 一个三维 `float32` 数据变量；
-- 维度严格为 `(time, lat, lon)`；
-- 只改变目标 chunks，不改变 codec；
-- Zarr v3 目录型 store。
-
-Rust 执行按互不重叠的目标 chunk 建立有界线程池。有效并发度同时受
-`--workers`、检测到的资源 worker ceiling、目标 chunk 数和内存预算限制；codec
-内部并发度单独收敛，metrics 会记录实际值和单 worker 内存估计。
-
-`--backend auto` 在 Rust 能力或输入范围不满足时回退 Python；`--backend rust`
-则在能力不足时明确失败。当前 CLI 默认仍为 Python，避免改变既有任务行为。
-
-Rust 输出先写入目标同文件系统的 staging 目录，随后由 Python 完成元数据、codec、
-抽样数值校验和原子发布。取消、异常或校验失败不会发布最终输出。Rust 后端目前
-不支持多变量、非 `float32`、codec 变更、Zarr v2、重采样或完整 pipeline 执行。
+Rust 执行按互不重叠的目标 chunk 建立有界线程池，worker ceiling、目标 chunk 数、
+内存预算和 codec 内部并发共同限制实际并发。输出先写入 staging，随后由 Python
+完成元数据、codec、抽样数值校验和原子发布；取消、异常或校验失败不会发布最终输出。
+Rust 后端目前不支持多变量、非 `float32`、Zarr v2、NetCDF/HDF/TIFF 转换、重采样
+或完整 pipeline 执行。
 
 ## 分块策略
 

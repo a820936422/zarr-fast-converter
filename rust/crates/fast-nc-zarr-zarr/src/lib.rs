@@ -1,12 +1,12 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
 use fast_nc_zarr_model::{RechunkExecutionPlan, RechunkMetrics};
 use ndarray::ArrayD;
 use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 use zarrs::array::{
     data_type, Array, ArrayBuilder, ArrayMetadataOptions, ArraySubset, CodecOptions,
@@ -94,6 +94,38 @@ fn array_relative_path(array_path: &str) -> Result<PathBuf> {
         }
     }
     Ok(relative.to_path_buf())
+}
+
+fn cancellation_requested(plan: &RechunkExecutionPlan) -> bool {
+    plan.cancellation_file
+        .as_deref()
+        .is_some_and(|path| Path::new(path).is_file())
+}
+
+fn report_progress(
+    plan: &RechunkExecutionPlan,
+    completed: u64,
+    total: u64,
+    lock: &std::sync::Mutex<()>,
+) -> Result<()> {
+    let Some(path) = plan.progress_file.as_deref() else {
+        return Ok(());
+    };
+    let _guard = lock
+        .lock()
+        .map_err(|_| ZarrError::message("progress lock poisoned"))?;
+    let payload = serde_json::json!({
+        "completed": completed,
+        "total": total,
+        "fraction": if total == 0 { 1.0 } else { completed as f64 / total as f64 },
+    });
+    let temporary = format!("{path}.tmp");
+    let mut file = fs::File::create(&temporary).map_err(ZarrError::from_display)?;
+    file.write_all(payload.to_string().as_bytes())
+        .map_err(ZarrError::from_display)?;
+    file.sync_all().map_err(ZarrError::from_display)?;
+    fs::rename(&temporary, path).map_err(ZarrError::from_display)?;
+    Ok(())
 }
 
 fn copy_store_tree(
@@ -422,6 +454,18 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
             "target_chunks must contain positive values",
         ));
     }
+    if !matches!(
+        plan.codec.as_str(),
+        "" | "none" | "zstd" | "blosc-zstd" | "blosc-lz4" | "blosc-lz4hc" | "blosc-zlib" | "gzip"
+    ) {
+        return Err(ZarrError::message(format!(
+            "unsupported Rust codec: {}",
+            plan.codec
+        )));
+    }
+    if cancellation_requested(plan) {
+        return Err(ZarrError::message("任务已取消"));
+    }
 
     let source_root = Path::new(&plan.source);
     let source_array = open_array(source_root, &plan.array_path)?;
@@ -450,8 +494,6 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
             .ok_or_else(|| ZarrError::message("source chunk element count overflows u64"))
     })?;
     let target_chunk_elements = checked_product(&plan.target_chunks)? as u64;
-    // Two decoded buffers and two codec-side buffers are the conservative
-    // per-task bound used to cap outer target-chunk parallelism.
     let peak_bytes_per_worker = source_chunk_elements
         .checked_add(target_chunk_elements)
         .and_then(|elements| elements.checked_mul(8))
@@ -476,6 +518,58 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
 
     let mut array_builder = ArrayBuilder::from_array(&source_array);
     array_builder.chunk_grid_metadata(plan.target_chunks.clone());
+    if !matches!(plan.codec.as_str(), "" | "none") {
+        let level = plan.codec_level.unwrap_or(1);
+        let codecs: Vec<std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>> = match plan
+            .codec
+            .as_str()
+        {
+            "zstd" | "blosc-zstd" | "blosc-lz4" | "blosc-lz4hc" | "blosc-zlib" => {
+                let codec = match plan.codec.as_str() {
+                    "zstd" => {
+                        std::sync::Arc::new(zarrs::array::codec::ZstdCodec::new(level, false))
+                            as std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>
+                    }
+                    "blosc-zstd" | "blosc-lz4" | "blosc-lz4hc" | "blosc-zlib" => {
+                        let compressor = match plan.codec.as_str() {
+                            "blosc-lz4" => zarrs::array::codec::BloscCompressor::LZ4,
+                            "blosc-lz4hc" => zarrs::array::codec::BloscCompressor::LZ4HC,
+                            "blosc-zlib" => zarrs::array::codec::BloscCompressor::Zlib,
+                            _ => zarrs::array::codec::BloscCompressor::Zstd,
+                        };
+                        let shuffle = match plan.codec_shuffle.as_str() {
+                            "bitshuffle" => zarrs::array::codec::BloscShuffleMode::BitShuffle,
+                            "shuffle" | "auto" => zarrs::array::codec::BloscShuffleMode::Shuffle,
+                            _ => zarrs::array::codec::BloscShuffleMode::NoShuffle,
+                        };
+                        std::sync::Arc::new(
+                            zarrs::array::codec::BloscCodec::new(
+                                compressor,
+                                u8::try_from(level)
+                                    .map_err(|_| ZarrError::message("Blosc level must be 0-9"))?
+                                    .try_into()
+                                    .map_err(|_| ZarrError::message("Blosc level must be 0-9"))?,
+                                None,
+                                shuffle,
+                                Some(4),
+                            )
+                            .map_err(ZarrError::from_display)?,
+                        )
+                            as std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>
+                    }
+                    _ => unreachable!(),
+                };
+                vec![codec]
+            }
+            "gzip" => vec![std::sync::Arc::new(
+                zarrs::array::codec::GzipCodec::new(level.max(0) as u32)
+                    .map_err(ZarrError::from_display)?,
+            )
+                as std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>],
+            _ => unreachable!(),
+        };
+        array_builder.bytes_to_bytes_codecs(codecs);
+    }
     let target_path = normalise_array_path(&plan.array_path);
     let target_array = array_builder
         .build(target_store, &target_path)
@@ -490,6 +584,7 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
             .checked_mul(*value)
             .ok_or_else(|| ZarrError::message("target chunk count overflows u64"))
     })?;
+    let progress_lock = std::sync::Mutex::new(());
     let resolved_workers = worker_ceiling
         .min(memory_limited_workers)
         .min(target_grid_count)
@@ -513,11 +608,14 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
         .num_threads(resolved_workers)
         .build()
         .map_err(ZarrError::from_display)?;
-
+    let completed = std::sync::atomic::AtomicU64::new(0);
     pool.install(|| {
         target_indices
             .into_par_iter()
             .try_for_each(|chunk_indices| -> Result<()> {
+                if cancellation_requested(plan) {
+                    return Err(ZarrError::message("任务已取消"));
+                }
                 let subset = target_array
                     .chunk_subset_bounded(&chunk_indices)
                     .map_err(ZarrError::from_display)?;
@@ -526,16 +624,24 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
                     .map_err(ZarrError::from_display)?;
                 target_array
                     .store_array_subset_opt(&subset, values, &codec_options)
-                    .map_err(ZarrError::from_display)
+                    .map_err(ZarrError::from_display)?;
+                let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                report_progress(plan, done, target_grid_count, &progress_lock)
             })
     })?;
-
+    if cancellation_requested(plan) {
+        return Err(ZarrError::message("任务已取消"));
+    }
     let logical_elements = checked_product(&source_shape)? as u64;
     let logical_bytes = logical_elements
         .checked_mul(4)
         .ok_or_else(|| ZarrError::message("logical byte count overflows u64"))?;
     Ok(RechunkMetrics {
-        execution_path: "rust-streaming-target-chunk".to_owned(),
+        execution_path: if matches!(plan.codec.as_str(), "" | "none") {
+            "rust-streaming-target-chunk".to_owned()
+        } else {
+            "rust-codec-target-chunk".to_owned()
+        },
         output: plan.target.clone(),
         source_shape,
         source_chunks: source_chunk_shape,
@@ -546,11 +652,8 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
             .map_err(|_| ZarrError::message("resolved worker count exceeds u32"))?,
         worker_reason: format!(
             "P3 bounded target-chunk pool; requested_workers={}, ceiling={}, memory_limited_workers={}, peak_bytes_per_worker={}, codec_concurrent_target={}",
-            plan.requested_workers.max(1),
-            plan.worker_ceiling,
-            memory_limited_workers,
-            peak_bytes_per_worker,
-            codec_concurrent_target,
+            plan.requested_workers.max(1), plan.worker_ceiling, memory_limited_workers,
+            peak_bytes_per_worker, codec_concurrent_target,
         ),
         peak_bytes_per_worker,
         memory_budget_bytes: plan.memory_budget_bytes,

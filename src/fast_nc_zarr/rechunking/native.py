@@ -22,7 +22,7 @@ BackendName = Literal["auto", "python", "rust"]
 
 @dataclass(frozen=True, slots=True)
 class RustRechunkPlan:
-    """Explicit single-array P3 execution plan for the Rust backend."""
+    """Explicit single-array execution plan for the Rust backend."""
 
     source: Path
     target: Path
@@ -33,6 +33,11 @@ class RustRechunkPlan:
     worker_ceiling: int = 1
     memory_budget_bytes: int = 0
     codec_concurrent_target: int = 1
+    codec: str = "none"
+    codec_level: int | None = None
+    codec_shuffle: str = "auto"
+    cancellation_file: Path | None = None
+    progress_file: Path | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -46,6 +51,19 @@ class RustRechunkPlan:
                 "worker_ceiling": max(1, int(self.worker_ceiling)),
                 "memory_budget_bytes": max(0, int(self.memory_budget_bytes)),
                 "codec_concurrent_target": max(1, int(self.codec_concurrent_target)),
+                "codec": str(self.codec),
+                "codec_level": None if self.codec_level is None else int(self.codec_level),
+                "codec_shuffle": str(self.codec_shuffle),
+                "cancellation_file": (
+                    None
+                    if self.cancellation_file is None
+                    else str(self.cancellation_file.expanduser().resolve())
+                ),
+                "progress_file": (
+                    None
+                    if self.progress_file is None
+                    else str(self.progress_file.expanduser().resolve())
+                ),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -63,12 +81,44 @@ def _metadata_signature(value: Any) -> str:
         return repr(value)
 
 
+def _codec_matches_request(
+    compressors: tuple[Any, ...],
+    codec: str,
+    level: int | None,
+    shuffle: str,
+) -> bool:
+    text = " ".join(repr(item) for item in compressors).lower()
+    if codec == "zstd":
+        matched = "zstdcodec" in text and "blosc" not in text
+        if level is not None:
+            matched = matched and f"level={int(level)}" in text
+        return matched
+    if codec == "gzip":
+        matched = "gzipcodec" in text
+        if level is not None:
+            matched = matched and f"level={int(level)}" in text
+        return matched
+    if codec.startswith("blosc-"):
+        cname = codec.removeprefix("blosc-")
+        matched = "blosccodec" in text and f"cname='{cname}'" in text
+        if level is not None:
+            matched = matched and f"clevel={int(level)}" in text
+        if shuffle not in {"", "auto"}:
+            matched = matched and f"shuffle='{shuffle}'" in text
+        return matched
+    return False
+
+
 def _validate_staged_output(
     source_info,
     staged: Path,
     target_chunks: tuple[int, ...],
     *,
     validate: bool,
+    array_path: str,
+    requested_codec: str,
+    requested_codec_level: int | None,
+    requested_codec_shuffle: str,
 ) -> None:
     from .inspection import inspect_store
 
@@ -79,11 +129,11 @@ def _validate_staged_output(
         )
     if _metadata_signature(source_info.attrs) != _metadata_signature(output_info.attrs):
         raise ValueError("Rust输出根属性发生变化")
-
     source_vars = {item.name: item for item in source_info.variables}
     output_vars = {item.name: item for item in output_info.variables}
     if source_vars.keys() != output_vars.keys():
         raise ValueError("Rust输出变量集合与输入不一致")
+    target_name = array_path.strip("/").split("/")[-1]
     for name, source_variable in source_vars.items():
         output_variable = output_vars[name]
         if (
@@ -94,7 +144,9 @@ def _validate_staged_output(
             raise ValueError(f"Rust输出变量 {name} 的结构发生变化")
         if source_variable.ndim:
             expected_chunks = (
-                target_chunks if not source_variable.is_coord else source_variable.chunks
+                target_chunks
+                if not source_variable.is_coord and name == target_name
+                else source_variable.chunks
             )
             if output_variable.chunks != expected_chunks:
                 raise ValueError(
@@ -105,7 +157,17 @@ def _validate_staged_output(
             output_variable.attrs
         ):
             raise ValueError(f"Rust输出变量 {name} 的属性发生变化")
-        if tuple(map(repr, source_variable.compressors)) != tuple(
+        if name == target_name and requested_codec not in {"", "none"}:
+            if not _codec_matches_request(
+                output_variable.compressors,
+                requested_codec,
+                requested_codec_level,
+                requested_codec_shuffle,
+            ):
+                raise ValueError(
+                    f"Rust输出变量 {name} 未使用请求的 codec {requested_codec}"
+                )
+        elif tuple(map(repr, source_variable.compressors)) != tuple(
             map(repr, output_variable.compressors)
         ):
             raise ValueError(f"Rust输出变量 {name} 的 codec 发生变化")
@@ -119,7 +181,7 @@ def run_rust_rechunk(
     validate: bool = True,
     cancel_event=None,
 ) -> dict[str, object]:
-    """Execute an explicit P3 plan through staging and atomic publication."""
+    """Execute a Rust plan with cooperative cancellation and atomic publication."""
 
     source = plan.source.expanduser().resolve()
     target = plan.target.expanduser().resolve(strict=False)
@@ -129,25 +191,42 @@ def run_rust_rechunk(
         raise ValueError("输入和输出 Zarr 不能相互嵌套")
     if not source.is_dir():
         raise ValueError(f"输入 Zarr 目录不存在: {source}")
-
-    resolved = resolve_backend(requested_backend, "zarr.rechunk_f32")
+    operation = (
+        "zarr.rechunk_f32_codec"
+        if plan.codec not in {"", "none"}
+        else "zarr.rechunk_f32"
+    )
+    resolved = resolve_backend(requested_backend, operation)
+    if plan.cancellation_file is not None or cancel_event is not None:
+        resolve_backend(requested_backend, "zarr.rechunk_f32_cancel")
     if resolved != "rust":
         raise BackendUnavailableError(
             "Rust rechunk operation is unavailable; the Python caller must use its normal backend."
         )
     if cancel_event is not None and cancel_event.is_set():
         from .engine import RechunkExecutionError
-
         raise RechunkExecutionError("任务已取消")
-
     target = validate_publish_target(
-        target,
-        overwrite=overwrite,
-        operation="Rust重分块",
-        require_zarr_v3=True,
+        target, overwrite=overwrite, operation="Rust重分块", require_zarr_v3=True
     )
     preflight_writable(target.parent, "Rust重分块输出")
     staging = make_staging_path(target, "rechunk-rust")
+    cancellation_file = (
+        plan.cancellation_file
+        if plan.cancellation_file is not None
+        else make_staging_path(target, "rechunk-rust-cancel")
+        if cancel_event is not None
+        else None
+    )
+    progress_file = (
+        plan.progress_file
+        if plan.progress_file is not None
+        else make_staging_path(target, "rechunk-rust-progress")
+        if cancel_event is not None
+        else None
+    )
+    remove_cancellation_file = plan.cancellation_file is None
+    remove_progress_file = plan.progress_file is None
     started = time.perf_counter()
     execution_plan = RustRechunkPlan(
         source=source,
@@ -159,18 +238,38 @@ def run_rust_rechunk(
         worker_ceiling=plan.worker_ceiling,
         memory_budget_bytes=plan.memory_budget_bytes,
         codec_concurrent_target=plan.codec_concurrent_target,
+        codec=plan.codec,
+        codec_level=plan.codec_level,
+        codec_shuffle=plan.codec_shuffle,
+        cancellation_file=cancellation_file,
+        progress_file=progress_file,
     )
+    import threading
+    watch_stop = threading.Event()
+    cancel_watcher = None
+    if cancel_event is not None and cancellation_file is not None:
+        def _watch_cancel() -> None:
+            while not watch_stop.wait(0.05):
+                if cancel_event.is_set():
+                    cancellation_file.touch(exist_ok=True)
+                    return
+        cancel_watcher = threading.Thread(target=_watch_cancel, daemon=True)
+        cancel_watcher.start()
+
+    def _cleanup() -> None:
+        watch_stop.set()
+        if cancel_watcher is not None:
+            cancel_watcher.join(timeout=1.0)
+        if remove_cancellation_file and cancellation_file is not None:
+            cancellation_file.unlink(missing_ok=True)
+        if remove_progress_file and progress_file is not None:
+            progress_file.unlink(missing_ok=True)
 
     try:
-        if cancel_event is not None and cancel_event.is_set():
-            from .engine import RechunkExecutionError
-
-            raise RechunkExecutionError("任务已取消")
         native = importlib.import_module("fast_nc_zarr._native")
         metrics = json.loads(native.rechunk_f32_json(execution_plan.to_json()))
         if cancel_event is not None and cancel_event.is_set():
             from .engine import RechunkExecutionError
-
             raise RechunkExecutionError("任务已取消")
         if source_info is not None:
             _validate_staged_output(
@@ -178,18 +277,25 @@ def run_rust_rechunk(
                 staging,
                 tuple(int(value) for value in plan.target_chunks),
                 validate=validate,
+                array_path=plan.array_path,
+                requested_codec=plan.codec,
+                requested_codec_level=plan.codec_level,
+                requested_codec_shuffle=plan.codec_shuffle,
             )
+        if cancel_event is not None and cancel_event.is_set():
+            from .engine import RechunkExecutionError
+            raise RechunkExecutionError("任务已取消")
         publish_staging(
-            staging,
-            target,
-            "rechunk-rust",
-            overwrite=overwrite,
-            require_zarr_v3=True,
+            staging, target, "rechunk-rust", overwrite=overwrite, require_zarr_v3=True
         )
         elapsed = time.perf_counter() - started
         logical_bytes = int(metrics.get("logical_bytes", 0))
         metrics.update(
             {
+                "backend": "rust",
+                "backend_fallback": False,
+                "backend_fallback_reason": None,
+                "protocol_version": 1,
                 "elapsed": elapsed,
                 "logical_bytes": logical_bytes,
                 "physical_bytes": _directory_size(target),
@@ -201,11 +307,18 @@ def run_rust_rechunk(
                 "memory_budget_bytes": plan.memory_budget_bytes,
                 "worker_tuning": {},
                 "tuning_objective": "balanced",
-                "selected_compression": {"profile": "none", "codec": "none"},
+                "selected_compression": {
+                    "profile": "rust" if plan.codec not in {"", "none"} else "none",
+                    "codec": plan.codec,
+                    "level": plan.codec_level,
+                    "shuffle": plan.codec_shuffle,
+                },
             }
         )
+        _cleanup()
         return metrics
     except Exception:
+        _cleanup()
         shutil.rmtree(staging, ignore_errors=True)
         raise
 
@@ -216,26 +329,24 @@ def run_rust_rechunk_for_config(
     info,
     plan=None,
     *,
+    compression=None,
     cancel_event=None,
 ) -> dict[str, object]:
-    """Resolve a supported float32 variable and execute one P3 plan."""
+    """Resolve a supported float32 variable and execute one Rust plan."""
 
     reference = next(
-        (variable for variable in info.data_variables if variable.ndim == 3),
-        None,
+        (variable for variable in info.data_variables if variable.ndim == 3), None
     )
     if reference is None:
-        raise ValueError("Rust P3 rechunk requires a three-dimensional data variable")
+        raise BackendUnavailableError("Rust P3 重分块要求三维数据变量")
     if str(reference.dtype) != "float32":
-        raise ValueError(
+        raise BackendUnavailableError(
             f"Rust P3 rechunk currently supports float32 only, got {reference.dtype}"
         )
     if len(info.data_variables) != 1:
-        raise ValueError("Rust P3 rechunk requires exactly one data variable")
+        raise BackendUnavailableError("Rust P3 重分块当前只支持一个数据变量")
     if tuple(reference.dims) != ("time", "lat", "lon"):
-        raise ValueError("Rust P3 rechunk requires data dimensions (time, lat, lon)")
-    if getattr(config, "compression", "none") != "none":
-        raise ValueError("Rust P3 rechunk does not yet support codec changes")
+        raise BackendUnavailableError("Rust P3 重分块要求数据维度为 (time, lat, lon)")
 
     if plan is None:
         target_chunks = tuple(int(value) for value in reference.chunks)
@@ -248,6 +359,22 @@ def run_rust_rechunk_for_config(
                 )
     else:
         target_chunks = tuple(int(value) for value in plan.chunks_for(reference))
+
+    if compression is None:
+        from .compression import make_compression_plan
+
+        compression = make_compression_plan(
+            getattr(config, "compression", "none"),
+            codec=getattr(config, "compression_codec", None),
+            level=getattr(config, "compression_level", None),
+            shuffle=getattr(config, "compression_shuffle", "auto"),
+        )
+    if getattr(compression, "profile", None) == "auto":
+        raise BackendUnavailableError("Rust 后端不执行自动压缩候选调优")
+    compression_enabled = bool(getattr(compression, "enabled", False))
+    codec = str(getattr(compression, "codec", "none")) if compression_enabled else "none"
+    codec_level = getattr(compression, "level", None) if compression_enabled else None
+    codec_shuffle = str(getattr(compression, "shuffle", "auto")) if compression_enabled else "auto"
 
     budget = getattr(config, "resource_budget", None)
     if budget is None:
@@ -275,6 +402,9 @@ def run_rust_rechunk_for_config(
             worker_ceiling=int(budget.worker_ceiling),
             memory_budget_bytes=int(budget.memory_budget_bytes),
             codec_concurrent_target=codec_workers,
+            codec=codec,
+            codec_level=codec_level,
+            codec_shuffle=codec_shuffle,
         ),
         requested_backend="rust",
         source_info=info,

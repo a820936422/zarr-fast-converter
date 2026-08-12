@@ -21,8 +21,9 @@ _RUST_ZARR_READY = _CAPABILITY.supported and {
     "zarr.read_region_f32",
     "zarr.write_f32",
     "zarr.rechunk_f32",
+    "zarr.rechunk_f32_codec",
+    "zarr.rechunk_f32_cancel",
 }.issubset(_CAPABILITY.operations)
-
 class NativePreparationTests(unittest.TestCase):
     def test_capability_probe_is_json_safe(self) -> None:
         capability = rust_capability()
@@ -132,6 +133,58 @@ class RustZarrCrossBackendTests(unittest.TestCase):
         self.assertGreater(metrics["peak_bytes_per_worker"], 0)
         with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as result:
             np.testing.assert_array_equal(result["value"].values, values)
+    def test_rust_codec_only_rechunk_is_lossless(self) -> None:
+        source = f"{self.tempdir.name}/codec-source.zarr"
+        target = f"{self.tempdir.name}/codec-target.zarr"
+        values = np.arange(4 * 3 * 2, dtype="float32").reshape(4, 3, 2)
+        xr.Dataset(
+            {"value": (("time", "lat", "lon"), values)},
+            coords={"time": np.arange(4), "lat": np.arange(3), "lon": np.arange(2)},
+        ).to_zarr(
+            source,
+            mode="w",
+            consolidated=False,
+            zarr_format=3,
+            encoding={"value": {"chunks": (2, 2, 1)}},
+        )
+        metrics = run_rust_rechunk(
+            RustRechunkPlan(
+                source=Path(source),
+                target=Path(target),
+                array_path="/value",
+                target_chunks=(2, 2, 1),
+                codec="zstd",
+                codec_level=1,
+            )
+        )
+        self.assertEqual(metrics["execution_path"], "rust-codec-target-chunk")
+        self.assertEqual(repr(zarr.open_array(target, path="value", mode="r").compressors[0]).split("(", 1)[0], "ZstdCodec")
+        with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as result:
+            np.testing.assert_array_equal(result["value"].values, values)
+
+    def test_rust_progress_file_reaches_completion(self) -> None:
+        source = f"{self.tempdir.name}/progress-source.zarr"
+        target = f"{self.tempdir.name}/progress-target.zarr"
+        progress = Path(self.tempdir.name) / "progress.json"
+        values = np.ones((2, 2, 2), dtype="float32")
+        xr.Dataset({"value": (("time", "lat", "lon"), values)}).to_zarr(
+            source, mode="w", consolidated=False, zarr_format=3
+        )
+        metrics = run_rust_rechunk(
+            RustRechunkPlan(
+                source=Path(source),
+                target=Path(target),
+                array_path="/value",
+                target_chunks=(1, 2, 2),
+                progress_file=progress,
+            )
+        )
+        self.assertEqual(json.loads(progress.read_text())["total"], 2)
+        with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as result:
+            np.testing.assert_array_equal(result["value"].values, values)
+            self.assertEqual(result["value"].encoding["chunks"], (1, 2, 2))
+        progress.unlink()
+        np.testing.assert_array_equal(values, np.ones((2, 2, 2), dtype="float32"))
 
     def test_rust_rechunk_pre_cancelled_does_not_publish(self) -> None:
         import threading

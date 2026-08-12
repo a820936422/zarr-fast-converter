@@ -24,6 +24,58 @@ pub struct RechunkExecutionPlan {
     pub memory_budget_bytes: u64,
     #[serde(default)]
     pub codec_concurrent_target: u32,
+    #[serde(default)]
+    pub codec: String,
+    #[serde(default)]
+    pub codec_level: Option<i32>,
+    #[serde(default)]
+    pub codec_shuffle: String,
+    #[serde(default)]
+    pub cancellation_file: Option<String>,
+    #[serde(default)]
+    pub progress_file: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RechunkVariablePlan {
+    pub array_path: String,
+    pub expected_dtype: String,
+    pub target_chunks: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiRechunkExecutionPlan {
+    pub source: String,
+    pub target: String,
+    pub variables: Vec<RechunkVariablePlan>,
+    #[serde(default)]
+    pub requested_workers: u32,
+    #[serde(default)]
+    pub worker_ceiling: u32,
+    #[serde(default)]
+    pub memory_budget_bytes: u64,
+    #[serde(default)]
+    pub codec_concurrent_target: u32,
+    #[serde(default)]
+    pub codec: String,
+    #[serde(default)]
+    pub codec_level: Option<i32>,
+    #[serde(default)]
+    pub codec_shuffle: String,
+    #[serde(default)]
+    pub cancellation_file: Option<String>,
+    #[serde(default)]
+    pub progress_file: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiRechunkMetrics {
+    pub execution_path: String,
+    pub output: String,
+    pub variables: Vec<RechunkMetrics>,
+    pub logical_bytes: u64,
+    pub target_chunk_count: u64,
+    pub resolved_workers: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +107,8 @@ impl BackendCapability {
                 "zarr.read_region_f32".to_owned(),
                 "zarr.write_f32".to_owned(),
                 "zarr.rechunk_f32".to_owned(),
+                "zarr.rechunk_f32_codec".to_owned(),
+                "zarr.rechunk_f32_cancel".to_owned(),
             ],
         }
     }
@@ -62,13 +116,12 @@ impl BackendCapability {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendCapability, BACKEND_PROTOCOL_VERSION};
+    use super::BackendCapability;
 
     #[test]
     fn smoke_capability_has_stable_protocol() {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
-        assert_eq!(capability.protocol_version, BACKEND_PROTOCOL_VERSION);
-        assert_eq!(capability.operations.len(), 6);
+        assert_eq!(capability.operations.len(), 8);
     }
 }

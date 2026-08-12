@@ -49,9 +49,14 @@ pixi run pipeline -- \
   --rechunk --strategy time \
   --recompress --compression-codec blosc-zstd \
   --compression-level 4 \
+  --backend auto \
   --temporary-dir /fast-ssd/pipeline-temp \
   --inspection-cache /data/cache/inspection.json
 ```
+
+`--backend python` 强制现有 Python 路径；`--backend auto` 仅在最终化阶段满足
+Rust 能力矩阵时尝试 Rust，否则回退 Python；`--backend rust` 在请求的阶段不支持
+时明确失败。Rust 当前不替换源转换、xESMF 重采样或 `--compression auto` 调优。
 
 处理现有 Zarr：
 
@@ -60,7 +65,7 @@ pixi run pipeline -- \
   --input /data/input.zarr --input-kind zarr \
   --output /data/output.zarr \
   --resample --resolution 0.25 \
-  --rechunk --recompress
+  --rechunk --recompress --backend auto
 ```
 
 只生成计划：

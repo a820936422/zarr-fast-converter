@@ -52,9 +52,11 @@ fn write_f32_array(
 }
 
 #[pyfunction]
-fn rechunk_f32_json(plan_json: &str) -> PyResult<String> {
+fn rechunk_f32_json(py: Python<'_>, plan_json: &str) -> PyResult<String> {
     let plan: RechunkExecutionPlan = serde_json::from_str(plan_json).map_err(runtime_error)?;
-    let metrics = rechunk_f32_array(&plan).map_err(runtime_error)?;
+    let metrics = py
+        .detach(|| rechunk_f32_array(&plan))
+        .map_err(runtime_error)?;
     serde_json::to_string(&metrics).map_err(runtime_error)
 }
 

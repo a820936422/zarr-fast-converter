@@ -1910,6 +1910,11 @@ class PipelinePage(QWidget):
         general_form.addRow("源介质", self.source_storage)
         general_form.addRow("临时介质", self.temporary_storage)
         general_form.addRow("输出介质", self.output_storage)
+        self.backend = QComboBox()
+        self.backend.addItem("Python（稳定）", "python")
+        self.backend.addItem("自动（能力满足时使用 Rust）", "auto")
+        self.backend.addItem("Rust（能力不足时失败）", "rust")
+        general_form.addRow("执行后端", self.backend)
         self.cleanup_intermediate = QCheckBox("下游验证通过后立即删除上游中间 Zarr")
         general_form.addRow("清理策略", self.cleanup_intermediate)
         settings_layout.addWidget(self.general_group)
@@ -2232,14 +2237,12 @@ class PipelinePage(QWidget):
             date = QDate.fromString(str(value or ""), Qt.DateFormat.ISODate)
             if date.isValid():
                 widget.setDate(date)
-        self.lat_min.setValue(general.lat_min)
-        self.lat_max.setValue(general.lat_max)
-        self.lon_min.setValue(general.lon_min)
-        self.lon_max.setValue(general.lon_max)
-        self.cleanup_intermediate.setChecked(general.cleanup_intermediate)
         self._set_combo_data(self.source_storage, general.source_storage)
         self._set_combo_data(self.temporary_storage, general.temporary_storage)
         self._set_combo_data(self.output_storage, general.output_storage)
+        self._set_combo_data(self.backend, config.backend)
+        self.lon_max.setValue(general.lon_max)
+        self.cleanup_intermediate.setChecked(general.cleanup_intermediate)
         operations = config.operations
         self.resample_checkbox.setChecked(operations.resample)
         self.rechunk_checkbox.setChecked(operations.rechunk)
@@ -2556,6 +2559,11 @@ class PipelinePage(QWidget):
                 ),
                 objective=self.compression_objective.currentData(),
                 tune_budget=self.compression_tune_budget.value(),
+            ),
+            backend=(
+                recovery_config.backend
+                if recovery_config is not None
+                else self.backend.currentData()
             ),
             validate=(recovery_config.validate if recovery_config is not None else True),
         )

@@ -789,12 +789,41 @@ def run_rechunk(
                 config,
                 preview.info,
                 preview.plan,
+                compression=preview.compression,
                 cancel_event=cancel_event,
             )
-        except (BackendUnavailableError, ValueError, RuntimeError) as exc:
+        except (BackendUnavailableError, ImportError, ModuleNotFoundError) as exc:
             if config.backend == "rust":
                 raise RechunkExecutionError(f"Rust 重分块失败: {exc}") from exc
-    return core_run_rechunk(
+            fallback_metrics = core_run_rechunk(
+                config.input,
+                config.output,
+                preview.info,
+                preview.plan,
+                preview.compression,
+                workers=config.workers,
+                overwrite=config.overwrite,
+                progress=True,
+                validate=config.validate,
+                cancel_event=cancel_event,
+                temporary_dir=config.temporary_dir,
+                compression_objective=config.compression_objective,
+                compression_tune_budget_seconds=config.compression_tune_budget,
+                tuning_objective=config.tuning_objective,
+                resource_budget=config.resource_budget,
+                storage_overrides=config.storage_overrides,
+            )
+            fallback_metrics = dict(fallback_metrics)
+            fallback_metrics.update(
+                {
+                    "backend": "python",
+                    "backend_fallback": True,
+                    "backend_fallback_reason": str(exc),
+                    "protocol_version": None,
+                }
+            )
+            return fallback_metrics
+    metrics = core_run_rechunk(
         config.input,
         config.output,
         preview.info,
@@ -812,6 +841,12 @@ def run_rechunk(
         resource_budget=config.resource_budget,
         storage_overrides=config.storage_overrides,
     )
+    metrics = dict(metrics)
+    metrics.setdefault("backend", "python")
+    metrics.setdefault("backend_fallback", False)
+    metrics.setdefault("backend_fallback_reason", None)
+    metrics.setdefault("protocol_version", None)
+    return metrics
 
 
 def preview_resample(

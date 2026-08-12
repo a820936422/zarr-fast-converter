@@ -117,7 +117,23 @@ def _apply_runtime_compression(
                 "cname": None,
                 "shuffle": "noshuffle",
             }
-
+def _apply_backend_metrics(manifest: dict, metrics: dict | None, requested: str) -> None:
+    if isinstance(metrics, dict) and "backend" in metrics:
+        manifest["backend"] = {
+            "requested": requested,
+            "resolved": str(metrics.get("backend", "python")),
+            "fallback": bool(metrics.get("backend_fallback", False)),
+            "fallback_reason": metrics.get("backend_fallback_reason"),
+            "protocol_version": metrics.get("protocol_version"),
+        }
+    elif manifest.get("backend", {}).get("resolved") == "pending":
+        manifest["backend"] = {
+            "requested": requested,
+            "resolved": "python",
+            "fallback": requested in {"auto", "rust"},
+            "fallback_reason": "该物理流程未调用Rust最终化阶段" if requested != "python" else None,
+            "protocol_version": None,
+        }
 
 
 def _pipeline_resource_snapshot(inspection, config: PipelineConfig, paths: PipelinePaths):
@@ -616,6 +632,7 @@ def _run_zarr_pipeline(
         physical_stages.append("resampling")
     if plan.finalization_required:
         physical_stages.append("finalization")
+    requested_backend = getattr(config, "backend", "python")
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "job_id": paths.root.name,
@@ -626,6 +643,13 @@ def _run_zarr_pipeline(
         "output": str(output),
         "temporary_root": str(paths.root),
         "events": str(paths.events),
+        "backend": {
+            "requested": requested_backend,
+            "resolved": "pending",
+            "fallback": None,
+            "fallback_reason": None,
+            "protocol_version": None,
+        },
         "resource_snapshot": resources.to_dict(),
         "resource_budget": resource_budget.to_dict(),
         "storage_profiles": {
@@ -780,13 +804,10 @@ def _run_zarr_pipeline(
                 _write_manifest(paths.manifest, manifest)
         if cancel_event is not None and cancel_event.is_set():
             raise PipelineExecutionError("任务已取消。")
+        if not plan.finalization_required:
+            _apply_backend_metrics(manifest, None, requested_backend)
         if plan.finalization_required:
             chunking = config.chunking
-            if progress:
-                print(
-                    f"统一流程阶段 {len(physical_stages)}/{len(physical_stages)}："
-                    "应用最终 chunks/codec"
-                )
             current_stage = "finalization"
             finalization_metrics = run_rechunk(
                 RechunkConfig(
@@ -803,6 +824,7 @@ def _run_zarr_pipeline(
                     workers=chunking.workers,
                     overwrite=config.general.overwrite,
                     validate=config.validate,
+                    backend=getattr(config, "backend", "python"),
                     rechunk=config.operations.rechunk,
                     recompress=config.operations.recompress,
                     temporary_dir=paths.root,
@@ -820,11 +842,18 @@ def _run_zarr_pipeline(
                 ),
                 cancel_event=cancel_event,
             )
+            manifest["backend"] = {
+                "requested": requested_backend,
+                "resolved": str(finalization_metrics.get("backend", "python")),
+                "fallback": bool(finalization_metrics.get("backend_fallback", False)),
+                "fallback_reason": finalization_metrics.get("backend_fallback_reason"),
+                "protocol_version": finalization_metrics.get("protocol_version"),
+            }
             manifest["stages"]["finalization"] = {
                 "status": "published_and_validated",
                 "metrics": finalization_metrics,
             }
-            _apply_runtime_compression(manifest, finalization_metrics)
+            _apply_backend_metrics(manifest, finalization_metrics, requested_backend)
             if plan.needs_resample and config.general.cleanup_intermediate:
                 shutil.rmtree(current)
                 manifest["stages"]["resampling"]["status"] = "validated_and_cleaned"
@@ -921,8 +950,11 @@ def run_pipeline(
     cancel_event=None,
     progress: bool = True,
 ) -> dict[str, object]:
-    """Execute the selected product operations and publish one final Zarr."""
     plan = build_pipeline_plan(inspection, config)
+    if config.backend == "rust" and not getattr(plan, "finalization_required", False):
+        raise PipelineExecutionError(
+            "当前Rust后端只支持兼容性最终化重分块；源转换和重采样仍使用Python后端。"
+        )
     if plan.needs_resample:
         validate_resampling_environment()
 
@@ -958,6 +990,7 @@ def run_pipeline(
         physical_stages.append("resampling")
     if plan.finalization_required:
         physical_stages.append("finalization")
+    requested_backend = getattr(config, "backend", "python")
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "job_id": paths.root.name,
@@ -968,6 +1001,13 @@ def run_pipeline(
         "output": str(Path(config.general.output).expanduser().resolve()),
         "temporary_root": str(paths.root),
         "events": str(paths.events),
+        "backend": {
+            "requested": requested_backend,
+            "resolved": "python",
+            "fallback": False,
+            "fallback_reason": None,
+            "protocol_version": None,
+        },
         "resource_snapshot": resources.to_dict(),
         "resource_budget": resource_budget.to_dict(),
         "storage_profiles": {
@@ -1218,6 +1258,7 @@ def run_pipeline(
                 "avoided_full_store_reads": 1,
                 "avoided_full_store_writes": 1,
             }
+            _apply_backend_metrics(manifest, rechunk_metrics, requested_backend)
             manifest["stages"]["finalization"] = {
                 "status": "not_required_direct_layout",
                 "metrics": rechunk_metrics,
@@ -1236,9 +1277,8 @@ def run_pipeline(
                     else "none"
                 ),
                 workers=chunking.workers,
-                overwrite=config.general.overwrite,
                 validate=config.validate,
-                rechunk=config.operations.rechunk,
+                backend=getattr(config, "backend", "python"),
                 recompress=config.operations.recompress,
                 temporary_dir=paths.root,
                 compression_codec=config.compression.codec,
@@ -1260,6 +1300,7 @@ def run_pipeline(
                 )
             current_stage = "finalization"
             rechunk_metrics = run_rechunk(rechunk_config, cancel_event=cancel_event)
+            _apply_backend_metrics(manifest, rechunk_metrics, requested_backend)
             manifest["stages"]["finalization"] = {
                 "status": "published_and_validated",
                 "metrics": rechunk_metrics,
