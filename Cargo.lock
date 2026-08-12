@@ -312,6 +312,7 @@ dependencies = [
 name = "fast-nc-zarr-zarr"
 version = "1.6.9"
 dependencies = [
+ "fast-nc-zarr-model",
  "ndarray",
  "serde",
  "serde_json",

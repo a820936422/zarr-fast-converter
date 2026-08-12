@@ -1,7 +1,7 @@
-use fast_nc_zarr_model::{BackendCapability, BACKEND_PROTOCOL_VERSION};
+use fast_nc_zarr_model::{BackendCapability, RechunkExecutionPlan, BACKEND_PROTOCOL_VERSION};
 use fast_nc_zarr_zarr::{
     inspect_array, read_chunk_f32 as read_zarr_chunk_f32, read_region_f32 as read_zarr_region_f32,
-    write_f32_array as write_zarr_f32_array,
+    rechunk_f32_array, write_f32_array as write_zarr_f32_array,
 };
 use pyo3::prelude::*;
 
@@ -51,6 +51,13 @@ fn write_f32_array(
     write_zarr_f32_array(path, array_path, &shape, &chunks, &values).map_err(runtime_error)
 }
 
+#[pyfunction]
+fn rechunk_f32_json(plan_json: &str) -> PyResult<String> {
+    let plan: RechunkExecutionPlan = serde_json::from_str(plan_json).map_err(runtime_error)?;
+    let metrics = rechunk_f32_array(&plan).map_err(runtime_error)?;
+    serde_json::to_string(&metrics).map_err(runtime_error)
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(capability_json, module)?)?;
@@ -58,6 +65,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(inspect_array_json, module)?)?;
     module.add_function(wrap_pyfunction!(read_chunk_f32, module)?)?;
     module.add_function(wrap_pyfunction!(read_region_f32, module)?)?;
+    module.add_function(wrap_pyfunction!(rechunk_f32_json, module)?)?;
     module.add_function(wrap_pyfunction!(write_f32_array, module)?)?;
     Ok(())
 }

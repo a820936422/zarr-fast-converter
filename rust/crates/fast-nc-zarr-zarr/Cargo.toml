@@ -7,6 +7,7 @@ description = "Zarr v3 inspection and chunk I/O for the native backend"
 
 [dependencies]
 zarrs_filesystem.workspace = true
+fast-nc-zarr-model.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

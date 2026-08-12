@@ -32,9 +32,13 @@ from fast_nc_zarr.application.services import (  # noqa: E402
     load_inspection_snapshot,
     preview_conversion,
     preview_rechunk,
-    save_inspection_snapshot,
     run_conversion,
+    run_rechunk,
+    save_inspection_snapshot,
 )
+from fast_nc_zarr._backend import rust_capability  # noqa: E402
+
+_RUST_ZARR_READY = rust_capability().supported and "zarr.rechunk_f32" in rust_capability().operations
 from fast_nc_zarr.models import VariableSpec, VariableTransform
 from fast_nc_zarr.gui import fonts  # noqa: E402
 from fast_nc_zarr.gui.fonts import configure_application_font  # noqa: E402
@@ -301,8 +305,36 @@ class GuiServiceTests(unittest.TestCase):
             RechunkConfig(ROOT / "input.zarr", ROOT / "output.zarr", workers=1),
             result.zarr_info,
         )
+
         self.assertEqual(result.zarr_info.zarr_format, 3)
         self.assertEqual(preview.plan.strategy, "time")
+
+    @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
+    def test_zarr_service_rust_backend_publishes_valid_output(self) -> None:
+        output = ROOT / "rust-service-output.zarr"
+        result = inspect_zarr(ROOT / "input.zarr")
+        metrics = run_rechunk(
+            RechunkConfig(
+                ROOT / "input.zarr",
+                output,
+                strategy="custom",
+                custom_chunks=(1, 3, 4),
+                workers=1,
+                backend="rust",
+                validate=True,
+            ),
+            result.zarr_info,
+        )
+        self.assertEqual(metrics["execution_path"], "rust-streaming-target-chunk")
+        self.assertEqual(Path(metrics["output"]), output)
+        self.assertEqual(metrics["target_chunks"], [1, 3, 4])
+        with xr.open_zarr(
+            output, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+        ) as dataset:
+            np.testing.assert_array_equal(
+                dataset["value"].values,
+                np.arange(24, dtype="float32").reshape(2, 3, 4),
+            )
 
     def test_main_window_has_mvp_pages(self) -> None:
         app = QApplication.instance() or QApplication([])

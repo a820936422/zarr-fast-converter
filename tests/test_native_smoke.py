@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import importlib
 import json
+from pathlib import Path
 import tempfile
 import unittest
 
 import numpy as np
 import xarray as xr
+import zarr
 
 from fast_nc_zarr._backend import resolve_backend, rust_capability
+from fast_nc_zarr.rechunking.native import RustRechunkPlan, run_rust_rechunk
 
 
 _CAPABILITY = rust_capability()
@@ -17,6 +20,7 @@ _RUST_ZARR_READY = _CAPABILITY.supported and {
     "zarr.read_chunk_f32",
     "zarr.read_region_f32",
     "zarr.write_f32",
+    "zarr.rechunk_f32",
 }.issubset(_CAPABILITY.operations)
 
 class NativePreparationTests(unittest.TestCase):
@@ -33,12 +37,16 @@ class NativePreparationTests(unittest.TestCase):
                 "supported": capability.supported,
             }
         )
-
     def test_auto_backend_falls_back_without_rust_operation(self) -> None:
-        self.assertEqual(resolve_backend("auto", "rechunk"), "python")
+        expected = "rust" if _RUST_ZARR_READY else "python"
+        self.assertEqual(resolve_backend("auto", "rechunk"), expected)
 
     def test_python_backend_is_always_selectable(self) -> None:
         self.assertEqual(resolve_backend("python", "rechunk"), "python")
+
+    def test_auto_backend_resolves_native_rechunk_capability(self) -> None:
+        expected = "rust" if _RUST_ZARR_READY else "python"
+        self.assertEqual(resolve_backend("auto", "zarr.rechunk_f32"), expected)
 
 
 @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
@@ -88,6 +96,65 @@ class RustZarrCrossBackendTests(unittest.TestCase):
         np.testing.assert_array_equal(region, values[1:3, 1:3, :].ravel())
         np.testing.assert_array_equal(chunk, [0.0, 2.0, 6.0, 8.0])
 
+
+    def test_rust_rechunk_changes_chunks_without_changing_values(self) -> None:
+        source = f"{self.tempdir.name}/rechunk-source.zarr"
+        target = f"{self.tempdir.name}/rechunk-target.zarr"
+        values = np.arange(4 * 3 * 2, dtype="float32").reshape(4, 3, 2)
+        dataset = xr.Dataset(
+            {
+                "value": (("time", "lat", "lon"), values),
+            },
+            coords={
+                "time": np.arange(4, dtype="int64"),
+                "lat": np.arange(3, dtype="int64"),
+                "lon": np.arange(2, dtype="int64"),
+            },
+            attrs={"title": "rust rechunk"},
+        )
+        dataset.to_zarr(
+            source,
+            mode="w",
+            consolidated=False,
+            zarr_format=3,
+            encoding={"value": {"chunks": (2, 2, 1)}},
+        )
+        dataset.close()
+        metrics = run_rust_rechunk(
+            RustRechunkPlan(
+                source=Path(source),
+                target=Path(target),
+                array_path="/value",
+                target_chunks=(1, 3, 2),
+            )
+        )
+        self.assertEqual(metrics["resolved_workers"], 1)
+        self.assertEqual(metrics["output"], target)
+        with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as result:
+            np.testing.assert_array_equal(result["value"].values, values)
+            np.testing.assert_array_equal(result["time"].values, np.arange(4))
+            self.assertEqual(result.attrs["title"], "rust rechunk")
+        group = zarr.open_group(target, mode="r")
+        self.assertEqual(group["value"].chunks, (1, 3, 2))
+
+    def test_rust_rechunk_rejects_non_float32_source(self) -> None:
+        source = f"{self.tempdir.name}/rechunk-int-source.zarr"
+        target = f"{self.tempdir.name}/rechunk-int-target.zarr"
+        dataset = xr.Dataset(
+            {"value": (("time", "lat", "lon"), np.zeros((2, 2, 2), dtype="int16"))},
+            coords={"time": [0, 1], "lat": [0, 1], "lon": [0, 1]},
+        )
+        dataset.to_zarr(source, mode="w", consolidated=False, zarr_format=3)
+        dataset.close()
+        with self.assertRaisesRegex(RuntimeError, "float32"):
+            run_rust_rechunk(
+                RustRechunkPlan(
+                    source=Path(source),
+                    target=Path(target),
+                    array_path="/value",
+                    target_chunks=(1, 2, 2),
+                )
+            )
 
 if __name__ == "__main__":
     unittest.main()

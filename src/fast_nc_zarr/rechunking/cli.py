@@ -60,6 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="并行 worker 上限；未指定时在有效资源上限内进入真实自动调优。",
     )
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "python", "rust"),
+        default="python",
+        help="执行后端；P2 Rust 仅支持显式 float32 单变量计划。",
+    )
     parser.add_argument("--overwrite", action="store_true", help="覆盖已有 Zarr v3 输出。")
     parser.add_argument("--no-validate", action="store_true", help="跳过输出抽样逐值校验。")
     parser.add_argument("--inspect-only", action="store_true", help="只检查输入，不生成计划。")
@@ -157,7 +163,7 @@ def interactive_args() -> argparse.Namespace:
         compression_level=None,
         compression_shuffle="auto",
         workers=None,
-        overwrite=False,
+        backend="python",
         no_validate=False,
         inspect_only=False,
         dry_run=False,
@@ -219,23 +225,40 @@ def run(args: argparse.Namespace) -> int:
         overwrite=args.overwrite,
     )
     workers = "auto" if args.workers is None else max(1, int(args.workers))
-    metrics = run_rechunk(
-        args.input,
-        output,
-        info,
-        plan,
-        compression,
-        workers=workers,
-        overwrite=overwrite,
-        progress=not args.quiet,
-        validate=not args.no_validate,
-    )
+    if args.backend in {"auto", "rust"}:
+        from ..application.services import RechunkConfig, run_rechunk as run_service_rechunk
+
+        service_config = RechunkConfig(
+            input=args.input,
+            output=output,
+            strategy=strategy,
+            target_mib=args.target_chunk_mib,
+            custom_chunks=(None if custom is None else tuple(int(value) for value in custom)),
+            compression=compression_name,
+            workers=workers,
+            overwrite=overwrite,
+            validate=not args.no_validate,
+            backend=args.backend,
+        )
+        metrics = run_service_rechunk(service_config, info)
+    else:
+        metrics = run_rechunk(
+            args.input,
+            output,
+            info,
+            plan,
+            compression,
+            workers=workers,
+            overwrite=overwrite,
+            progress=not args.quiet,
+            validate=not args.no_validate,
+        )
     print(
         "\n重分块完成并通过校验。\n"
-        f"输出：{metrics['output']}\n"
-        f"耗时：{float(metrics['elapsed']):.1f} 秒\n"
-        f"逻辑吞吐：{float(metrics['throughput_mib_s']):.1f} MiB/s\n"
-        f"输出物理大小：{int(metrics['physical_bytes']) / 1024**3:.2f} GiB"
+        f"输出：{metrics.get('output', output)}\n"
+        f"执行路径：{metrics.get('execution_path', 'python')}\n"
+        f"逻辑字节：{int(metrics.get('logical_bytes', info.logical_bytes)) / 1024**3:.2f} GiB\n"
+        f"目标 chunk：{tuple(metrics.get('target_chunks', plan.chunks))}"
     )
     return 0
 

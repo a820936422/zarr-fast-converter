@@ -41,10 +41,11 @@ from ..models import (
 from ..planner import resolve_conversion_plan
 from ..selection import make_selection, selected_logical_bytes
 from ..rechunking.compression import make_compression_plan
-from ..rechunking.engine import run_rechunk as core_run_rechunk
+from ..rechunking.engine import RechunkExecutionError, run_rechunk as core_run_rechunk
 from ..rechunking.inspection import format_inspection, inspect_store
 from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo
 from ..rechunking.planning import DEFAULT_TARGET_MIB, plan_chunks
+from .._backend import BackendUnavailableError
 from ..system import EffectiveResourceBudget
 from ..resampling.engine import (
     format_plan as format_resample_plan,
@@ -278,6 +279,7 @@ class RechunkConfig:
     workers: int | str = "auto"
     overwrite: bool = False
     validate: bool = True
+    backend: Literal["auto", "python", "rust"] = "python"
     # ``compression_only`` is retained for callers of the previous two-page
     # GUI/API.  New callers should select the two independent operations
     # below; both can then be applied in one output-producing pass.
@@ -779,6 +781,19 @@ def run_rechunk(
     cancel_event=None,
 ) -> dict[str, Any]:
     preview = preview_rechunk(config, info)
+    if config.backend in {"auto", "rust"}:
+        from ..rechunking.native import run_rust_rechunk_for_config
+
+        try:
+            return run_rust_rechunk_for_config(
+                config,
+                preview.info,
+                preview.plan,
+                cancel_event=cancel_event,
+            )
+        except (BackendUnavailableError, ValueError, RuntimeError) as exc:
+            if config.backend == "rust":
+                raise RechunkExecutionError(f"Rust 重分块失败: {exc}") from exc
     return core_run_rechunk(
         config.input,
         config.output,

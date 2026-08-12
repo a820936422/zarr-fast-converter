@@ -68,7 +68,11 @@ def resolve_backend(requested: BackendName, operation: str) -> str:
         raise ValueError(f"unsupported backend selection: {requested}")
 
     capability = rust_capability()
-    supported = capability.supported and operation in capability.operations
+    supported = capability.supported and (
+        operation in capability.operations
+        or operation == "rechunk"
+        and "zarr.rechunk_f32" in capability.operations
+    )
     if requested == "rust" and not supported:
         reason = capability.reason or f"operation is not supported: {operation}"
         raise BackendUnavailableError(reason)

@@ -1,12 +1,13 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use fast_nc_zarr_model::{RechunkExecutionPlan, RechunkMetrics};
 use ndarray::ArrayD;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
-use zarrs::array::{data_type, Array, ArrayBuilder, ArraySubset};
+use zarrs::array::{data_type, Array, ArrayBuilder, ArrayMetadataOptions, ArraySubset};
 use zarrs::group::GroupBuilder;
 use zarrs_filesystem::FilesystemStore;
 
@@ -30,7 +31,7 @@ impl ZarrError {
     }
 }
 
-pub type Result<T> = std::result::Result<T, ZarrError>;
+pub type Result<T, E = ZarrError> = std::result::Result<T, E>;
 
 type Store = FilesystemStore;
 type ArrayStore = Array<Store>;
@@ -72,6 +73,91 @@ fn open_array(root: &Path, array_path: &str) -> Result<ArrayStore> {
 
 fn serialised_metadata(array: &ArrayStore) -> Result<Value> {
     serde_json::to_value(array.metadata()).map_err(ZarrError::from_display)
+}
+
+fn array_relative_path(array_path: &str) -> Result<PathBuf> {
+    let normalised = normalise_array_path(array_path);
+    let relative = Path::new(normalised.trim_start_matches('/'));
+    if relative.as_os_str().is_empty() {
+        return Err(ZarrError::message(
+            "array_path must identify an array below the root",
+        ));
+    }
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(ZarrError::message(
+                "array_path must contain only normal path components",
+            ));
+        }
+    }
+    Ok(relative.to_path_buf())
+}
+
+fn copy_store_tree(
+    source_root: &Path,
+    source_dir: &Path,
+    target_root: &Path,
+    skipped_array: &Path,
+) -> Result<()> {
+    for entry in fs::read_dir(source_dir).map_err(ZarrError::from_display)? {
+        let entry = entry.map_err(ZarrError::from_display)?;
+        let source = entry.path();
+        let relative = source
+            .strip_prefix(source_root)
+            .map_err(ZarrError::from_display)?;
+        if relative == skipped_array {
+            continue;
+        }
+        let target = target_root.join(relative);
+        let file_type = entry.file_type().map_err(ZarrError::from_display)?;
+        if file_type.is_symlink() {
+            return Err(ZarrError::message(format!(
+                "source Zarr contains a symlink: {}",
+                source.display()
+            )));
+        }
+        if file_type.is_dir() {
+            fs::create_dir_all(&target).map_err(ZarrError::from_display)?;
+            copy_store_tree(source_root, &source, target_root, skipped_array)?;
+        } else if file_type.is_file() {
+            fs::copy(&source, &target).map_err(ZarrError::from_display)?;
+        } else {
+            return Err(ZarrError::message(format!(
+                "source Zarr contains an unsupported filesystem entry: {}",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn copy_store_without_array(
+    source_root: &Path,
+    target_root: &Path,
+    array_path: &str,
+) -> Result<()> {
+    if target_root.exists() {
+        if !target_root.is_dir() {
+            return Err(ZarrError::message(format!(
+                "target path is not a directory: {}",
+                target_root.display()
+            )));
+        }
+        if fs::read_dir(target_root)
+            .map_err(ZarrError::from_display)?
+            .next()
+            .is_some()
+        {
+            return Err(ZarrError::message(format!(
+                "refusing to overwrite non-empty target store: {}",
+                target_root.display()
+            )));
+        }
+    } else {
+        fs::create_dir_all(target_root).map_err(ZarrError::from_display)?;
+    }
+    let skipped_array = array_relative_path(array_path)?;
+    copy_store_tree(source_root, source_root, target_root, &skipped_array)
 }
 
 pub fn inspect_array(root: impl AsRef<Path>, array_path: &str) -> Result<ArraySummary> {
@@ -319,4 +405,104 @@ pub fn write_f32_array(
         }
     }
     Ok(())
+}
+
+pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> {
+    if plan.expected_dtype != "float32" {
+        return Err(ZarrError::message(format!(
+            "P2 Rust rechunk backend only supports expected_dtype=float32, got {}",
+            plan.expected_dtype
+        )));
+    }
+    if plan.target_chunks.is_empty() || plan.target_chunks.contains(&0) {
+        return Err(ZarrError::message(
+            "target_chunks must contain positive values",
+        ));
+    }
+
+    let source_root = Path::new(&plan.source);
+    let source_array = open_array(source_root, &plan.array_path)?;
+    let source_metadata = serialised_metadata(&source_array)?;
+    if source_metadata.get("data_type") != Some(&Value::String("float32".to_owned())) {
+        return Err(ZarrError::message(
+            "P2 Rust rechunk backend only supports source data_type=float32",
+        ));
+    }
+    if plan.target_chunks.len() != source_array.shape().len() {
+        return Err(ZarrError::message(
+            "target_chunks dimensionality does not match source array",
+        ));
+    }
+
+    let target_root = Path::new(&plan.target);
+    copy_store_without_array(source_root, target_root, &plan.array_path)?;
+    let target_store =
+        Arc::new(FilesystemStore::new(target_root).map_err(ZarrError::from_display)?);
+
+    let mut array_builder = ArrayBuilder::from_array(&source_array);
+    array_builder.chunk_grid_metadata(plan.target_chunks.clone());
+    let target_path = normalise_array_path(&plan.array_path);
+    let target_array = array_builder
+        .build(target_store, &target_path)
+        .map_err(ZarrError::from_display)?;
+    target_array
+        .store_metadata_opt(&ArrayMetadataOptions::default().with_include_zarrs_metadata(false))
+        .map_err(ZarrError::from_display)?;
+
+    let target_grid_shape = target_array.chunk_grid_shape().to_vec();
+    let target_grid_count = target_grid_shape.iter().try_fold(1_u64, |total, value| {
+        total
+            .checked_mul(*value)
+            .ok_or_else(|| ZarrError::message("target chunk count overflows u64"))
+    })?;
+    let mut chunk_indices = vec![0_u64; target_grid_shape.len()];
+    loop {
+        let subset = target_array
+            .chunk_subset_bounded(&chunk_indices)
+            .map_err(ZarrError::from_display)?;
+        let values: ArrayD<f32> = source_array
+            .retrieve_array_subset(&subset)
+            .map_err(ZarrError::from_display)?;
+        target_array
+            .store_array_subset(&subset, values)
+            .map_err(ZarrError::from_display)?;
+        let shape = target_grid_shape
+            .iter()
+            .map(|value| usize::try_from(*value).unwrap_or(usize::MAX))
+            .collect::<Vec<_>>();
+        let mut index = chunk_indices
+            .iter()
+            .map(|value| usize::try_from(*value).unwrap_or(usize::MAX))
+            .collect::<Vec<_>>();
+        if !increment_index(&mut index, &shape) {
+            break;
+        }
+        chunk_indices = index
+            .into_iter()
+            .map(|value| u64::try_from(value).unwrap_or(u64::MAX))
+            .collect();
+    }
+
+    let source_shape = source_array.shape().to_vec();
+    let source_chunk_shape = source_array
+        .chunk_shape_usize(&vec![0_u64; source_shape.len()])
+        .map_err(ZarrError::from_display)?;
+    let logical_elements = checked_product(&source_shape)? as u64;
+    let logical_bytes = logical_elements
+        .checked_mul(4)
+        .ok_or_else(|| ZarrError::message("logical byte count overflows u64"))?;
+    Ok(RechunkMetrics {
+        execution_path: "rust-streaming-target-chunk".to_owned(),
+        output: plan.target.clone(),
+        source_shape,
+        source_chunks: source_chunk_shape,
+        target_chunks: plan.target_chunks.clone(),
+        logical_bytes,
+        target_chunk_count: target_grid_count,
+        resolved_workers: 1,
+        worker_reason: format!(
+            "P2 initial implementation owns one target chunk at a time; requested_workers={}",
+            plan.requested_workers
+        ),
+    })
 }
