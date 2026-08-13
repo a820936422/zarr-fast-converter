@@ -1,6 +1,6 @@
 [workspace]
 name = "fast-nc-zarr"
-version = "1.6.9"
+version = "1.7.1"
 description = "Reproducible development environment for the fast Zarr converter"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
@@ -25,12 +25,12 @@ xesmf = ">=0.9.2,<0.10"
 zarr = ">=3.3,<4"
 rust = ">=1.83,<2"
 maturin = ">=1.8,<2"
+pyinstaller = ">=6.22,<7"
 pkg-config = ">=0.29.2,<0.30"
 cmake = ">=4.4.2,<5"
 ninja = ">=1.13.2,<2"
 patchelf = ">=0.17.2,<0.18"
 pip = ">=26.2.1,<27"
-
 [activation.env]
 PYTHONPATH = "${PIXI_PROJECT_ROOT}/src"
 
@@ -49,3 +49,14 @@ rust-test = "CFLAGS=-std=gnu17 cargo test --workspace"
 rust-fmt-check = "cargo fmt --all -- --check"
 rust-clippy = "CFLAGS=-std=gnu17 cargo clippy --workspace --all-targets -- -D warnings"
 cross-backend-test = "CFLAGS=-std=gnu17 maturin develop --release && python -m pytest -q tests/test_native_smoke.py"
+desktop-install = "npm --prefix apps/desktop ci"
+desktop-typecheck = "npm --prefix apps/desktop run typecheck"
+desktop-build = "npm --prefix apps/desktop run build"
+desktop-test = "npm --prefix apps/desktop run test"
+desktop-worker = "python -m fast_nc_zarr.application.desktop_worker"
+tauri-build = "env CI=false npm --prefix apps/desktop run tauri:build"
+desktop-sidecar = "bash scripts/build_desktop_sidecar.sh"
+desktop-sidecar-target = "bash scripts/build_desktop_sidecar.sh"
+desktop-release-check = "pixi run desktop-typecheck && pixi run desktop-build && pixi run native-check"
+gui-legacy = "python -m fast_nc_zarr.gui.app"
+release-candidate = "mkdir -p release && cp target/debug/bundle/deb/*.deb release/ && cp target/debug/bundle/rpm/*.rpm release/ && cp apps/desktop/src-tauri/icons/icon.png release/fast-nc-zarr-icon.png"

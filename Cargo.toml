@@ -4,10 +4,11 @@ members = [
     "rust/crates/fast-nc-zarr-model",
     "rust/crates/fast-nc-zarr-zarr",
     "rust/crates/fast-nc-zarr-python",
+    "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
-version = "1.6.9"
+version = "1.7.1"
 edition = "2021"
 rust-version = "1.83"
 
@@ -21,4 +22,8 @@ serde_json = "1.0"
 thiserror = "2.0"
 zarrs = "0.23.13"
 zarrs_filesystem = "0.3.12"
+tauri = { version = "2.11.3" }
+tauri-build = { version = "2.6.3" }
+tauri-plugin-log = "2"
+tauri-plugin-dialog = "2"
 ndarray = "0.17.2"

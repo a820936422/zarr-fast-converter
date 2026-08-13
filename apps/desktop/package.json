@@ -1,0 +1,36 @@
+{
+  "name": "fast-nc-zarr-desktop",
+  "private": true,
+  "version": "1.7.1",
+  "description": "Tauri desktop shell for Fast NC Zarr",
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25",
+    "npm": ">=12 <13"
+  },
+  "packageManager": "npm@12.0.2",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.2",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "typescript": "7.0.2",
+    "vite": "8.2.1",
+    "vitest": "4.1.10"
+  }
+}

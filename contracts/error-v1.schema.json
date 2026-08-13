@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fast-nc-zarr.dev/contracts/error-v1.json",
+  "title": "Fast NC Zarr IPC error",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "message", "retryable"],
+  "properties": {
+    "kind": {"enum": ["invalid_request", "path_not_found", "permission_denied", "input_invalid", "backend_unavailable", "worker_start_failed", "worker_protocol_error", "cancelled", "resource_budget_exceeded", "validation_failed", "publication_failed", "unknown"]},
+    "message": {"type": "string", "minLength": 1},
+    "retryable": {"type": "boolean"},
+    "stage": {"type": ["string", "null"]},
+    "details": {"type": "object"},
+    "manifest": {"type": ["string", "null"]}
+  }
+}
