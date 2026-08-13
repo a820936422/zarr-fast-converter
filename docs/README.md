@@ -1,6 +1,6 @@
 # 模块文档
 
-本文档目录按可执行模块组织，描述当前 v1.7.1 的功能、使用方式和边界。项目总览、环境安装和快速示例见根目录 [README](../README.md)。
+本文档目录按可执行模块组织，描述当前 v1.7.2 的功能、使用方式和边界。项目总览、环境安装和快速示例见根目录 [README](../README.md)。
 
 | 模块 | 作用 | 入口 |
 |---|---|---|
@@ -28,3 +28,4 @@
 
 - [Rust backend 当前方案](architecture/rust-backend.md)
 - [架构历史归档](architecture/archive/)
+- [v1.7.2 Native-first 开发方案](v1.7.2-development-plan.md)

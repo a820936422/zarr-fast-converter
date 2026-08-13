@@ -1,6 +1,6 @@
 [package]
 name = "fast-nc-zarr-desktop"
-version = "1.7.1"
+version = "1.7.2"
 description = "Tauri desktop shell for Fast NC Zarr"
 authors = ["Fast NC Zarr contributors"]
 license = "MIT"

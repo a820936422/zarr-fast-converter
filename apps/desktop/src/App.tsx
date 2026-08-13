@@ -177,7 +177,7 @@ function App() {
       </aside>
       <section className="workspace">
         <header className="topbar">
-          <div><span className="eyebrow">v1.7.1 / Tauri shell</span><h1>{view === "inspection" ? "数据检查" : view === "pipeline" ? "处理流程" : "任务中心"}</h1></div>
+          <div><span className="eyebrow">v1.7.2 / Native-first Tauri shell</span><h1>{view === "inspection" ? "数据检查" : view === "pipeline" ? "处理流程" : "任务中心"}</h1></div>
           <span className="status-badge">{busy ? "处理中" : runningTasks.length ? "任务运行中" : inspection ? "检查完成" : "准备就绪"}</span>
         </header>
 

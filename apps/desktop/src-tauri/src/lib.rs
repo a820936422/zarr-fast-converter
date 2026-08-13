@@ -18,7 +18,7 @@ struct BackendInfo {
 fn get_backend_info() -> BackendInfo {
     BackendInfo {
         app: "fast-nc-zarr",
-        version: "1.7.1",
+        version: "1.7.2",
         runtime: "tauri-rust",
     }
 }

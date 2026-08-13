@@ -4,13 +4,15 @@
 >
 > 更新日期：2026-08-13
 >
-> 分支：`refactor/v1.7.1-tauri`
+> 分支：`refactor/v1.7.2-native-first`
 >
-> 审计提交：`c2d4b8b`（本地 HEAD 与远端同名分支一致）
+> 审计基线：`a8e231f`（`refactor/v1.7.1-tauri`）
 >
-> 当前版本：`1.7.1`
+> 当前版本：`1.7.2`
 
-本文件只保留当前真实状态、已经完成的治理工作和仍然可执行的清理项。此前的分阶段执行日志不再重复保留；已经完成的事项统一归入“已完成”，避免把历史计划误读为未执行任务。
+本文件只保留当前真实状态、已经完成的治理工作和仍然可执行的清理项。v1.7.2 Native-first
+开发已完成 P0 capability contract 地基，但默认 Python backend、复杂格式 fallback 和
+PySide6 legacy 路径仍保留；开发细节见 [`v1.7.2-development-plan.md`](v1.7.2-development-plan.md)。
 
 ## 1. 结论
 

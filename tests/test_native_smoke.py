@@ -38,6 +38,26 @@ class NativePreparationTests(unittest.TestCase):
                 "supported": capability.supported,
             }
         )
+    def test_capability_matrix_matches_supported_operations(self) -> None:
+        capability = rust_capability()
+        supported = {
+            item.operation for item in capability.capabilities if item.supported
+        }
+        self.assertEqual(supported, set(capability.operations))
+        if capability.supported:
+            detail = capability.operation("raw.netcdf.convert")
+            self.assertIsNotNone(detail)
+            self.assertFalse(detail.supported)
+            self.assertTrue(detail.reason)
+
+    def test_legacy_capability_payload_without_matrix_remains_compatible(self) -> None:
+        from fast_nc_zarr import _backend
+
+        operations = ("probe", "zarr.inspect")
+        parsed = _backend._parse_capabilities({"operations": list(operations)}, operations)
+        self.assertEqual(tuple(item.operation for item in parsed), operations)
+        self.assertTrue(all(item.supported for item in parsed))
+
     def test_auto_backend_falls_back_without_rust_operation(self) -> None:
         expected = "rust" if _RUST_ZARR_READY else "python"
         self.assertEqual(resolve_backend("auto", "rechunk"), expected)

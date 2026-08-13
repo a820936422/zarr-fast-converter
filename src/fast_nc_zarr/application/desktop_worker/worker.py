@@ -316,7 +316,15 @@ def _dispatch(request: Request, output: TextIO, cancel_event: ThreadEvent) -> No
         from ..._backend import rust_capability
 
         capability = rust_capability()
-        sink.emit("finished", {"backend": "python", "native": _safe(capability), "operations": ["inspection", "pipeline"]}, stage="capabilities")
+        sink.emit(
+            "finished",
+            {
+                "backend": "python",
+                "native": _safe(capability),
+                "operations": ["inspection", "pipeline"],
+            },
+            stage="capabilities",
+        )
         return
     if request.command == "inspect_time_metadata":
         from ...time_mapping import inspect_time_metadata

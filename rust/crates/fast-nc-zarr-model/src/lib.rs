@@ -3,11 +3,41 @@ use serde::{Deserialize, Serialize};
 pub const BACKEND_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationCapability {
+    pub operation: String,
+    pub supported: bool,
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub limitations: Vec<String>,
+}
+
+impl OperationCapability {
+    fn supported(operation: &str, limitations: &[&str]) -> Self {
+        Self {
+            operation: operation.to_owned(),
+            supported: true,
+            reason: None,
+            limitations: limitations.iter().map(|item| (*item).to_owned()).collect(),
+        }
+    }
+
+    fn unsupported(operation: &str, reason: &str, limitations: &[&str]) -> Self {
+        Self {
+            operation: operation.to_owned(),
+            supported: false,
+            reason: Some(reason.to_owned()),
+            limitations: limitations.iter().map(|item| (*item).to_owned()).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendCapability {
     pub backend: String,
     pub protocol_version: u32,
     pub crate_version: String,
     pub operations: Vec<String>,
+    pub capabilities: Vec<OperationCapability>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,21 +126,67 @@ pub struct RechunkMetrics {
 
 impl BackendCapability {
     pub fn smoke() -> Self {
+        let supported = [
+            ("probe", &[][..]),
+            ("zarr.inspect", &["Zarr v3 directory store"][..]),
+            ("zarr.read_chunk_f32", &["float32 arrays"][..]),
+            ("zarr.read_region_f32", &["float32 arrays"][..]),
+            ("zarr.write_f32", &["float32 arrays"][..]),
+            ("zarr.rechunk_f32", &["single float32 data variable"][..]),
+            (
+                "zarr.rechunk_f32_codec",
+                &["single float32 data variable", "explicit lossless codec"][..],
+            ),
+            ("zarr.rechunk_f32_cancel", &["cooperative cancellation"][..]),
+        ];
+        let operations = supported
+            .iter()
+            .map(|(operation, _)| (*operation).to_owned())
+            .collect::<Vec<_>>();
+        let mut capabilities = supported
+            .iter()
+            .map(|(operation, limitations)| OperationCapability::supported(operation, limitations))
+            .collect::<Vec<_>>();
+        capabilities.extend([
+            OperationCapability::unsupported(
+                "raw.netcdf.inspect",
+                "native reader is not implemented in this phase",
+                &["use Python fallback"],
+            ),
+            OperationCapability::unsupported(
+                "raw.netcdf.convert",
+                "native reader is not implemented in this phase",
+                &["use Python fallback"],
+            ),
+            OperationCapability::unsupported(
+                "resample.nearest",
+                "native resampling is not implemented in this phase",
+                &["use Python fallback"],
+            ),
+            OperationCapability::unsupported(
+                "resample.bilinear",
+                "native resampling is not implemented in this phase",
+                &["use Python fallback"],
+            ),
+            OperationCapability::unsupported(
+                "pipeline.native",
+                "native pipeline runtime is not implemented in this phase",
+                &["use Python fallback"],
+            ),
+        ]);
         Self {
             backend: "rust".to_owned(),
             protocol_version: BACKEND_PROTOCOL_VERSION,
             crate_version: env!("CARGO_PKG_VERSION").to_owned(),
-            operations: vec![
-                "probe".to_owned(),
-                "zarr.inspect".to_owned(),
-                "zarr.read_chunk_f32".to_owned(),
-                "zarr.read_region_f32".to_owned(),
-                "zarr.write_f32".to_owned(),
-                "zarr.rechunk_f32".to_owned(),
-                "zarr.rechunk_f32_codec".to_owned(),
-                "zarr.rechunk_f32_cancel".to_owned(),
-            ],
+            operations,
+            capabilities,
         }
+    }
+
+    pub fn operation(&self, operation: &str) -> Option<&OperationCapability> {
+        self.capabilities
+            .iter()
+            .find(|item| item.operation == operation)
     }
 }
 
@@ -119,9 +195,23 @@ mod tests {
     use super::BackendCapability;
 
     #[test]
-    fn smoke_capability_has_stable_protocol() {
+    fn smoke_capability_has_stable_protocol_and_matrix() {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
         assert_eq!(capability.operations.len(), 8);
+        assert_eq!(capability.capabilities.len(), 13);
+        let supported = capability
+            .capabilities
+            .iter()
+            .filter(|item| item.supported)
+            .map(|item| item.operation.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(supported, capability.operations);
+        assert!(
+            !capability
+                .operation("raw.netcdf.convert")
+                .unwrap()
+                .supported
+        );
     }
 }

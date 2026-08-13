@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fast-nc-zarr.dev/contracts/capability-v1.schema.json",
+  "title": "Fast NC Zarr backend capability report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["backend", "protocol_version", "crate_version", "operations", "capabilities"],
+  "properties": {
+    "backend": {"type": "string", "minLength": 1},
+    "protocol_version": {"const": 1},
+    "crate_version": {"type": ["string", "null"]},
+    "operations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/operationCapability"}
+    }
+  },
+  "$defs": {
+    "operationCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "supported", "reason", "limitations"],
+      "properties": {
+        "operation": {"type": "string", "minLength": 1},
+        "supported": {"type": "boolean"},
+        "reason": {"type": ["string", "null"]},
+        "limitations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

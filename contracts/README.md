@@ -1,4 +1,4 @@
-# v1.7.1 IPC contract
+# v1.7.2 IPC contract
 
 Protocol version: `1`.
 
@@ -84,3 +84,21 @@ Error kinds are `invalid_request`, `path_not_found`, `permission_denied`,
 `input_invalid`, `backend_unavailable`, `worker_start_failed`,
 `worker_protocol_error`, `cancelled`, `resource_budget_exceeded`,
 `validation_failed`, `publication_failed`, and `unknown`.
+## Backend capability report
+
+The v1.7.2 native-first migration keeps protocol version `1` and adds a structured
+capability report. Its canonical schema is
+[`capability-v1.schema.json`](capability-v1.schema.json).
+
+The report contains:
+
+- `operations`: operation IDs currently supported by the reported backend;
+- `capabilities`: supported and unsupported operation details;
+- `reason`: a stable explanation when an operation is unavailable;
+- `limitations`: user-visible constraints and fallback guidance.
+
+`backend=python` always remains selectable. `backend=rust` fails explicitly when
+the requested operation is unsupported. `backend=auto` may select Python only
+when the report records an explainable fallback reason.
+
+The native golden fixture is [`fixtures/capability-v1.json`](fixtures/capability-v1.json).

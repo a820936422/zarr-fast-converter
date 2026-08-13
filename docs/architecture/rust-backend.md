@@ -1,14 +1,17 @@
 # Rust backend 方案与实施边界
 
-> 本文由 v1.7.0 重构方案整理而来，保留设计决策和兼容边界。当前实现版本为 v1.7.1；实际分支状态、能力矩阵和验证结果以根 README 与 `docs/rechunking.md` 为准。
+> 本文由 v1.7.0 重构方案整理而来，保留设计决策和兼容边界。当前实现版本为 v1.7.2；实际分支状态、能力矩阵和验证结果以根 README、`docs/rechunking.md` 和 `docs/v1.7.2-development-plan.md` 为准。
 
 - 原始设计基线：v1.6.9 / v1.7.0
 - 原始工作分支：`refactor/v1.7.0-rust`
-- 当前方案：Python 产品层 + Rust 性能核心 + Python fallback
+- 当前方案：Tauri/TypeScript 产品层 + Rust native-first 核心 + Python fallback
 
-v1.7.0 不进行一次性全量重写。Rust 先替换具有明确输入输出边界、可通过 Zarr v3 交叉校验、且确实存在 Python 调度或内存开销的核心路径。xarray、xESMF 和 PySide6 暂时保留。
+v1.7.2 不进行一次性全量 Python 重写。Rust 先替换具有明确输入输出边界、可通过 Zarr v3
+交叉校验、且确实存在 Python 调度或内存开销的核心路径；xarray、xESMF、复杂输入兼容和
+PySide6 legacy 路径继续保留，直到对应 capability 决策门通过。
 
-当前进度：P0、P1、P2 已完成；P3 正在将单目标 chunk 流式重分块扩展为有界 Rust 线程池。Rust backend 仍不是 Pipeline 默认执行路径，Python backend 和默认 CLI 行为保持不变。
+当前进度：v1.7.2 P0 capability contract 已完成，P1 Tauri native task runtime 尚未开始。
+Rust backend 尚未成为 Pipeline 默认路径，Python backend 和默认 CLI 行为保持不变。
 
 ## 2. 当前基线
 
@@ -437,4 +440,4 @@ Python backend → Rust backend 结果比较
 - Rust wheel 或 Pixi 构建在目标平台可重复；
 - capability 不支持时 fallback 可解释且不会改变输出语义。
 
-在此之前，v1.7.0 的 Rust backend 仅作为实验性后端，不影响 Python 默认路径。
+在 v1.7.2 的 capability、交叉 fixture、真实数据 A/B、取消/异常安全和跨平台构建决策门通过前，Rust backend 仍不作为 Pipeline 默认路径，Python fallback 不得删除。

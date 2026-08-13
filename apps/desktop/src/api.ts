@@ -6,6 +6,26 @@ export type BackendInfo = {
   version: string;
   runtime: string;
 };
+export type OperationCapability = {
+  operation: string;
+  supported: boolean;
+  reason: string | null;
+  limitations: string[];
+};
+
+export type BackendCapability = {
+  backend: string;
+  protocol_version: number;
+  crate_version: string | null;
+  operations: string[];
+  capabilities: OperationCapability[];
+};
+
+export type WorkerCapabilities = {
+  backend: string;
+  native: BackendCapability;
+  operations: string[];
+};
 
 export type TimeRef = {
   source: "filename" | "time";
@@ -74,7 +94,7 @@ export type TaskEvent = {
 
 
 export const getBackendInfo = () => invoke<BackendInfo>("get_backend_info");
-export const getWorkerCapabilities = () => invoke<Record<string, unknown>>("worker_capabilities");
+export const getWorkerCapabilities = () => invoke<WorkerCapabilities>("worker_capabilities");
 export const inspectSource = (request: InspectionRequest) => invoke<InspectionResult>("inspect_source", { payload: request });
 export const inspectZarr = (path: string) => invoke<InspectionResult>("inspect_zarr", { path });
 export const inspectTimeMetadata = (inputDir: string, recursive = false, engine = "auto") =>

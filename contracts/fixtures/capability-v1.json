@@ -1,0 +1,30 @@
+{
+  "backend": "rust",
+  "protocol_version": 1,
+  "crate_version": "1.7.2",
+  "operations": [
+    "probe",
+    "zarr.inspect",
+    "zarr.read_chunk_f32",
+    "zarr.read_region_f32",
+    "zarr.write_f32",
+    "zarr.rechunk_f32",
+    "zarr.rechunk_f32_codec",
+    "zarr.rechunk_f32_cancel"
+  ],
+  "capabilities": [
+    {"operation": "probe", "supported": true, "reason": null, "limitations": []},
+    {"operation": "zarr.inspect", "supported": true, "reason": null, "limitations": ["Zarr v3 directory store"]},
+    {"operation": "zarr.read_chunk_f32", "supported": true, "reason": null, "limitations": ["float32 arrays"]},
+    {"operation": "zarr.read_region_f32", "supported": true, "reason": null, "limitations": ["float32 arrays"]},
+    {"operation": "zarr.write_f32", "supported": true, "reason": null, "limitations": ["float32 arrays"]},
+    {"operation": "zarr.rechunk_f32", "supported": true, "reason": null, "limitations": ["single float32 data variable"]},
+    {"operation": "zarr.rechunk_f32_codec", "supported": true, "reason": null, "limitations": ["single float32 data variable", "explicit lossless codec"]},
+    {"operation": "zarr.rechunk_f32_cancel", "supported": true, "reason": null, "limitations": ["cooperative cancellation"]},
+    {"operation": "raw.netcdf.inspect", "supported": false, "reason": "native reader is not implemented in this phase", "limitations": ["use Python fallback"]},
+    {"operation": "raw.netcdf.convert", "supported": false, "reason": "native reader is not implemented in this phase", "limitations": ["use Python fallback"]},
+    {"operation": "resample.nearest", "supported": false, "reason": "native resampling is not implemented in this phase", "limitations": ["use Python fallback"]},
+    {"operation": "resample.bilinear", "supported": false, "reason": "native resampling is not implemented in this phase", "limitations": ["use Python fallback"]},
+    {"operation": "pipeline.native", "supported": false, "reason": "native pipeline runtime is not implemented in this phase", "limitations": ["use Python fallback"]}
+  ]
+}
