@@ -67,7 +67,7 @@ v1.6.9 将存储介质从静态 worker 限速改为有效资源约束与真实�
 `refactor/v1.7.0-rust` 分支已完成 Rust Zarr v3 核心、单变量 `float32` 重分块、
 有界目标 chunk 并行、明确 codec 重压缩和取消/进度协议。Rust 后端仍为实验性 opt-in，
 不改变 v1.6.9 的 Python 默认路径；完整说明见 [`docs/rechunking.md`](docs/rechunking.md)
-和 [`Architecture/v1.7.0-rust-refactor-plan.md`](Architecture/v1.7.0-rust-refactor-plan.md)。
+和 [`docs/architecture/rust-backend.md`](docs/architecture/rust-backend.md)。
 
 Rust 后端当前支持一个 `(time, lat, lon)` 三维 `float32` 数据变量、Zarr v3、目标
 chunks 变更以及明确的 Zstd/Blosc/Gzip codec；输出通过 staging、结构/codec 校验、

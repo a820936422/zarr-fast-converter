@@ -1,6 +1,6 @@
 # 模块文档
 
-本文档目录按可执行模块组织，描述 v1.6.8 的现有功能、使用方式和边界。项目总览、环境安装和快速示例见根目录 [README](../README.md)。
+本文档目录按可执行模块组织，描述当前 v1.7.1 的功能、使用方式和边界。项目总览、环境安装和快速示例见根目录 [README](../README.md)。
 
 | 模块 | 作用 | 入口 |
 |---|---|---|
@@ -23,3 +23,8 @@
 ## 建议阅读顺序
 
 首次处理源文件：先读 [源数据转换](converter.md)，再读 [一条龙处理](pipeline.md)。只处理现有 Zarr 时，直接阅读 [空间重采样](resampling.md) 和 [重分块与重压缩](rechunking.md)。批量接入真实数据前，使用 [真实源数据校验](raw-validation.md) 建立兼容性报告。
+
+## 架构与历史设计
+
+- [Rust backend 当前方案](architecture/rust-backend.md)
+- [架构历史归档](architecture/archive/)

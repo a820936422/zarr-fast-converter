@@ -1,9 +1,10 @@
-# v1.7.0 Rust 混合重构初步方案
+# Rust backend 方案与实施边界
 
-- 当前版本：v1.6.9（v1.7.0 重构分支开发中）
-- 工作分支：`refactor/v1.7.0-rust`
-- 方案性质：混合重构，不改变 v1.6.9 主分支行为
-- 推荐路线：Python 产品层 + Rust 性能核心 + Python fallback
+> 本文由 v1.7.0 重构方案整理而来，保留设计决策和兼容边界。当前实现版本为 v1.7.1；实际分支状态、能力矩阵和验证结果以根 README 与 `docs/rechunking.md` 为准。
+
+- 原始设计基线：v1.6.9 / v1.7.0
+- 原始工作分支：`refactor/v1.7.0-rust`
+- 当前方案：Python 产品层 + Rust 性能核心 + Python fallback
 
 v1.7.0 不进行一次性全量重写。Rust 先替换具有明确输入输出边界、可通过 Zarr v3 交叉校验、且确实存在 Python 调度或内存开销的核心路径。xarray、xESMF 和 PySide6 暂时保留。
 

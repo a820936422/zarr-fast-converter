@@ -185,41 +185,29 @@ cp apps/desktop/src-tauri/icons/icon.png release/fast-nc-zarr-icon.png
 
 | 源图 | PNG 1 | PNG 2 | 建议 |
 |---|---|---|---|
-| `Architecture/architecture-v1.7.0-rust-refactor.drawio` | `architecture-v1.7.0-rust-refactor.png` 约 399.5K | `architecture-v1.7.0-rust-refactor.drawio.png` 约 401.7K | 保留 `.drawio` + 一个规范命名 PNG |
-| `Architecture/architecture-v1.6.9-optimization.drawio` | `architecture-v1.6.9-optimization.png` 约 654.6K | `architecture-v1.6.9-optimization.drawio.png` 约 303.3K | 保留 `.drawio` + 一个规范命名 PNG |
+| `docs/architecture/rust-backend.drawio` | `docs/architecture/rust-backend.png` 约 399.5K | 已删除 `Architecture/architecture-v1.7.0-rust-refactor.drawio.png` 约 401.7K | 保留 `.drawio` + 一个规范命名 PNG |
+| `docs/architecture/archive/architecture-v1.6.9-optimization.drawio` | `docs/architecture/archive/architecture-v1.6.9-optimization.png` 约 654.6K | 已删除 `Architecture/architecture-v1.6.9-optimization.drawio.png` 约 303.3K | 保留 `.drawio` + 一个规范命名 PNG |
 
-`.drawio.png` 与 `.png` 不是字节级重复；前者可能是带嵌入 XML 的可恢复导出，不能只凭大小删除。执行方案：
-
-1. 用 draw.io 打开两个 `.drawio` 源图；
-2. 确认文档只需要在线预览还是需要“PNG 可反向编辑”；
-3. 若只需要预览，保留普通 `.png`，删除 `.drawio.png`；
-4. 若需要 PNG 自带编辑数据，保留 `.drawio.png`，删除普通 `.png`；
-5. 统一命名并更新所有链接。
+重复 `.drawio.png` 导出已删除；普通 PNG 和可编辑 `.drawio` 源图保留。需要 PNG 内嵌 XML 的场景可从 `.drawio` 源图重新导出，不再在仓库长期保存第二份导出。
 
 此外，以下旧图目前没有 README/docs 引用：
 
-- `Architecture/gui-redesign-v1.6.8.drawio`；
-- `Architecture/architecture-v1.6.7.drawio`。
+- `docs/architecture/archive/gui-redesign-v1.6.8.drawio`；
+- `docs/architecture/archive/architecture-v1.6.7.drawio`。
 
-建议先移入 `docs/archive/architecture/`，一个版本周期后仍无引用再删除。若项目不需要保留设计历史，可在确认后直接删除；它们不是运行时依赖。
+上述旧图已移入 `docs/architecture/archive/`，它们不是运行时依赖；后续若确认不再需要设计历史，可再删除。
 
 ### B3. 历史架构计划合并/归档
 
-`Architecture/v1.7.0-rust-preparation.md` 和 `Architecture/v1.7.0-rust-refactor-plan.md` 有明显内容重叠：目录目标、Cargo workspace、native 环境、阶段计划和兼容边界重复。两份文档还保留旧状态：
+`v1.7.0-rust-refactor-plan.md` 已整理为当前入口 `docs/architecture/rust-backend.md`；`v1.7.0-rust-preparation.md` 已移入 `docs/architecture/archive/`。两者仍保留原始实施决策和历史基线，但不再在仓库根目录并列维护。
 
-- preparation 文档记录分支 `refactor/v1.7.0-rust`；
-- refactor plan 开头记录当前版本 v1.6.9；
-- 当前仓库版本已经是 1.7.1，Rust/Tauri 桌面代码已经存在。
+当前 Rust 架构入口保留：
 
-建议下一轮文档整理时：
+- `docs/architecture/rust-backend.md`：方案、能力边界和 fallback 说明；
+- `docs/architecture/rust-backend.drawio`：当前方案可编辑图；
+- `docs/architecture/archive/v1.7.0-rust-preparation.md`：准备阶段历史记录。
 
-- 合并为一个 `docs/architecture/rust-backend-history.md` 或 `docs/architecture/rust-backend.md`；
-- 将“准备清单”和“实施结果”分成两个一级标题，不再维护两棵重复目录树；
-- 将真正仍有效的能力矩阵、fallback 边界和未完成 A/B 验收保留；
-- 将旧版本、旧分支和已完成 checklist 标成历史记录；
-- 更新 `docs/README.md` 和根 README 的链接。
-
-`Architecture/v1.6.9-optimization-plan.md` 属于已实施方案的历史设计稿，建议移动到同一 archive，而不是与当前模块文档并列。
+`v1.6.9-optimization-plan.md` 及对应图纸已移入 `docs/architecture/archive/`，避免历史设计稿与当前用户模块文档混排。
 
 ### B4. 两份字体和两份 OFL 许可文件
 
@@ -418,21 +406,24 @@ docs/
 ├── gui.md
 ├── raw-validation.md
 └── architecture/
-    ├── rust-backend.md        # 合并 v1.7.0 两份设计文档
-    └── archive/
+    ├── rust-backend.md        # 当前 Rust 方案与能力边界
+    ├── rust-backend.drawio    # 当前架构可编辑图
+    └── archive/               # 历史方案与历史架构图
+        ├── v1.7.0-rust-preparation.md
         ├── v1.6.9-optimization-plan.md
         ├── architecture-v1.6.9-optimization.drawio
+        ├── architecture-v1.6.9-optimization.png
         ├── architecture-v1.6.7.drawio
         └── gui-redesign-v1.6.8.drawio
 ```
 
 实施顺序：
 
-1. 先修正 `docs/README.md:3` 的过时“v1.6.8”描述；
-2. 给旧 Architecture 文档加“历史设计/状态不代表当前实现”标记；
-3. 移动后更新所有链接并检查没有断链；
-4. 合并两份 v1.7.0 计划时保留原始提交历史，必要时在新文档顶部列出来源文件；
-5. 最后才删除没有引用的旧图纸或重复 PNG。
+1. 修正 `docs/README.md:3` 的过时版本描述；
+2. 将当前架构入口和历史资料收敛到 `docs/architecture/`；
+3. 更新根 README、模块索引和归档文档中的链接；
+4. 删除重复 `.drawio.png` 导出，保留源图和普通预览 PNG；
+5. 字体、协议实现和兼容入口仍按后续阶段处理。
 
 这样可以把项目根部的历史设计噪音收进 `docs/architecture/`，又不会丢失对 Rust 重构决策有价值的上下文。
 
@@ -569,10 +560,10 @@ sha256sum src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf \
 
 ### 可合并/重组
 
-- [ ] `release/fast-nc-zarr-icon.png` 合并回 Tauri icon 生成流程
-- [ ] 每组 Architecture 图只保留 `.drawio` + 一种 PNG
+- [x] `release/fast-nc-zarr-icon.png` 合并回 Tauri icon 生成流程
+- [x] 每组 Architecture 图只保留 `.drawio` + 一种 PNG
 - [ ] `v1.7.0-rust-preparation.md` 与 `v1.7.0-rust-refactor-plan.md` 合并为一个历史/现状文档
-- [ ] `Architecture/` 迁入 `docs/architecture/`
+- [x] `Architecture/` 迁入 `docs/architecture/`
 - [ ] 两份字体改为一个源文件 + 两个构建 staging 输出
 - [ ] 两份 `OFL.txt` 随字体构建复制，不在两个运行时目录各维护一份
 - [ ] 协议 schema 作为唯一源，生成 Python/Rust/TypeScript 定义
@@ -585,8 +576,8 @@ sha256sum src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf \
 - [ ] `pixi.toml` 的 `gui-legacy`
 - [ ] `gui/main_window.py` 中旧页面对象
 - [ ] `gui/path_chooser.py` 与 `gui/path_picker.py` 的重复/兼容层
-- [ ] 未引用的 `architecture-v1.6.7.drawio`、`gui-redesign-v1.6.8.drawio`
-- [ ] 重复的普通 PNG 或 `.drawio.png` 导出
+- [ ] 未引用的 `architecture-v1.6.7.drawio`、`gui-redesign-v1.6.8.drawio`（已归档，待后续删除决策）
+- [x] 重复的普通 PNG 或 `.drawio.png` 导出
 - [ ] 分散的版本号定义
 - [ ] 已确认可自动生成的 `apps/desktop/src-tauri/gen/schemas/`
 
@@ -605,7 +596,7 @@ sha256sum src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf \
 
 ---
 
-## 11. 本次实际执行记录（2026-08-13）
+## 11. 第一次实际执行记录（2026-08-13）
 
 本次已按 A 类低风险项执行实际清理，并完成一项 B 类资源合并：
 
@@ -637,3 +628,17 @@ sha256sum src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf \
 - `release/*.deb`、`release/*.rpm` 仍被 `.gitignore` 覆盖。
 - 唯一保留的源图标 SHA-256 为 `7caed0b5ba81bbba515650019e18c658bee3bdba26898a77730d8d70ed5391f2`。
 - 本次未运行完整测试套件：清理同时删除了本地 Pixi/编译依赖环境；后续重建环境后按第 9 节命令验证。
+
+---
+
+## 12. 第二次实际执行记录（2026-08-13）
+
+- [x] 将当前 Rust 方案整理到 `docs/architecture/rust-backend.md`。
+- [x] 将准备阶段、v1.6.9 优化方案和旧架构图移入 `docs/architecture/archive/`。
+- [x] 将根 README 和 `docs/README.md` 的架构入口更新到新路径。
+- [x] 为归档方案添加历史状态说明，并修正归档优化方案的图纸相对路径。
+- [x] 删除两份重复 `.drawio.png` 导出；保留两个 `.drawio` 源图和普通 PNG 预览。
+- [x] 保留两份字体、协议实现、兼容入口和 Tauri 生成 schema，未扩大清理范围。
+- [x] `Architecture/` 已不再包含跟踪文件；历史设计内容集中在 `docs/architecture/`。
+
+本阶段未运行完整测试套件；验证重点为 Git 路径、文档链接、图纸源文件和归档结构。
