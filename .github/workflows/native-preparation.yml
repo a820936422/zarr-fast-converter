@@ -36,8 +36,6 @@ jobs:
 
       - name: Run Rust clippy
         run: pixi run rust-clippy
-      - name: Check desktop frontend and sidecar build inputs
-        run: pixi run desktop-release-check && pixi run desktop-sidecar
 
 
       - name: Run native protocol smoke tests

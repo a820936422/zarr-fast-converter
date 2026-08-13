@@ -292,37 +292,18 @@ a3041811a78c361b1de50f953c805e0244951c21c5bd412f7232ef0d899af0da
 4. 删除旧页面与 `gui-legacy` task；
 5. 最后才删除根 `gui.py` wrapper。
 
-### C3. `fast-nc-zarr-worker.spec`
+### C3. 遗留 PyInstaller spec（已完成）
 
-该 PyInstaller spec 存在两个问题：
+原 `fast-nc-zarr-worker.spec` 含本机绝对路径，且 sidecar 脚本已直接管理 PyInstaller 参数。它已被删除；当前 `scripts/build_desktop_sidecar.sh` 将 spec、workpath 和 distpath 全部放入 ignored 的构建目录。
 
-- `binaries` 写死了本机绝对路径：`/run/media/owen/HDD/zarr-fast-converter-v1/src/...so`；
-- 当前 `scripts/build_desktop_sidecar.sh` 直接调用 `pyinstaller --onefile --paths src --add-binary ...`，没有引用该 spec。
+验证：sidecar 重建成功，仓库根目录不会重新生成 spec。
 
-因此它是高概率的遗留/重复打包入口，且不可移植。建议：
+### C4. 遗留 native 构建脚本（已完成）
 
-- 先在 CI 和发布说明中确认没有人通过 `pyinstaller fast-nc-zarr-worker.spec` 构建；
-- 将必要参数迁移到 `pyproject.toml` 或构建脚本；
-- 删除 `fast-nc-zarr-worker.spec`；
-- 只保留一个可跨机器工作的 sidecar 构建入口。
+原 `scripts/build_native.sh` 只执行未统一 `CFLAGS` 的 `maturin develop --release`，已被删除。当前统一入口是 `pixi run native-develop`，使用可重复的 `--skip-install` 原地构建。
 
-这是适合后续清理的文件，不建议在没有构建验证前直接删除。
+后续仍保留的构建治理工作：协议 codegen、字体 staging、版本字段集中化和兼容入口弃用。
 
-### C4. `scripts/build_native.sh`
-
-它只有：
-
-```bash
-exec maturin develop --release "$@"
-```
-
-而 `pixi.toml` 已提供：
-
-```text
-native-develop = "CFLAGS=-std=gnu17 maturin develop --release"
-```
-
-当前脚本没有被 README、CI、其他脚本或 Pixi task 引用；并且缺少项目统一的 `CFLAGS`。建议将外部使用迁移到 `pixi run native-develop` 后删除该脚本。不要与 `check_native_environment.py` 合并，环境检查和构建是两个清晰职责。
 
 ### C5. Python/Rust/TypeScript 三份协议定义
 
@@ -679,3 +660,13 @@ sha256sum src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf \
 
 
 最终回归补充：单进程 Python 回归再次通过 `188 passed`、`29 subtests passed`；sidecar spec 已隔离到 ignored 的 `build/fast-nc-zarr-worker/`，仓库根目录不会重新生成 `fast-nc-zarr-worker.spec`。桌面 package 已移除无测试文件的 Vitest/`desktop-test` 入口。
+
+### 收尾修正（2026-08-13）
+
+- [x] 从 native-preparation job 移除依赖 Node/sidecar 的桌面步骤，桌面构建只在 `desktop-release` job 执行。
+- [x] 修复 CI desktop job 顺序：Linux 系统库 → Pixi sidecar → Node/npm → 前端 → Tauri。
+- [x] 移除无测试文件的 `desktop-test`/Vitest 入口及 `tsconfig.json` 中的 `vitest/globals` 类型引用。
+- [x] 扩展 `release/` 对 AppImage、tar.gz、zip、dmg、msi、wheel 的忽略规则。
+- [x] `scripts/build_desktop_sidecar.sh` 将 PyInstaller spec 生成到 ignored build 目录，根目录不再出现临时 spec。
+
+最终工作区仅保留源码构建配置和可重建产物；没有把测试日志或构建日志写入 Git。
