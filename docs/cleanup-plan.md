@@ -570,8 +570,8 @@ sha256sum src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf \
 
 ### 后续优化后可清理
 
-- [ ] `fast-nc-zarr-worker.spec`
-- [ ] `scripts/build_native.sh`
+- [x] `fast-nc-zarr-worker.spec`（已由 `scripts/build_desktop_sidecar.sh` 替代，原文件含本机绝对路径）
+- [x] `scripts/build_native.sh`（已由 `pixi run native-develop` 替代，统一使用 `--skip-install`）
 - [ ] 根目录五个兼容 wrapper
 - [ ] `pixi.toml` 的 `gui-legacy`
 - [ ] `gui/main_window.py` 中旧页面对象
@@ -618,8 +618,7 @@ sha256sum src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf \
 
 - 未移动/删除 `Architecture/` 历史文档和 PNG 导出；需要先确认归档位置与预览/嵌入 XML 策略。
 - 未合并两份 Noto Sans SC 字体；Python GUI 与 React/Tauri 当前分别直接读取它们。
-- 未删除根入口 wrapper、`gui-legacy`、旧 GUI 页面、`fast-nc-zarr-worker.spec` 或 `scripts/build_native.sh`；这些仍涉及兼容调用或缺少外部使用确认。
-- 未改动协议 schema、Python/Rust/TypeScript 协议实现或版本字段；这些需要 codegen/发布流程改造后再处理。
+- 未删除根入口 wrapper、`gui-legacy`、旧 GUI 页面或协议重复实现；这些仍涉及兼容调用或跨语言边界。
 
 ### 清理后观测
 
@@ -642,3 +641,41 @@ sha256sum src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf \
 - [x] `Architecture/` 已不再包含跟踪文件；历史设计内容集中在 `docs/architecture/`。
 
 本阶段未运行完整测试套件；验证重点为 Git 路径、文档链接、图纸源文件和归档结构。
+
+---
+
+## 13. 重建验证与构建治理记录（2026-08-13）
+
+### 重建结果
+
+- [x] `pixi install` 成功恢复 `.pixi/` 环境。
+- [x] `pixi run native-check` 通过，Python headers、NumPy、Rust、maturin、CMake、Ninja、GDAL 和 NetCDF 工具可用。
+- [x] native Rust/PyO3 扩展编译成功，`capability_json()` 返回协议 v1、crate v1.7.1 和完整操作列表。
+- [x] `pixi run native-develop` 和 `pixi run cross-backend-test` 改为 `maturin develop --skip-install` 后通过；默认安装阶段原先因 ELF `bad offset` 失败，已避免该不可重复的 pip 安装路径。
+- [x] Python 全量测试：`188 passed`、`29 subtests passed`、`1 warning`。
+- [x] Rust 核心 crate 测试：`1 passed`，其余 crate 无测试失败。
+- [x] Rust 核心 clippy 通过。
+- [x] `npm --prefix apps/desktop ci` 成功恢复 57 个依赖包。
+- [x] 桌面 TypeScript typecheck 和 Vite production build 通过，产物 JS 202.03KB、CSS 4.91KB。
+- [x] PyInstaller sidecar 成功重建为 target-specific worker，并通过协议 fixture：`accepted → started → finished`，backend 为 `python`。
+- [x] Tauri Linux release 构建成功，生成 deb bundle。
+
+### 暴露并修复的治理问题
+
+- `cargo test --workspace` 原先把 Tauri 桌面壳和核心 Rust crate 混在一起，清理重建后会在缺少 sidecar 或 GTK/WebKit linker 时误报核心 Rust 回归。`rust-test`、`rust-clippy` 现在显式排除 `fast-nc-zarr-desktop`；桌面壳由专用 Tauri 构建任务验证。
+- Pixi 会注入 conda Linux linker，但 Tauri GTK/WebKit 开发库来自宿主系统；新增 `scripts/desktop_linker_env.sh` 和 `scripts/build_desktop.sh`，Linux 桌面构建显式使用宿主 linker。
+- 本机没有 `rpmbuild`。原先同时请求 deb/rpm 会在 RPM bundler 阶段长时间无进展；治理脚本默认在 Linux 只构建 deb，显式请求 RPM 且缺少 `rpmbuild` 时立即失败。CI 安装 `rpm` 并显式设置 `TAURI_BUNDLES=deb,rpm`。
+- 增加 `scripts/check_version_consistency.py` 和 `pixi run version-check`，校验 `VERSION`、Pixi、Python、Cargo、Tauri、npm 和运行时版本均一致。
+- CI 已加入版本检查、核心 Rust 测试、sidecar 前置构建、Linux Tauri 系统依赖安装和治理后的桌面构建脚本。
+
+### 当前验证边界
+
+- 本机 Linux deb 构建已验证；RPM 构建由 CI 安装 `rpm` 后验证。
+- Windows/macOS 只能在对应 runner 上验证，当前未在 Linux 交叉执行。
+- Tauri release 编译仍有 5 个未使用 Rust enum/function 警告；不影响构建成功，但应作为后续桌面代码清理项处理。
+- 本次未删除兼容 wrapper、字体副本或协议重复定义；`fast-nc-zarr-worker.spec` 与 `scripts/build_native.sh` 已删除并由新构建入口替代。
+
+- [x] 删除未引用且不可移植的 `fast-nc-zarr-worker.spec` 和 `scripts/build_native.sh`；构建职责已由 Pixi task 与跨平台 sidecar 脚本承接。
+
+
+最终回归补充：单进程 Python 回归再次通过 `188 passed`、`29 subtests passed`；sidecar spec 已隔离到 ignored 的 `build/fast-nc-zarr-worker/`，仓库根目录不会重新生成 `fast-nc-zarr-worker.spec`。桌面 package 已移除无测试文件的 Vitest/`desktop-test` 入口。

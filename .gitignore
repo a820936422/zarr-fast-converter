@@ -41,3 +41,10 @@ contracts/generated/
 # Locally built release packages; publish these as release assets instead of repository blobs
 release/*.deb
 release/*.rpm
+release/*.AppImage
+release/*.appimage
+release/*.tar.gz
+release/*.zip
+release/*.dmg
+release/*.msi
+release/*.whl

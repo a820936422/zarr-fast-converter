@@ -21,12 +21,18 @@ pixi run native-develop
 # when PyInstaller is available. Native builds remain usable without it.
 if command -v pyinstaller >/dev/null 2>&1; then
   NATIVE_MODULE="$(python -c 'import fast_nc_zarr._native as n; print(n.__file__)')"
+  BUILD_DIR="${PYINSTALLER_BUILD_DIR:-$ROOT/build/fast-nc-zarr-worker}"
+  DIST_DIR="${PYINSTALLER_DIST_DIR:-$ROOT/dist}"
+  mkdir -p "$BUILD_DIR" "$DIST_DIR"
   pyinstaller --noconfirm --clean --onefile \
     --name fast-nc-zarr-worker \
     --paths src \
+    --workpath "$BUILD_DIR" \
+    --specpath "$BUILD_DIR" \
+    --distpath "$DIST_DIR" \
     --add-binary "$NATIVE_MODULE:fast_nc_zarr" \
     src/fast_nc_zarr/application/desktop_worker/sidecar_main.py
-  WORKER="dist/fast-nc-zarr-worker"
+  WORKER="$DIST_DIR/fast-nc-zarr-worker"
 else
   echo "pyinstaller is unavailable; using the project Python worker at runtime" >&2
   exit 0
