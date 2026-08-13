@@ -38,6 +38,6 @@ apps/desktop/src-tauri/binaries/*
 
 # Generated desktop protocol bindings
 contracts/generated/
- # Locally built release packages; publish these as release assets instead of repository blobs
+# Locally built release packages; publish these as release assets instead of repository blobs
 release/*.deb
 release/*.rpm
