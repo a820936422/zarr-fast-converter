@@ -602,3 +602,38 @@ sha256sum src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf \
 - [ ] 当前用户文档与模块文档
 
 **最优先的实际动作是 Phase 1：清掉 12G `target`、280M `build`、245M `dist` 和前端缓存；这些动作不改变代码结构，却能立即把工作树从“构建机状态”恢复为“源码仓库状态”。**
+
+---
+
+## 11. 本次实际执行记录（2026-08-13）
+
+本次已按 A 类低风险项执行实际清理，并完成一项 B 类资源合并：
+
+### 已完成
+
+- [x] 删除 `.pixi/`（约 3.9G，可由 `pixi install` 重建）。
+- [x] 删除 `target/`（约 12G，可由 Cargo/Tauri/maturin 重建）。
+- [x] 删除 `build/` 和根 `dist/`（PyInstaller 中间/输出产物）。
+- [x] 删除 `apps/desktop/node_modules/`、`apps/desktop/dist/`、`.vite` 缓存（可由 `npm ci` 和 Vite build 重建）。
+- [x] 删除 `apps/desktop/src-tauri/binaries/`（sidecar 可由 `pixi run desktop-sidecar` 重建）。
+- [x] 删除 `.pytest_cache/`、全部已发现的 `__pycache__/` 和 `.pyc` 缓存。
+- [x] 删除 `src/fast_nc_zarr/_native*.so` 本地 native 构建产物。
+- [x] 删除 tracked 的 `release/fast-nc-zarr-icon.png`；保留 `apps/desktop/src-tauri/icons/icon.png` 唯一源图标。
+- [x] 修改 `pixi.toml:release-candidate`，不再把源图标复制为冗余 release 副本。
+- [x] 保留 `release/*.deb`、`release/*.rpm`，因为本次没有外部发布、checksum 归档或交付确认。
+- [x] 保留 `apps/desktop/src-tauri/gen/schemas/`，因为 `capabilities/default.json` 仍通过 `$schema` 引用其中的 `desktop-schema.json`。
+
+### 本次未执行
+
+- 未移动/删除 `Architecture/` 历史文档和 PNG 导出；需要先确认归档位置与预览/嵌入 XML 策略。
+- 未合并两份 Noto Sans SC 字体；Python GUI 与 React/Tauri 当前分别直接读取它们。
+- 未删除根入口 wrapper、`gui-legacy`、旧 GUI 页面、`fast-nc-zarr-worker.spec` 或 `scripts/build_native.sh`；这些仍涉及兼容调用或缺少外部使用确认。
+- 未改动协议 schema、Python/Rust/TypeScript 协议实现或版本字段；这些需要 codegen/发布流程改造后再处理。
+
+### 清理后观测
+
+- `.pixi/`、`target/`、`build/`、根 `dist/`、桌面 `node_modules/dist/binaries`、`.pytest_cache/` 均已不存在。
+- `git clean -ndX` 仅剩 Tauri 生成 schema 目录和未发布的 deb/rpm；没有残留 Python 缓存。
+- `release/*.deb`、`release/*.rpm` 仍被 `.gitignore` 覆盖。
+- 唯一保留的源图标 SHA-256 为 `7caed0b5ba81bbba515650019e18c658bee3bdba26898a77730d8d70ed5391f2`。
+- 本次未运行完整测试套件：清理同时删除了本地 Pixi/编译依赖环境；后续重建环境后按第 9 节命令验证。
