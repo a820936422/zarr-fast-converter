@@ -175,7 +175,8 @@ impl BackendCapability {
                 "raw.netcdf.convert",
                 &[
                     "NetCDF-4/classic",
-                    "float32/float64 variables",
+                    "float32/float64 time-lat-lon data variables",
+                    "numeric standard coordinates",
                     "Zarr v3 output",
                 ][..],
             ),

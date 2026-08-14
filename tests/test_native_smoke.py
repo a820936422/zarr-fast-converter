@@ -129,15 +129,29 @@ class RustNetcdfInspectTests(unittest.TestCase):
             with netCDF4.Dataset(path, "w", format="NETCDF4_CLASSIC") as dataset:
                 for name, size in (("time", 2), ("lat", 2), ("lon", 3)):
                     dataset.createDimension(name, size)
-                dataset.createVariable("time", "f8", ("time",))[:] = [0, 1]
-                dataset.createVariable("lat", "f4", ("lat",))[:] = [10, 20]
-                dataset.createVariable("lon", "f4", ("lon",))[:] = [100, 110, 120]
-                dataset.createVariable("value", "f4", ("time", "lat", "lon"))[:] = values
+                time = dataset.createVariable("time", "i2", ("time",))
+                time.units = "hours since 2000-01-01"
+                time[:] = [0, 1]
+                dataset.createVariable("lat", "i4", ("lat",))[:] = [10, 20]
+                dataset.createVariable("lon", "i4", ("lon",))[:] = [100, 110, 120]
+                value = dataset.createVariable(
+                    "value", "f4", ("time", "lat", "lon"), fill_value=np.nan
+                )
+                value.long_name = "relative humidity"
+                value[:] = values
             native = importlib.import_module("fast_nc_zarr._native")
             metrics = json.loads(native.convert_netcdf_json(str(path), str(target)))
             self.assertEqual(metrics["variables"], ["time", "lat", "lon", "value"])
-            with xr.open_zarr(target, consolidated=False, chunks=None) as result:
-                np.testing.assert_array_equal(result["value"].values, values)
+            with xr.open_zarr(
+                target, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+            ) as result:
+                np.testing.assert_array_equal(result["time"].values, [0, 1])
+                np.testing.assert_array_equal(result["lat"].values, [10, 20])
+                np.testing.assert_array_equal(result["lon"].values, [100, 110, 120])
+                self.assertEqual(result["time"].dtype, np.dtype("int16"))
+                self.assertEqual(result["lat"].dtype, np.dtype("int32"))
+                self.assertEqual(result["lon"].dtype, np.dtype("int32"))
+                self.assertEqual(result["value"].attrs["long_name"], "relative humidity")
 
 @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
 class RustZarrCrossBackendTests(unittest.TestCase):

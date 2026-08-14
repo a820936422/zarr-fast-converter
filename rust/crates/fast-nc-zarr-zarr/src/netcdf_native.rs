@@ -55,6 +55,7 @@ fn attribute_value(value: AttributeValue) -> Value {
         AttributeValue::Double(v) => serde_json::json!(v),
         AttributeValue::Doubles(v) => serde_json::json!(v),
         AttributeValue::Str(v) => serde_json::json!(v),
+        AttributeValue::Strs(v) if v.len() == 1 => serde_json::json!(v[0]),
         AttributeValue::Strs(v) => serde_json::json!(v),
     }
 }
@@ -65,8 +66,11 @@ fn attributes<'a>(
     let mut result = Map::new();
     for attribute in owner {
         let name = attribute.name().to_owned();
-        let value = attribute.value().map_err(|error| error.to_string())?;
-        result.insert(name, attribute_value(value));
+        let value = attribute_value(attribute.value().map_err(|error| error.to_string())?);
+        if name == "_FillValue" && value.is_null() {
+            continue;
+        }
+        result.insert(name, value);
     }
     Ok(result)
 }
@@ -113,14 +117,22 @@ pub fn inspect_netcdf(path: &Path) -> Result<NetcdfSummary, String> {
     let mut variables = Vec::new();
     let mut limitations = Vec::new();
     for variable in file.variables() {
+        let name = variable.name();
         let (dtype, numeric) = dtype(&variable.vartype());
         let variable_dimensions = variable
             .dimensions()
             .iter()
             .map(|dimension| dimension.name())
             .collect::<Vec<_>>();
-        if variable_dimensions.len() == 3 && !numeric {
-            limitations.push(format!("variable {} is not numeric", variable.name()));
+        let is_standard_coordinate = matches!(name.as_str(), "time" | "lat" | "lon")
+            && variable_dimensions == [name.clone()];
+        if !is_standard_coordinate
+            && (variable_dimensions != vec!["time".to_owned(), "lat".to_owned(), "lon".to_owned()]
+                || !numeric)
+        {
+            limitations.push(format!(
+                "variable {name} is not a numeric three-dimensional time/lat/lon variable"
+            ));
         }
         variables.push(NetcdfVariableSummary {
             name: variable.name(),
@@ -190,7 +202,11 @@ fn store_f32_array(
     for (key, value) in attrs {
         array.attributes_mut().insert(key.clone(), value.clone());
     }
-    array.store_metadata().map_err(|error| error.to_string())?;
+    array
+        .store_metadata_opt(
+            &zarrs::array::ArrayMetadataOptions::default().with_include_zarrs_metadata(false),
+        )
+        .map_err(|error| error.to_string())?;
     let grid = array
         .chunk_grid_shape()
         .iter()
@@ -239,7 +255,11 @@ fn store_f64_array(
     for (key, value) in attrs {
         array.attributes_mut().insert(key.clone(), value.clone());
     }
-    array.store_metadata().map_err(|error| error.to_string())?;
+    array
+        .store_metadata_opt(
+            &zarrs::array::ArrayMetadataOptions::default().with_include_zarrs_metadata(false),
+        )
+        .map_err(|error| error.to_string())?;
     let grid = array
         .chunk_grid_shape()
         .iter()
@@ -263,6 +283,116 @@ fn store_f64_array(
     Ok((values.len() * std::mem::size_of::<f64>()) as u64)
 }
 
+fn integer_chunk_values<T: Copy + Default>(
+    values: &[T],
+    shape: &[u64],
+    chunk_shape: &[usize],
+    chunk_indices: &[u64],
+) -> Result<Vec<T>, String> {
+    let expected = super::checked_product(shape).map_err(|error| error.to_string())?;
+    if values.len() != expected {
+        return Err(format!(
+            "values length {} does not match array element count {}",
+            values.len(),
+            expected
+        ));
+    }
+    let strides = super::row_major_strides(shape).map_err(|error| error.to_string())?;
+    let capacity = chunk_shape
+        .iter()
+        .try_fold(1_usize, |total, value| total.checked_mul(*value))
+        .ok_or_else(|| "chunk element count overflows usize".to_owned())?;
+    let mut output = Vec::with_capacity(capacity);
+    let mut local = vec![0_usize; chunk_shape.len()];
+    loop {
+        let mut source_offset = 0_usize;
+        let mut in_bounds = true;
+        for axis in 0..chunk_shape.len() {
+            let origin = usize::try_from(chunk_indices[axis])
+                .ok()
+                .and_then(|index| index.checked_mul(chunk_shape[axis]))
+                .ok_or_else(|| "chunk origin overflows usize".to_owned())?;
+            let coordinate = origin
+                .checked_add(local[axis])
+                .ok_or_else(|| "chunk coordinate overflows usize".to_owned())?;
+            let axis_size =
+                usize::try_from(shape[axis]).map_err(|_| "array shape exceeds usize".to_owned())?;
+            if coordinate >= axis_size {
+                in_bounds = false;
+                break;
+            }
+            source_offset = source_offset
+                .checked_add(
+                    coordinate
+                        .checked_mul(strides[axis])
+                        .ok_or_else(|| "source offset overflows usize".to_owned())?,
+                )
+                .ok_or_else(|| "source offset overflows usize".to_owned())?;
+        }
+        output.push(if in_bounds {
+            values[source_offset]
+        } else {
+            T::default()
+        });
+        if !super::increment_index(&mut local, chunk_shape) {
+            break;
+        }
+    }
+    Ok(output)
+}
+
+fn store_integer_array<
+    T: Copy + Default + zarrs::array::Element + Into<zarrs::array::builder::ArrayBuilderFillValue>,
+>(
+    store: std::sync::Arc<zarrs_filesystem::FilesystemStore>,
+    name: &str,
+    shape: &[u64],
+    dimensions: &[String],
+    values: &[T],
+    attrs: &Map<String, Value>,
+    data_type: zarrs::array::builder::ArrayBuilderDataType,
+    fill_value: T,
+) -> Result<u64, String> {
+    let chunks = shape
+        .iter()
+        .map(|value| (*value).min(64).max(1))
+        .collect::<Vec<_>>();
+    let mut builder =
+        zarrs::array::ArrayBuilder::new(shape.to_vec(), chunks, data_type, fill_value);
+    builder.dimension_names(Some(dimensions.to_vec()));
+    let mut array = builder
+        .build(store, &format!("/{name}"))
+        .map_err(|error| error.to_string())?;
+    for (key, value) in attrs {
+        array.attributes_mut().insert(key.clone(), value.clone());
+    }
+    array
+        .store_metadata_opt(
+            &zarrs::array::ArrayMetadataOptions::default().with_include_zarrs_metadata(false),
+        )
+        .map_err(|error| error.to_string())?;
+    let grid = array
+        .chunk_grid_shape()
+        .iter()
+        .map(|value| *value as usize)
+        .collect::<Vec<_>>();
+    let mut index = vec![0_usize; grid.len()];
+    loop {
+        let index_u64 = index.iter().map(|value| *value as u64).collect::<Vec<_>>();
+        let chunk_shape = array
+            .chunk_shape_usize(&index_u64)
+            .map_err(|error| error.to_string())?;
+        let chunk = integer_chunk_values(values, shape, &chunk_shape, &index_u64)?;
+        array
+            .store_chunk(&index_u64, chunk.as_slice())
+            .map_err(|error| error.to_string())?;
+        if !super::increment_index(&mut index, &grid) {
+            break;
+        }
+    }
+    Ok((values.len() * std::mem::size_of::<T>()) as u64)
+}
+
 pub fn convert_netcdf_to_zarr(
     input: &Path,
     output: &Path,
@@ -281,13 +411,13 @@ pub fn convert_netcdf_to_zarr(
             summary.limitations
         ));
     }
-    if summary
-        .variables
-        .iter()
-        .any(|item| !matches!(item.dtype.as_str(), "float32" | "float64"))
-    {
+    if summary.variables.iter().any(|item| {
+        let coordinate = matches!(item.name.as_str(), "time" | "lat" | "lon")
+            && item.dimensions == vec![item.name.clone()];
+        !coordinate && !matches!(item.dtype.as_str(), "float32" | "float64")
+    }) {
         return Err(
-            "native conversion currently supports float32 and float64 variables only".into(),
+            "native conversion supports float32/float64 time-lat-lon data variables and numeric standard coordinates".into(),
         );
     }
     std::fs::create_dir_all(output).map_err(|error| error.to_string())?;
@@ -331,6 +461,102 @@ pub fn convert_netcdf_to_zarr(
                     .get_values::<f64, _>(..)
                     .map_err(|error| error.to_string())?,
                 &attrs,
+            )?,
+            "int8" => store_integer_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<i8, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+                zarrs::array::data_type::int8().into(),
+                0_i8,
+            )?,
+            "int16" => store_integer_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<i16, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+                zarrs::array::data_type::int16().into(),
+                0_i16,
+            )?,
+            "int32" => store_integer_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<i32, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+                zarrs::array::data_type::int32().into(),
+                0_i32,
+            )?,
+            "int64" => store_integer_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<i64, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+                zarrs::array::data_type::int64().into(),
+                0_i64,
+            )?,
+            "uint8" => store_integer_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<u8, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+                zarrs::array::data_type::uint8().into(),
+                0_u8,
+            )?,
+            "uint16" => store_integer_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<u16, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+                zarrs::array::data_type::uint16().into(),
+                0_u16,
+            )?,
+            "uint32" => store_integer_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<u32, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+                zarrs::array::data_type::uint32().into(),
+                0_u32,
+            )?,
+            "uint64" => store_integer_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<u64, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+                zarrs::array::data_type::uint64().into(),
+                0_u64,
             )?,
             _ => unreachable!(),
         };
