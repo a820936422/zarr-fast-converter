@@ -160,6 +160,11 @@ impl BackendCapability {
             .collect::<Vec<_>>();
         capabilities.extend([
             OperationCapability::unsupported(
+                "zarr.rechunk_multi",
+                "native multi-variable publish path is not implemented in this phase",
+                &["use Python fallback"],
+            ),
+            OperationCapability::unsupported(
                 "raw.netcdf.inspect",
                 "native reader is not implemented in this phase",
                 &["use Python fallback"],
@@ -210,7 +215,7 @@ mod tests {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
         assert_eq!(capability.operations.len(), 13);
-        assert_eq!(capability.capabilities.len(), 18);
+        assert_eq!(capability.capabilities.len(), 19);
         let supported = capability
             .capabilities
             .iter()

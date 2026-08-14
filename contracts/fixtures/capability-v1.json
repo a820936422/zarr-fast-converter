@@ -31,6 +31,7 @@
     {"operation": "zarr.rechunk_f32", "supported": true, "reason": null, "limitations": ["single float32 data variable"]},
     {"operation": "zarr.rechunk_f32_codec", "supported": true, "reason": null, "limitations": ["single float32 data variable", "explicit lossless codec"]},
     {"operation": "zarr.rechunk_f32_cancel", "supported": true, "reason": null, "limitations": ["cooperative cancellation"]},
+    {"operation": "zarr.rechunk_multi", "supported": false, "reason": "native multi-variable publish path is not implemented in this phase", "limitations": ["use Python fallback"]},
     {"operation": "raw.netcdf.inspect", "supported": false, "reason": "native reader is not implemented in this phase", "limitations": ["use Python fallback"]},
     {"operation": "raw.netcdf.convert", "supported": false, "reason": "native reader is not implemented in this phase", "limitations": ["use Python fallback"]},
     {"operation": "resample.nearest", "supported": false, "reason": "native resampling is not implemented in this phase", "limitations": ["use Python fallback"]},

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   getBackendInfo,
   getNativeCapabilities,
+  inspectPipelineRecovery,
   inspectSource,
   inspectTimeMetadata,
   inspectZarr,
@@ -11,6 +12,7 @@ import {
   saveInspectionSnapshot,
   startNativeTask,
   startPipeline,
+  resumePipeline,
   type BackendCapability,
   type BackendInfo,
   type InspectionRequest,
@@ -50,6 +52,8 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("inspection");
   const [plan, setPlan] = useState<Record<string, unknown> | null>(null);
+  const [recoveryPath, setRecoveryPath] = useState("");
+  const [recoveryInspection, setRecoveryInspection] = useState<InspectionResult | null>(null);
   const [resample, setResample] = useState(false);
   const [resampleMethod, setResampleMethod] = useState("bilinear");
   const [resolution, setResolution] = useState(0.1);
@@ -57,7 +61,7 @@ function App() {
   const [targetMib, setTargetMib] = useState(128);
   const [recompress, setRecompress] = useState(false);
   const [compression, setCompression] = useState("auto");
-  const [backendMode, setBackendMode] = useState<BackendMode>("python");
+  const [backendMode, setBackendMode] = useState<BackendMode>("auto");
   const [favorites, setFavorites] = useState<string[]>([]);
   const [recentPaths, setRecentPaths] = useState<string[]>([]);
   const { events, tasks, cancel } = useTaskEvents();
@@ -231,6 +235,40 @@ function App() {
       setBusy(false);
     }
   };
+  const inspectRecovery = async () => {
+    if (!recoveryPath) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setRecoveryInspection(await inspectPipelineRecovery(recoveryPath));
+    } catch (reason) {
+      setError(reasonText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resumeRecovery = async () => {
+    if (!recoveryPath) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await resumePipeline({
+        output: outputPath || `${recoveryPath.replace(/[\\/]$/, "")}.recovered.zarr`,
+        input_dir: recoveryPath,
+        input_kind: "temporary",
+        inspection_kind: "temporary",
+        path: recoveryPath,
+        backend: backendMode,
+        validate: true,
+      });
+      setView("tasks");
+    } catch (reason) {
+      setError(reasonText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const stageIndex = stage === "input" ? 1 : stage === "time" ? 2 : 3;
   const canInspectTime = inputKind === "source" && Boolean(inputPath) && !busy;
@@ -298,7 +336,11 @@ function App() {
 
         {view === "pipeline" && <section className="content-grid"><article className="card hero-card"><span className="step-label">已锁定检查结果</span><h2>处理流程</h2><p>输入：{inputPath}</p><label className="field-label" htmlFor="output-path">输出 Zarr 目录</label><input id="output-path" value={outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`} onChange={(event) => setOutputPath(event.target.value)} /><div className="options-row"><label><input type="checkbox" checked={resample} onChange={(event) => setResample(event.target.checked)} />空间重采样</label><label><input type="checkbox" checked={rechunk} onChange={(event) => setRechunk(event.target.checked)} />重分块</label><label><input type="checkbox" checked={recompress} onChange={(event) => setRecompress(event.target.checked)} />重压缩</label></div>{resample && <div className="options-row"><label>方法 <select value={resampleMethod} onChange={(event) => setResampleMethod(event.target.value)}><option value="nearest_s2d">nearest_s2d</option><option value="nearest_d2s">nearest_d2s</option><option value="bilinear">bilinear</option><option value="conservative">conservative（Python）</option></select></label><label>分辨率 <input className="small-input" type="number" min="0" step="any" value={resolution} onChange={(event) => setResolution(Number(event.target.value))} /></label></div>}{rechunk && <div className="options-row"><label>目标 chunk MiB <input className="small-input" type="number" min="1" step="1" value={targetMib} onChange={(event) => setTargetMib(Number(event.target.value))} /></label></div>}{recompress && <div className="options-row"><label>压缩 <select value={compression} onChange={(event) => setCompression(event.target.value)}><option value="auto">自动</option><option value="zstd">Zstd</option><option value="blosc-lz4">Blosc LZ4</option><option value="gzip">Gzip</option></select></label></div>}<div className="options-row"><label>执行 backend <select value={backendMode} onChange={(event) => setBackendMode(event.target.value as BackendMode)}><option value="python">Python reference</option><option value="auto">Auto（按 capability）</option><option value="rust">Rust native（不支持则失败）</option></select></label></div>{backendMode !== "python" && <p className="helper-text">Auto/Rust 只会启用已通过 capability 的最终化操作；原始格式、复杂重采样和 pipeline 仍由 Python 处理。</p>}<div className="actions"><button className="secondary-button" disabled={busy} type="button" onClick={() => void runPreview()}>预览计划</button><button className="primary-button" disabled={busy} type="button" onClick={() => void runPipeline()}>启动任务</button></div>{plan && <div className="result-box"><strong>计划已生成</strong><p>{JSON.stringify(plan, null, 2)}</p></div>}</article><article className="card checklist-card"><h2>请求能力</h2><ul><li className="done">源数据检查</li><li className={resample ? "done" : ""}>空间重采样 {resample ? `（${resampleMethod}）` : "（未选择）"}</li><li className={rechunk ? "done" : ""}>重分块 {rechunk ? "（已选择）" : "（未选择）"}</li><li className={recompress ? "done" : ""}>重压缩 {recompress ? `（${compression}）` : "（未选择）"}</li></ul>{resampleMethod && <p className="helper-text">native status：{supported(`resample.${resampleMethod}`)?.supported ? "supported" : "Python fallback"}</p>}</article></section>}
 
-        {view === "tasks" && <section className="content-grid"><article className="card hero-card"><h2>任务历史</h2>{tasks.length === 0 ? <p>暂无任务。完成数据检查后可从处理流程启动。</p> : <div className="task-list">{tasks.map((task) => <div className="task-row" key={task.taskId}><div><strong>{task.command}</strong><small>{task.taskId}</small>{task.resource && <small>{task.resource.logicalCpus} CPU · 可用内存 {formatBytes(task.resource.memoryAvailableBytes)}</small>}</div><span className={`task-status ${task.status}`}>{task.status}</span>{(task.status === "running" || task.status === "cancelling") && <button className="secondary-button" type="button" onClick={() => void cancel(task.taskId)}>取消</button>}{task.manifest && <span className="manifest-path">{task.manifest}</span>}</div>)}</div>}</article><article className="card checklist-card"><h2>实时日志</h2><div className="event-log">{events.slice(-20).map((eve) => <p key={`${eve.request_id}-${eve.sequence}`}><strong>{eve.event}</strong> · {eve.stage || "—"}<br />{JSON.stringify(eve.payload)}</p>)}</div></article></section>}
+        {view === "tasks" && <section className="content-grid">
+          <article className="card hero-card"><h2>任务历史</h2>{tasks.length === 0 ? <p>暂无任务。完成数据检查后可从处理流程启动。</p> : <div className="task-list">{tasks.map((task) => <div className="task-row" key={task.taskId}><div><strong>{task.command}</strong><small>{task.taskId}</small>{task.resource && <small>{task.resource.logicalCpus} CPU · 可用内存 {formatBytes(task.resource.memoryAvailableBytes)}</small>}</div><span className={`task-status ${task.status}`}>{task.status}</span>{(task.status === "running" || task.status === "cancelling") && <button className="secondary-button" type="button" onClick={() => void cancel(task.taskId)}>取消</button>}{task.manifest && <span className="manifest-path">{task.manifest}</span>}</div>)}</div>}</article>
+          <article className="card checklist-card"><h2>任务恢复</h2><p className="helper-text">输入保留的 pipeline 临时目录，先检查 manifest/checkpoint，再恢复到新的输出目录。</p><label className="field-label" htmlFor="recovery-path">临时任务目录</label><div className="path-row"><input id="recovery-path" value={recoveryPath} onChange={(event) => setRecoveryPath(event.target.value)} placeholder="例如 /tmp/.../pipeline-..." /><button className="secondary-button" type="button" onClick={() => void inspectRecovery()}>检查</button></div><div className="actions"><button className="primary-button" type="button" disabled={!recoveryInspection || busy} onClick={() => void resumeRecovery()}>恢复任务</button></div>{recoveryInspection && <div className="result-box"><strong>恢复检查完成</strong><p>{recoveryInspection.report}</p></div>}</article>
+          <article className="card checklist-card"><h2>实时日志</h2><div className="event-log">{events.slice(-20).map((eve) => <p key={`${eve.request_id}-${eve.sequence}`}><strong>{eve.event}</strong> · {eve.stage || "—"}<br />{JSON.stringify(eve.payload)}</p>)}</div></article>
+        </section>}
 
         {view === "settings" && <section className="content-grid"><article className="card hero-card"><h2>路径设置</h2><p className="helper-text">路径只保存在当前桌面用户的 localStorage，不写入项目文件。</p><label className="field-label" htmlFor="settings-input-path">当前输入路径</label><div className="path-row"><input id="settings-input-path" value={inputPath} onChange={(event) => setInputPath(event.target.value)} placeholder="输入或选择目录" /><button className="secondary-button" type="button" onClick={() => void chooseInput()}>浏览</button></div><div className="actions"><button className="secondary-button" type="button" disabled={!inputPath} onClick={() => toggleFavorite(inputPath)}>{inputPath && favorites.includes(inputPath) ? "取消收藏" : "收藏当前路径"}</button><button className="primary-button" type="button" disabled={!inputPath} onClick={() => { rememberPath(inputPath); setView("inspection"); }}>使用此路径</button></div></article><article className="card checklist-card"><h2>收藏和最近目录</h2><div className="path-history"><strong>收藏</strong>{favorites.length ? favorites.map((path) => <div className="history-row" key={`favorite-${path}`}><button className="path-link" type="button" onClick={() => setInputPath(path)}>{path}</button><button className="icon-button" type="button" onClick={() => toggleFavorite(path)}>移除</button></div>) : <p className="helper-text">暂无收藏路径。</p>}<strong>最近使用</strong>{recentPaths.length ? recentPaths.map((path) => <div className="history-row" key={`recent-${path}`}><button className="path-link" type="button" onClick={() => setInputPath(path)}>{path}</button><button className="icon-button" type="button" onClick={() => toggleFavorite(path)}>{favorites.includes(path) ? "已收藏" : "收藏"}</button></div>) : <p className="helper-text">暂无最近目录。</p>}</div></article></section>}
 

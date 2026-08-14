@@ -130,6 +130,7 @@ export const previewPipeline = (payload: PipelinePayload) =>
   invoke<Record<string, unknown>>("preview_pipeline", { payload });
 export const startPipeline = (payload: PipelinePayload) => invoke<string>("start_pipeline", { payload });
 export const resumePipeline = (payload: PipelinePayload) => invoke<string>("resume_pipeline", { payload });
+export const inspectPipelineRecovery = (path: string) => invoke<InspectionResult>("inspect_pipeline_recovery", { path });
 export const getTask = (taskId: string) => invoke<TaskSummary | null>("get_task", { taskId });
 export const startNativeTask = (request: NativeTaskRequest) => invoke<string>("start_native_task", { request });
 export const listTasks = () => invoke<TaskSummary[]>("list_tasks");

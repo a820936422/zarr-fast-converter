@@ -11,14 +11,17 @@
 > 当前版本：`1.7.2`
 
 本文件只保留当前真实状态、已经完成的治理工作和仍然可执行的清理项。v1.7.2 Native-first
-开发已完成 P0 capability contract 地基，但默认 Python backend、复杂格式 fallback 和
-PySide6 legacy 路径仍保留；开发细节见 [`v1.7.2-development-plan.md`](v1.7.2-development-plan.md)。
+已完成 P0/P1、React parity 基础、Tauri pipeline 默认 `backend=auto` 和 P3 float64 native
+扩展；默认 Python backend 仍是 legacy CLI/PySide6 与未指定 payload 的兼容保守值，复杂格式
+fallback、Python validation oracle 和 PySide6 legacy 路径仍保留。P4/P5 正确性与发布决策门
+未通过前，不删除 worker、PySide6、字体资源或兼容入口；开发细节见
+[`v1.7.2-development-plan.md`](v1.7.2-development-plan.md)。
 
 ## 1. 结论
 
 项目源码目录已经完成第一轮结构收敛，当前“目录很大”的主要原因是**本地重建后的 ignored 构建环境和发布包**，不是 tracked 源码失控：
 
-- Git 仅跟踪 178 个文件；`.git` pack 约 13.14 MiB。
+- Git 仅跟踪 183 个文件；`.git` pack 约 13.14 MiB。
 - 根目录旧的 `Architecture/` 已移除，当前架构文档集中在 `docs/architecture/`。
 - `target/`、`.pixi/`、PyInstaller、Vite、npm 和 Tauri sidecar 产物均已加入忽略规则，可按需删除并重建。
 - `release/` 中的 deb/rpm 是本地发布缓存，不在 Git 跟踪范围，也不在当前分支历史中；它们仍需完成外部发布或备份后才能删除。

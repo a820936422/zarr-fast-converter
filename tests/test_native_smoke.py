@@ -10,7 +10,7 @@ import numpy as np
 import xarray as xr
 import zarr
 
-from fast_nc_zarr._backend import resolve_backend, rust_capability
+from fast_nc_zarr._backend import BackendUnavailableError, resolve_backend, rust_capability
 from fast_nc_zarr.rechunking.native import RustRechunkPlan, run_rust_rechunk
 
 
@@ -74,6 +74,11 @@ class NativePreparationTests(unittest.TestCase):
     def test_auto_backend_resolves_native_float64_rechunk_capability(self) -> None:
         expected = "rust" if _CAPABILITY.supported and "zarr.rechunk_f64" in _CAPABILITY.operations else "python"
         self.assertEqual(resolve_backend("auto", "rechunk_f64"), expected)
+    def test_standard_raw_and_resample_operations_remain_explainable_fallbacks(self) -> None:
+        for operation in ("raw.netcdf.inspect", "raw.netcdf.convert", "resample.nearest", "resample.bilinear"):
+            self.assertEqual(resolve_backend("auto", operation), "python")
+            with self.assertRaises(BackendUnavailableError):
+                resolve_backend("rust", operation)
 
 
 @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
@@ -174,6 +179,36 @@ class RustZarrCrossBackendTests(unittest.TestCase):
 
 
 
+
+    def test_auto_multi_variable_rechunk_records_python_fallback(self) -> None:
+        from fast_nc_zarr.application.services import RechunkConfig, run_rechunk as run_service_rechunk
+
+        source = Path(self.tempdir.name) / "multi-fallback-source.zarr"
+        target = Path(self.tempdir.name) / "multi-fallback-target.zarr"
+        values = np.arange(2 * 3 * 4, dtype="float32").reshape(2, 3, 4)
+        xr.Dataset(
+            {
+                "value": (("time", "lat", "lon"), values),
+                "quality": (("time", "lat", "lon"), values + 100),
+            },
+            coords={"time": np.arange(2), "lat": np.arange(3), "lon": np.arange(4)},
+        ).to_zarr(source, mode="w", consolidated=False, zarr_format=3)
+        metrics = run_service_rechunk(
+            RechunkConfig(
+                input=source,
+                output=target,
+                target_mib=1,
+                workers=1,
+                backend="auto",
+                compression="none",
+            )
+        )
+        self.assertEqual(metrics["backend"], "python")
+        self.assertTrue(metrics["backend_fallback"])
+        self.assertIn("只支持一个数据变量", str(metrics["backend_fallback_reason"]))
+        with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as dataset:
+            np.testing.assert_array_equal(dataset["value"].values, values)
+            np.testing.assert_array_equal(dataset["quality"].values, values + 100)
 
     def test_rust_rechunk_uses_bounded_parallel_workers(self) -> None:
         source = f"{self.tempdir.name}/parallel-source.zarr"
