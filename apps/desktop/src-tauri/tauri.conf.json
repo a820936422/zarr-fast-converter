@@ -37,7 +37,7 @@
     "linux": {
       "rpm": {
         "compression": {
-          "type": "zstd",
+          "type": "gzip",
           "level": 1
         }
       }
