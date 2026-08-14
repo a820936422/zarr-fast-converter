@@ -312,6 +312,9 @@ def _dispatch(request: Request, output: TextIO, cancel_event: ThreadEvent) -> No
         sink.emit("cancelled", {"reason": "cancel requested"}, stage="worker")
         return
     sink.emit("started", stage=request.command)
+    resource_snapshot = request.payload.get("resource_snapshot")
+    if request.command in {"run_pipeline", "resume_pipeline"} and isinstance(resource_snapshot, dict):
+        sink.emit("resource", resource_snapshot, stage="resources")
     if request.command == "get_capabilities":
         from ..._backend import rust_capability
 

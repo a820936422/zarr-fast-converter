@@ -1,7 +1,9 @@
 mod commands;
 mod error;
+mod native;
 mod pipeline;
 mod protocol;
+mod resource;
 mod tasks;
 mod worker;
 use serde::Serialize;
@@ -26,8 +28,6 @@ fn get_backend_info() -> BackendInfo {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(commands::AppState::default())
-        .manage(tasks::TaskRegistry::default())
         .invoke_handler(tauri::generate_handler![
             get_backend_info,
             commands::worker_capabilities,
@@ -38,6 +38,7 @@ pub fn run() {
             tasks::get_task,
             tasks::list_tasks,
             tasks::cancel_task,
+            native::start_native_task,
             pipeline::preview_pipeline,
             pipeline::start_pipeline,
             pipeline::resume_pipeline,

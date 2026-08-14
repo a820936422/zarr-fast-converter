@@ -16,6 +16,7 @@ COMMANDS = frozenset(
         "preview_pipeline",
         "run_pipeline",
         "resume_pipeline",
+        "native_task",
         "cancel_task",
         "shutdown",
     }

@@ -1,5 +1,5 @@
 use crate::error::{AppError, ErrorKind};
-use crate::protocol::{decode_event, EventEnvelope, RequestEnvelope, PROTOCOL_VERSION};
+use crate::protocol::{decode_event, EventEnvelope, RequestEnvelope};
 use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Write};
@@ -76,6 +76,22 @@ impl WorkerProcess {
         })
     }
     pub fn send(&mut self, request: &RequestEnvelope) -> Result<Vec<EventEnvelope>, AppError> {
+        let mut events = Vec::new();
+        self.send_streaming(request, |event| {
+            events.push(event.clone());
+            Ok(())
+        })?;
+        Ok(events)
+    }
+
+    pub fn send_streaming<F>(
+        &mut self,
+        request: &RequestEnvelope,
+        mut on_event: F,
+    ) -> Result<EventEnvelope, AppError>
+    where
+        F: FnMut(&EventEnvelope) -> Result<(), AppError>,
+    {
         request
             .validate()
             .map_err(|error| AppError::new(ErrorKind::InvalidRequest, error).at_stage("request"))?;
@@ -86,7 +102,6 @@ impl WorkerProcess {
         self.stdin
             .flush()
             .map_err(|error| AppError::new(ErrorKind::WorkerStartFailed, error.to_string()))?;
-        let mut events = Vec::new();
         loop {
             let mut line = String::new();
             let count = self.stdout.read_line(&mut line).map_err(|error| {
@@ -112,9 +127,9 @@ impl WorkerProcess {
             }
             self.check_sequence(&event)?;
             let terminal = event.is_terminal();
-            events.push(event);
+            on_event(&event)?;
             if terminal {
-                return Ok(events);
+                return Ok(event);
             }
         }
     }
@@ -158,8 +173,4 @@ pub type SharedWorker = Arc<Mutex<Option<WorkerProcess>>>;
 
 pub fn new_shared_worker() -> SharedWorker {
     Arc::new(Mutex::new(None))
-}
-
-pub fn protocol_version() -> u32 {
-    PROTOCOL_VERSION
 }

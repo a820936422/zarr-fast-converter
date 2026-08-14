@@ -34,6 +34,7 @@ Supported commands:
 - `run_pipeline`
 - `resume_pipeline`
 - `cancel_task`
+- `native_task`（由 Tauri Rust native runtime 执行，不转发给 Python worker）
 - `shutdown`
 
 ## Event envelope

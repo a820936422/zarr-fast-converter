@@ -25,6 +25,35 @@ class ProtocolTests(unittest.TestCase):
         events = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([event["event"] for event in events], ["accepted", "started", "finished"])
         self.assertEqual(events[-1]["payload"]["backend"], "python")
+    def test_pipeline_request_forwards_rust_resource_snapshot(self) -> None:
+        request = {
+            "protocol_version": 1,
+            "request_id": "resource-request",
+            "task_id": "resource-task",
+            "command": "run_pipeline",
+            "payload": {
+                "resource_snapshot": {
+                    "capturedAtMs": 1,
+                    "logicalCpus": 2,
+                    "memoryTotalBytes": 3,
+                    "memoryAvailableBytes": 4,
+                }
+            },
+        }
+        result = subprocess.run(
+            [sys.executable, "-m", "fast_nc_zarr.application.desktop_worker"],
+            cwd=PROJECT,
+            input=json.dumps(request) + "\n",
+            text=True,
+            capture_output=True,
+            check=True,
+            env={**os.environ, "PYTHONPATH": str(PROJECT / "src")},
+        )
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(events[2]["event"], "resource")
+        self.assertEqual(events[2]["payload"]["logicalCpus"], 2)
+        self.assertEqual(events[-1]["event"], "failed")
+
 
     def test_invalid_request_returns_structured_failure(self) -> None:
         result = subprocess.run(

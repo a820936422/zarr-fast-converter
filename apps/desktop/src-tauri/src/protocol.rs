@@ -12,6 +12,7 @@ const COMMANDS: &[&str] = &[
     "preview_pipeline",
     "run_pipeline",
     "resume_pipeline",
+    "native_task",
     "cancel_task",
     "shutdown",
 ];
@@ -50,19 +51,6 @@ pub struct EventEnvelope {
     #[serde(default)]
     pub stage: Option<String>,
     pub payload: Map<String, Value>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ErrorPayload {
-    pub kind: String,
-    pub message: String,
-    pub retryable: bool,
-    #[serde(default)]
-    pub stage: Option<String>,
-    #[serde(default)]
-    pub details: Map<String, Value>,
-    #[serde(default)]
-    pub manifest: Option<String>,
 }
 
 impl RequestEnvelope {
@@ -110,13 +98,6 @@ pub fn decode_event(line: &str) -> Result<EventEnvelope, String> {
         .map_err(|error| format!("invalid worker JSON event: {error}"))?;
     event.validate()?;
     Ok(event)
-}
-
-pub fn payload_value(payload: &Map<String, Value>, key: &str) -> Result<Value, String> {
-    payload
-        .get(key)
-        .cloned()
-        .ok_or_else(|| format!("missing payload field: {key}"))
 }
 
 #[cfg(test)]

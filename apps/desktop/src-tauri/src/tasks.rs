@@ -4,13 +4,35 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::error::{AppError, ErrorKind};
 use crate::protocol::{EventEnvelope, RequestEnvelope};
+use crate::resource::ResourceSnapshot;
 use crate::worker::{SharedWorker, WorkerProcess};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    Running,
+    Cancelling,
+    Finished,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTaskRequest {
+    pub operation: String,
+    #[serde(default)]
+    pub payload: Map<String, Value>,
+}
+pub type TaskRequest = NativeTaskRequest;
+
+pub type TaskEvent = EventEnvelope;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,11 +40,12 @@ pub struct TaskSummary {
     pub task_id: String,
     pub request_id: String,
     pub command: String,
-    pub status: String,
+    pub status: TaskStatus,
     pub manifest: Option<String>,
     pub error: Option<Value>,
     pub cancellation_file: Option<String>,
     pub started_at: u64,
+    pub resource: Option<ResourceSnapshot>,
 }
 
 #[derive(Clone, Default)]
@@ -59,9 +82,13 @@ impl TaskRegistry {
     }
 
     pub fn cancellation_file(&self, task_id: &str) -> Result<Option<PathBuf>, AppError> {
-        Ok(self
-            .get(task_id)?
-            .and_then(|task| task.cancellation_file.map(PathBuf::from)))
+        Ok(self.get(task_id)?.and_then(|task| {
+            if matches!(task.status, TaskStatus::Running | TaskStatus::Cancelling) {
+                task.cancellation_file.map(PathBuf::from)
+            } else {
+                None
+            }
+        }))
     }
 
     pub fn mark_cancelling(&self, task_id: &str) -> Result<(), AppError> {
@@ -72,19 +99,33 @@ impl TaskRegistry {
         let task = tasks.get_mut(task_id).ok_or_else(|| {
             AppError::new(ErrorKind::PathNotFound, format!("unknown task: {task_id}"))
         })?;
-        if task.status == "running" {
-            task.status = "cancelling".to_string();
+        if task.status == TaskStatus::Running {
+            task.status = TaskStatus::Cancelling;
         }
         Ok(())
     }
 
+    pub fn update_resource(
+        &self,
+        task_id: &str,
+        resource: ResourceSnapshot,
+    ) -> Result<(), AppError> {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| AppError::new(ErrorKind::Unknown, "task registry lock poisoned"))?;
+        if let Some(task) = tasks.get_mut(task_id) {
+            task.resource = Some(resource);
+        }
+        Ok(())
+    }
     pub fn update_failure(&self, task_id: &str, error: AppError) -> Result<(), AppError> {
         let mut tasks = self
             .tasks
             .lock()
             .map_err(|_| AppError::new(ErrorKind::Unknown, "task registry lock poisoned"))?;
         if let Some(task) = tasks.get_mut(task_id) {
-            task.status = "failed".to_string();
+            task.status = TaskStatus::Failed;
             task.error = Some(
                 serde_json::to_value(error)
                     .unwrap_or_else(|_| Value::String("worker failed".to_string())),
@@ -96,7 +137,7 @@ impl TaskRegistry {
     pub fn update_terminal(
         &self,
         task_id: &str,
-        event: Option<&EventEnvelope>,
+        event: Option<&TaskEvent>,
     ) -> Result<(), AppError> {
         let mut tasks = self
             .tasks
@@ -105,24 +146,25 @@ impl TaskRegistry {
         let Some(task) = tasks.get_mut(task_id) else {
             return Ok(());
         };
-        let Some(event) = event else {
-            task.status = "failed".to_string();
-            task.error = Some(Value::String(
-                "worker returned no terminal event".to_string(),
-            ));
-            return Ok(());
-        };
-        match event.event.as_str() {
-            "finished" => {
-                task.status = "finished".to_string();
-                task.manifest = find_manifest(&Value::Object(event.payload.clone()));
+        match event {
+            None => {
+                task.status = TaskStatus::Failed;
+                task.error = Some(Value::String(
+                    "worker returned no terminal event".to_string(),
+                ));
             }
-            "cancelled" => task.status = "cancelled".to_string(),
-            "failed" => {
-                task.status = "failed".to_string();
-                task.error = event.payload.get("error").cloned();
-            }
-            _ => task.status = "failed".to_string(),
+            Some(event) => match event.event.as_str() {
+                "finished" => {
+                    task.status = TaskStatus::Finished;
+                    task.manifest = find_manifest(&Value::Object(event.payload.clone()));
+                }
+                "cancelled" => task.status = TaskStatus::Cancelled,
+                "failed" => {
+                    task.status = TaskStatus::Failed;
+                    task.error = event.payload.get("error").cloned();
+                }
+                _ => task.status = TaskStatus::Failed,
+            },
         }
         if let Some(path) = &task.cancellation_file {
             let _ = fs::remove_file(path);
@@ -180,7 +222,7 @@ fn ensure_worker(
 pub(crate) fn send_request(
     shared: &SharedWorker,
     request: &RequestEnvelope,
-) -> Result<Vec<EventEnvelope>, AppError> {
+) -> Result<Vec<TaskEvent>, AppError> {
     let mut worker = ensure_worker(shared)?;
     worker
         .as_mut()
@@ -188,18 +230,24 @@ pub(crate) fn send_request(
         .send(request)
 }
 
-pub(crate) fn send_dedicated(request: &RequestEnvelope) -> Result<Vec<EventEnvelope>, AppError> {
+pub(crate) fn send_dedicated_streaming<F>(
+    request: &RequestEnvelope,
+    on_event: F,
+) -> Result<TaskEvent, AppError>
+where
+    F: FnMut(&TaskEvent) -> Result<(), AppError>,
+{
     let mut worker = WorkerProcess::spawn()?;
-    worker.send(request)
+    worker.send_streaming(request, on_event)
 }
 
-fn terminal_event(events: &[EventEnvelope]) -> Result<&EventEnvelope, AppError> {
+fn terminal_event(events: &[TaskEvent]) -> Result<&TaskEvent, AppError> {
     events
         .last()
         .ok_or_else(|| AppError::new(ErrorKind::WorkerProtocolError, "worker returned no events"))
 }
 
-pub(crate) fn payload_or_error(events: Vec<EventEnvelope>) -> Result<Value, AppError> {
+pub(crate) fn payload_or_error(events: Vec<TaskEvent>) -> Result<Value, AppError> {
     let terminal = terminal_event(&events)?;
     if terminal.event == "failed" {
         return Err(AppError::new(
@@ -211,7 +259,28 @@ pub(crate) fn payload_or_error(events: Vec<EventEnvelope>) -> Result<Value, AppE
     Ok(Value::Object(terminal.payload.clone()))
 }
 
-pub(crate) fn emit_task_event(app: &AppHandle, event: &EventEnvelope) -> Result<(), AppError> {
+pub(crate) fn failed_event(
+    request: &RequestEnvelope,
+    error: &AppError,
+    sequence: u64,
+) -> TaskEvent {
+    let mut payload = Map::new();
+    payload.insert(
+        "error".to_string(),
+        serde_json::to_value(error).unwrap_or_else(|_| Value::String("worker failed".to_string())),
+    );
+    TaskEvent {
+        protocol_version: 1,
+        request_id: request.request_id.clone(),
+        task_id: request.task_id.clone(),
+        sequence,
+        event: "failed".to_string(),
+        stage: Some(error.stage.clone().unwrap_or_else(|| "worker".to_string())),
+        payload,
+    }
+}
+
+pub(crate) fn emit_task_event(app: &AppHandle, event: &TaskEvent) -> Result<(), AppError> {
     app.emit("task-event", event)
         .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))
 }
@@ -224,6 +293,11 @@ pub fn get_task(
     registry.get(&task_id)
 }
 
+pub(crate) fn progress_path(task_id: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("fast-nc-zarr-tauri")
+        .join(format!("{task_id}.progress.json"))
+}
 #[tauri::command]
 pub fn list_tasks(registry: State<'_, TaskRegistry>) -> Result<Vec<TaskSummary>, AppError> {
     registry.list()
@@ -252,4 +326,66 @@ pub(crate) fn cancellation_path(task_id: &str) -> PathBuf {
     std::env::temp_dir()
         .join("fast-nc-zarr-tauri")
         .join(format!("{task_id}.cancel"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TaskEvent, TaskRegistry, TaskStatus, TaskSummary};
+    use crate::resource::ResourceSnapshot;
+    use serde_json::json;
+    use std::fs;
+
+    fn task(path: &str) -> TaskSummary {
+        TaskSummary {
+            task_id: "task-1".to_string(),
+            request_id: "request-1".to_string(),
+            command: "native_task".to_string(),
+            status: TaskStatus::Running,
+            manifest: None,
+            error: None,
+            cancellation_file: Some(path.to_string()),
+            started_at: 1,
+            resource: Some(ResourceSnapshot {
+                captured_at_ms: 1,
+                logical_cpus: 1,
+                memory_total_bytes: 2,
+                memory_available_bytes: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn terminal_transition_cleans_cancellation_and_manifest() {
+        let path =
+            std::env::temp_dir().join(format!("fast-nc-zarr-task-test-{}", std::process::id()));
+        fs::write(&path, b"cancel").expect("create cancellation file");
+        let registry = TaskRegistry::default();
+        registry
+            .insert(task(path.to_str().expect("utf8 path")))
+            .expect("insert task");
+        let event = TaskEvent {
+            protocol_version: 1,
+            request_id: "request-1".to_string(),
+            task_id: Some("task-1".to_string()),
+            sequence: 3,
+            event: "finished".to_string(),
+            stage: Some("native".to_string()),
+            payload: serde_json::from_value(json!({"manifest": "/tmp/manifest.json"}))
+                .expect("payload object"),
+        };
+        registry
+            .update_terminal("task-1", Some(&event))
+            .expect("terminal update");
+        let current = registry
+            .get("task-1")
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(current.status, TaskStatus::Finished);
+        assert_eq!(current.manifest.as_deref(), Some("/tmp/manifest.json"));
+        assert!(!path.exists());
+        assert!(registry
+            .cancellation_file("task-1")
+            .expect("cancel handle")
+            .is_none());
+    }
 }

@@ -71,6 +71,25 @@ export type InspectionResult = {
 
 export type PipelinePayload = Record<string, unknown> & { output: string };
 
+export type ResourceSnapshot = {
+  capturedAtMs: number;
+  logicalCpus: number;
+  memoryTotalBytes: number;
+  memoryAvailableBytes: number;
+};
+
+export type NativeInspectTaskRequest = {
+  operation: "zarr.inspect";
+  payload: { path: string; array_path: string };
+};
+
+export type NativeRechunkTaskRequest = {
+  operation: "zarr.rechunk_f32";
+  payload: Record<string, unknown>;
+};
+
+export type NativeTaskRequest = NativeInspectTaskRequest | NativeRechunkTaskRequest;
+
 export type TaskSummary = {
   taskId: string;
   requestId: string;
@@ -80,6 +99,7 @@ export type TaskSummary = {
   error: Record<string, unknown> | null;
   cancellationFile: string | null;
   startedAt: number;
+  resource: ResourceSnapshot | null;
 };
 
 export type TaskEvent = {
@@ -106,6 +126,7 @@ export const previewPipeline = (payload: PipelinePayload) =>
 export const startPipeline = (payload: PipelinePayload) => invoke<string>("start_pipeline", { payload });
 export const resumePipeline = (payload: PipelinePayload) => invoke<string>("resume_pipeline", { payload });
 export const getTask = (taskId: string) => invoke<TaskSummary | null>("get_task", { taskId });
+export const startNativeTask = (request: NativeTaskRequest) => invoke<string>("start_native_task", { request });
 export const listTasks = () => invoke<TaskSummary[]>("list_tasks");
 export const cancelTask = (taskId: string) => invoke<void>("cancel_task", { taskId });
 export const pickDirectory = () => open({ directory: true, multiple: false });

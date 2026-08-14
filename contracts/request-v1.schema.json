@@ -10,7 +10,7 @@
     "request_id": {"type": "string", "minLength": 1},
     "task_id": {"type": ["string", "null"]},
     "command": {
-      "enum": ["get_capabilities", "inspect_source", "inspect_zarr", "inspect_time_metadata", "save_inspection_snapshot", "preview_pipeline", "run_pipeline", "resume_pipeline", "cancel_task", "shutdown"]
+      "enum": ["get_capabilities", "inspect_source", "inspect_zarr", "inspect_time_metadata", "save_inspection_snapshot", "preview_pipeline", "run_pipeline", "resume_pipeline", "native_task", "cancel_task", "shutdown"]
     },
     "payload": {"type": "object"}
   }
