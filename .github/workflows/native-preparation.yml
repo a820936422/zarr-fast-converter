@@ -6,6 +6,9 @@ on:
       - main
       - develop
   pull_request:
+concurrency:
+  group: native-preparation-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -88,9 +91,8 @@ jobs:
         run: npm --prefix apps/desktop exec tauri info
       - name: Build Linux deb and rpm packages
         env:
-          CI: false
           TAURI_BUNDLES: deb,rpm
-        run: bash scripts/build_desktop.sh --target x86_64-unknown-linux-gnu
+        run: bash scripts/build_desktop.sh --target x86_64-unknown-linux-gnu --ci --no-sign
       - name: Verify Linux packages
         shell: bash
         run: |
