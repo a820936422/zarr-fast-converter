@@ -23,7 +23,7 @@ pixi run gui
 ```
 
 `pixi run gui` 调用 `scripts/desktop_dev.sh`，脚本会设置桌面 Rust linker 环境并启动 Tauri dev window。
-在 Linux Wayland 会话中，如果存在可用的 X11 display，Tauri 会自动使用 X11 fallback，避免 WebKitGTK 因 Wayland protocol error 无法创建窗口。需要强制选择时可设置 `FAST_NC_ZARR_DISPLAY_BACKEND=x11` 或 `FAST_NC_ZARR_DISPLAY_BACKEND=wayland`。
+在 Linux Wayland 会话中，如果存在可用的 X11 display，Tauri 会自动使用 X11 fallback，避免 WebKitGTK 因 Wayland protocol error 无法创建窗口。需要强制选择时可设置 `FAST_NC_ZARR_DISPLAY_BACKEND=x11` 或 `FAST_NC_ZARR_DISPLAY_BACKEND=wayland`；强制 `wayland` 会绕过自动回退，只有当前 compositor 支持所需协议时才应使用。
 
 直接使用 npm：
 
