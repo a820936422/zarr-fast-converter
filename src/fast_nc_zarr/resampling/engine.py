@@ -17,11 +17,12 @@ import numpy as np
 import xarray as xr
 import zarr
 
+from .._backend import resolve_backend
 from ..metadata import sanitize_cf_references
 from ..rechunking.models import DatasetInfo, VariableInfo
 from ..publication import preflight_writable, publish_staging
-from ..runtime import configure_process_runtime, spawn_context
 from ..writer import compressor_from_spec
+from ..runtime import configure_process_runtime, spawn_context
 from ..system import effective_resource_budget
 from .autotune import (
     resolve_auto_space_workers,
@@ -1976,6 +1977,62 @@ def _apply_data_dependent_post_replacements(
             array[region] = replaced.astype(array.dtype, copy=False)
     return statistics, mode
 
+def _native_source_has_no_codec(path: Path, plan: ResamplePlan) -> bool:
+    try:
+        group = zarr.open_group(path, mode="r")
+        return all(not tuple(group[item.name].compressors) for item in plan.inspection.info.data_variables)
+    except (KeyError, OSError, ValueError, TypeError):
+        return False
+
+
+
+def _run_native_regular_resample(config: ResampleConfig, plan: ResamplePlan, *, cancel_event=None) -> dict[str, object]:
+    source_path = Path(config.input).expanduser().resolve()
+    target_path = Path(config.output).expanduser().resolve()
+    if config.before_replacements.data_dependent or config.after_replacements.data_dependent:
+        raise ResampleExecutionError("native regular resampling does not support data-dependent replacements")
+    native = __import__("fast_nc_zarr._native", fromlist=["resample_f32_json"])
+    source = xr.open_zarr(source_path, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False)
+    staging = target_path.parent / f".{target_path.name}.native-resample-{uuid4().hex}.tmp"
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ResampleExecutionError("任务已取消，未生成输出。")
+        lat = np.asarray(source["lat"].values, dtype="float32")
+        lon = np.asarray(source["lon"].values, dtype="float32")
+        variables = {}
+        for item in plan.inspection.info.data_variables:
+            if item.dims != ("time", "lat", "lon") or str(item.dtype) != "float32":
+                raise ResampleExecutionError("native regular resampling requires float32 (time, lat, lon) variables")
+            values = np.asarray(source[item.name].values, dtype="float32")
+            request = {
+                "values": values.reshape(-1).tolist(),
+                "shape": list(values.shape),
+                "source_lat": lat.tolist(),
+                "source_lon": lon.tolist(),
+                "target_lat": np.asarray(plan.target.lat, dtype="float32").tolist(),
+                "target_lon": np.asarray(plan.target.lon, dtype="float32").tolist(),
+                "method": "nearest" if plan.method.startswith("nearest") else "bilinear",
+            }
+            result = json.loads(native.resample_f32_json(json.dumps(request)))
+            variables[item.name] = (("time", "lat", "lon"), np.asarray(result["values"], dtype="float32").reshape(result["shape"]), dict(source[item.name].attrs))
+        output = xr.Dataset(variables, coords={"time": source["time"].values, "lat": plan.target.lat, "lon": plan.target.lon}, attrs=dict(source.attrs))
+        for name, chunks in plan.output_chunks.items():
+            if name in output:
+                output[name].encoding["chunks"] = tuple(int(value) for value in chunks)
+        staging.mkdir(parents=False, exist_ok=False)
+        output.to_zarr(staging, mode="w", consolidated=False, zarr_format=3)
+        output.close()
+        if cancel_event is not None and cancel_event.is_set():
+            raise ResampleExecutionError("任务已取消，未发布输出。")
+        if config.validate:
+            _validate_output(source, staging, plan)
+        publish_staging(staging, target_path, "resample-native", overwrite=config.overwrite, require_zarr_v3=True)
+        logical_bytes = sum(int(np.asarray(source[item.name]).size) * 4 for item in plan.inspection.info.data_variables)
+        return {"backend": "rust", "backend_fallback": False, "output": str(target_path), "logical_bytes": logical_bytes, "physical_bytes": _directory_size(target_path), "method": plan.method}
+    finally:
+        source.close()
+        shutil.rmtree(staging, ignore_errors=True)
+
 
 def run_resample(
     config: ResampleConfig,
@@ -1987,6 +2044,16 @@ def run_resample(
     validate_resampling_environment()
     plan = plan or plan_resample(config)
     requested_plan = plan
+    native_operation = "resample.nearest" if plan.method.startswith("nearest") else "resample.bilinear"
+    if (
+        plan.method in {"nearest_s2d", "bilinear"}
+        and resolve_backend("auto", native_operation) == "rust"
+        and not config.before_replacements.rules
+        and not config.after_replacements.rules
+        and all(item.dims == ("time", "lat", "lon") and str(item.dtype) == "float32" for item in plan.inspection.info.data_variables)
+        and _native_source_has_no_codec(Path(config.input), plan)
+    ):
+        return _run_native_regular_resample(config, plan, cancel_event=cancel_event)
     source_path = Path(config.input).expanduser().resolve()
     target_path = Path(config.output).expanduser().resolve()
     if source_path == target_path:
