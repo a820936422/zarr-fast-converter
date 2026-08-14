@@ -1,7 +1,9 @@
 use fast_nc_zarr_model::{BackendCapability, RechunkExecutionPlan, BACKEND_PROTOCOL_VERSION};
 use fast_nc_zarr_zarr::{
-    inspect_array, read_chunk_f32 as read_zarr_chunk_f32, read_region_f32 as read_zarr_region_f32,
-    rechunk_f32_array, write_f32_array as write_zarr_f32_array,
+    inspect_array, read_chunk_f32 as read_zarr_chunk_f32, read_chunk_f64 as read_zarr_chunk_f64,
+    read_region_f32 as read_zarr_region_f32, read_region_f64 as read_zarr_region_f64,
+    rechunk_f32_array, rechunk_f64_array, write_f32_array as write_zarr_f32_array,
+    write_f64_array as write_zarr_f64_array,
 };
 use pyo3::prelude::*;
 
@@ -41,6 +43,21 @@ fn read_region_f32(
 }
 
 #[pyfunction]
+fn read_chunk_f64(path: &str, array_path: &str, chunk_indices: Vec<u64>) -> PyResult<Vec<f64>> {
+    read_zarr_chunk_f64(path, array_path, &chunk_indices).map_err(runtime_error)
+}
+
+#[pyfunction]
+fn read_region_f64(
+    path: &str,
+    array_path: &str,
+    starts: Vec<u64>,
+    shape: Vec<u64>,
+) -> PyResult<Vec<f64>> {
+    read_zarr_region_f64(path, array_path, &starts, &shape).map_err(runtime_error)
+}
+
+#[pyfunction]
 fn write_f32_array(
     path: &str,
     array_path: &str,
@@ -52,10 +69,30 @@ fn write_f32_array(
 }
 
 #[pyfunction]
+fn write_f64_array(
+    path: &str,
+    array_path: &str,
+    shape: Vec<u64>,
+    chunks: Vec<u64>,
+    values: Vec<f64>,
+) -> PyResult<()> {
+    write_zarr_f64_array(path, array_path, &shape, &chunks, &values).map_err(runtime_error)
+}
+
+#[pyfunction]
 fn rechunk_f32_json(py: Python<'_>, plan_json: &str) -> PyResult<String> {
     let plan: RechunkExecutionPlan = serde_json::from_str(plan_json).map_err(runtime_error)?;
     let metrics = py
         .detach(|| rechunk_f32_array(&plan))
+        .map_err(runtime_error)?;
+    serde_json::to_string(&metrics).map_err(runtime_error)
+}
+
+#[pyfunction]
+fn rechunk_f64_json(py: Python<'_>, plan_json: &str) -> PyResult<String> {
+    let plan: RechunkExecutionPlan = serde_json::from_str(plan_json).map_err(runtime_error)?;
+    let metrics = py
+        .detach(|| rechunk_f64_array(&plan))
         .map_err(runtime_error)?;
     serde_json::to_string(&metrics).map_err(runtime_error)
 }
@@ -67,7 +104,11 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(inspect_array_json, module)?)?;
     module.add_function(wrap_pyfunction!(read_chunk_f32, module)?)?;
     module.add_function(wrap_pyfunction!(read_region_f32, module)?)?;
+    module.add_function(wrap_pyfunction!(read_chunk_f64, module)?)?;
+    module.add_function(wrap_pyfunction!(read_region_f64, module)?)?;
     module.add_function(wrap_pyfunction!(rechunk_f32_json, module)?)?;
     module.add_function(wrap_pyfunction!(write_f32_array, module)?)?;
+    module.add_function(wrap_pyfunction!(rechunk_f64_json, module)?)?;
+    module.add_function(wrap_pyfunction!(write_f64_array, module)?)?;
     Ok(())
 }

@@ -87,8 +87,12 @@ export type NativeRechunkTaskRequest = {
   operation: "zarr.rechunk_f32";
   payload: Record<string, unknown>;
 };
+export type NativeWriteF64TaskRequest = {
+  operation: "zarr.write_f64";
+  payload: { path: string; array_path: string; shape: number[]; chunks: number[]; values: number[] };
+};
 
-export type NativeTaskRequest = NativeInspectTaskRequest | NativeRechunkTaskRequest;
+export type NativeTaskRequest = NativeInspectTaskRequest | NativeRechunkTaskRequest | NativeWriteF64TaskRequest;
 
 export type TaskSummary = {
   taskId: string;

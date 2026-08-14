@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use fast_nc_zarr_model::RechunkExecutionPlan;
-use fast_nc_zarr_zarr::{inspect_array, rechunk_f32_array};
+use fast_nc_zarr_zarr::{inspect_array, rechunk_f32_array, write_f64_array};
 use serde_json::{Map, Value};
 use tauri::{AppHandle, State};
 
@@ -16,7 +16,7 @@ use crate::tasks::{
     TaskRequest, TaskStatus, TaskSummary,
 };
 
-const NATIVE_OPERATIONS: &[&str] = &["zarr.inspect", "zarr.rechunk_f32"];
+const NATIVE_OPERATIONS: &[&str] = &["zarr.inspect", "zarr.rechunk_f32", "zarr.write_f64"];
 
 #[tauri::command]
 pub fn start_native_task(
@@ -139,9 +139,9 @@ fn run_native_task(
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     let _ = emit("resource", "resources", resource_payload);
-
     let result = match operation.as_str() {
         "zarr.inspect" => native_inspect(&request.payload),
+        "zarr.write_f64" => native_write_f64(&request.payload),
         "zarr.rechunk_f32" => native_rechunk(
             &request.payload,
             &cancellation_file,
@@ -198,6 +198,39 @@ fn native_inspect(payload: &Map<String, Value>) -> Result<Map<String, Value>, Ap
         "summary".to_string(),
         serde_json::to_value(summary)
             .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
+    );
+    Ok(output)
+}
+fn native_write_f64(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+    let root = required_string(payload, "path")?;
+    let array_path = required_string(payload, "array_path")?;
+    let shape = required_u64_vec(payload, "shape")?;
+    let chunks = required_u64_vec(payload, "chunks")?;
+    let values = required_f64_vec(payload, "values")?;
+    if Path::new(&root).exists() {
+        return Err(AppError::new(
+            ErrorKind::PublicationFailed,
+            format!("native task refuses an existing target: {root}"),
+        )
+        .at_stage("native"));
+    }
+    write_f64_array(&root, &array_path, &shape, &chunks, &values).map_err(|error| {
+        AppError::new(ErrorKind::PublicationFailed, error.to_string()).at_stage("native")
+    })?;
+    let mut output = Map::new();
+    output.insert(
+        "operation".to_string(),
+        Value::String("zarr.write_f64".to_string()),
+    );
+    output.insert("path".to_string(), Value::String(root));
+    output.insert("array_path".to_string(), Value::String(array_path));
+    output.insert(
+        "shape".to_string(),
+        Value::Array(shape.into_iter().map(Value::from).collect()),
+    );
+    output.insert(
+        "chunks".to_string(),
+        Value::Array(chunks.into_iter().map(Value::from).collect()),
     );
     Ok(output)
 }
@@ -286,6 +319,47 @@ fn required_string(payload: &Map<String, Value>, key: &str) -> Result<String, Ap
         })
 }
 
+fn required_u64_vec(payload: &Map<String, Value>, key: &str) -> Result<Vec<u64>, AppError> {
+    let values = payload.get(key).and_then(Value::as_array).ok_or_else(|| {
+        AppError::new(ErrorKind::InvalidRequest, format!("{key} must be an array"))
+    })?;
+    let values = values
+        .iter()
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                AppError::new(
+                    ErrorKind::InvalidRequest,
+                    format!("{key} must contain non-negative integers"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() || values.contains(&0) {
+        return Err(AppError::new(
+            ErrorKind::InvalidRequest,
+            format!("{key} must contain positive values"),
+        ));
+    }
+    Ok(values)
+}
+
+fn required_f64_vec(payload: &Map<String, Value>, key: &str) -> Result<Vec<f64>, AppError> {
+    let values = payload.get(key).and_then(Value::as_array).ok_or_else(|| {
+        AppError::new(ErrorKind::InvalidRequest, format!("{key} must be an array"))
+    })?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_f64().ok_or_else(|| {
+                AppError::new(
+                    ErrorKind::InvalidRequest,
+                    format!("{key} must contain numbers"),
+                )
+            })
+        })
+        .collect()
+}
+
 fn read_progress(path: Option<&Path>) -> Option<(u64, u64)> {
     let path = path?;
     let contents = fs::read_to_string(path).ok()?;
@@ -298,7 +372,7 @@ fn read_progress(path: Option<&Path>) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{native_inspect, native_rechunk, validate_operation};
+    use super::{native_inspect, native_rechunk, native_write_f64, validate_operation};
     use crate::protocol::EventEnvelope;
     use fast_nc_zarr_zarr::write_f32_array;
     use serde_json::{json, Map, Value};
@@ -318,6 +392,28 @@ mod tests {
     fn native_operation_gate_is_explicit() {
         assert!(validate_operation("zarr.inspect").is_ok());
         assert!(validate_operation("raw.netcdf.convert").is_err());
+    }
+
+    #[test]
+    fn native_write_f64_publishes_a_valid_zarr_store() {
+        let target = store("float64-write.zarr");
+        let payload: Map<String, Value> = serde_json::from_value(json!({
+            "path": target,
+            "array_path": "/value",
+            "shape": [2, 2, 2],
+            "chunks": [1, 2, 2],
+            "values": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+        }))
+        .expect("payload");
+        let result = native_write_f64(&payload).expect("native write");
+        assert_eq!(result["operation"], "zarr.write_f64");
+        let summary = native_inspect(
+            &serde_json::from_value(json!({"path": target, "array_path": "/value"}))
+                .expect("inspect payload"),
+        )
+        .expect("inspect output");
+        assert_eq!(summary["summary"]["data_type"], "float64");
+        let _ = fs::remove_dir_all(target);
     }
 
     #[test]

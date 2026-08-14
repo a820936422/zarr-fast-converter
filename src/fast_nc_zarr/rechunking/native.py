@@ -191,14 +191,16 @@ def run_rust_rechunk(
         raise ValueError("输入和输出 Zarr 不能相互嵌套")
     if not source.is_dir():
         raise ValueError(f"输入 Zarr 目录不存在: {source}")
-    operation = (
-        "zarr.rechunk_f32_codec"
-        if plan.codec not in {"", "none"}
-        else "zarr.rechunk_f32"
-    )
+    dtype = str(plan.expected_dtype)
+    if dtype not in {"float32", "float64"}:
+        raise BackendUnavailableError(f"Rust rechunk currently supports float32/float64 only, got {dtype}")
+    native_dtype = "f32" if dtype == "float32" else "f64"
+    if dtype == "float64" and plan.codec not in {"", "none"}:
+        raise BackendUnavailableError("Rust float64 rechunk preserves the source codec and does not apply a new codec")
+    operation = f"zarr.rechunk_{native_dtype}"
     resolved = resolve_backend(requested_backend, operation)
     if plan.cancellation_file is not None or cancel_event is not None:
-        resolve_backend(requested_backend, "zarr.rechunk_f32_cancel")
+        resolve_backend(requested_backend, f"zarr.rechunk_{native_dtype}_cancel")
     if resolved != "rust":
         raise BackendUnavailableError(
             "Rust rechunk operation is unavailable; the Python caller must use its normal backend."
@@ -267,7 +269,10 @@ def run_rust_rechunk(
 
     try:
         native = importlib.import_module("fast_nc_zarr._native")
-        metrics = json.loads(native.rechunk_f32_json(execution_plan.to_json()))
+        native_rechunk = getattr(native, f"rechunk_{native_dtype}_json", None)
+        if native_rechunk is None:
+            raise BackendUnavailableError(f"native extension lacks rechunk_{native_dtype}_json")
+        metrics = json.loads(native_rechunk(execution_plan.to_json()))
         if cancel_event is not None and cancel_event.is_set():
             from .engine import RechunkExecutionError
             raise RechunkExecutionError("任务已取消")
@@ -332,16 +337,16 @@ def run_rust_rechunk_for_config(
     compression=None,
     cancel_event=None,
 ) -> dict[str, object]:
-    """Resolve a supported float32 variable and execute one Rust plan."""
-
+    """Resolve one three-dimensional float32/float64 data variable and execute Rust."""
     reference = next(
         (variable for variable in info.data_variables if variable.ndim == 3), None
     )
     if reference is None:
         raise BackendUnavailableError("Rust P3 重分块要求三维数据变量")
-    if str(reference.dtype) != "float32":
+    expected_dtype = str(reference.dtype)
+    if expected_dtype not in {"float32", "float64"}:
         raise BackendUnavailableError(
-            f"Rust P3 rechunk currently supports float32 only, got {reference.dtype}"
+            f"Rust P3 rechunk currently supports float32/float64 only, got {reference.dtype}"
         )
     if len(info.data_variables) != 1:
         raise BackendUnavailableError("Rust P3 重分块当前只支持一个数据变量")
@@ -375,6 +380,8 @@ def run_rust_rechunk_for_config(
     codec = str(getattr(compression, "codec", "none")) if compression_enabled else "none"
     codec_level = getattr(compression, "level", None) if compression_enabled else None
     codec_shuffle = str(getattr(compression, "shuffle", "auto")) if compression_enabled else "auto"
+    if expected_dtype == "float64" and codec not in {"", "none"}:
+        raise BackendUnavailableError("Rust float64 rechunk preserves the source codec and does not apply a new codec")
 
     budget = getattr(config, "resource_budget", None)
     if budget is None:
@@ -397,7 +404,7 @@ def run_rust_rechunk_for_config(
             target=Path(config.output),
             array_path=f"/{reference.name}",
             target_chunks=target_chunks,
-            expected_dtype="float32",
+            expected_dtype=expected_dtype,
             requested_workers=requested_workers,
             worker_ceiling=int(budget.worker_ceiling),
             memory_budget_bytes=int(budget.memory_budget_bytes),

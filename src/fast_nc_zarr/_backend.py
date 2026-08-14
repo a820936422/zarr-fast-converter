@@ -141,9 +141,13 @@ def resolve_backend(requested: BackendName, operation: str) -> str:
         return "python"
     if requested not in {"auto", "rust"}:
         raise ValueError(f"unsupported backend selection: {requested}")
-
     capability = rust_capability()
-    operation_id = "zarr.rechunk_f32" if operation == "rechunk" else operation
+
+    operation_id = {
+        "rechunk": "zarr.rechunk_f32",
+        "rechunk_f32": "zarr.rechunk_f32",
+        "rechunk_f64": "zarr.rechunk_f64",
+    }.get(operation, operation)
     detail = capability.operation(operation_id)
     supported = capability.supported and operation_id in capability.operations
     if requested == "rust" and not supported:

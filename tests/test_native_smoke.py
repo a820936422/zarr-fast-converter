@@ -49,6 +49,9 @@ class NativePreparationTests(unittest.TestCase):
             self.assertIsNotNone(detail)
             self.assertFalse(detail.supported)
             self.assertTrue(detail.reason)
+            f64 = capability.operation("zarr.write_f64")
+            self.assertIsNotNone(f64)
+            self.assertTrue(f64.supported)
 
     def test_legacy_capability_payload_without_matrix_remains_compatible(self) -> None:
         from fast_nc_zarr import _backend
@@ -68,6 +71,9 @@ class NativePreparationTests(unittest.TestCase):
     def test_auto_backend_resolves_native_rechunk_capability(self) -> None:
         expected = "rust" if _RUST_ZARR_READY else "python"
         self.assertEqual(resolve_backend("auto", "zarr.rechunk_f32"), expected)
+    def test_auto_backend_resolves_native_float64_rechunk_capability(self) -> None:
+        expected = "rust" if _CAPABILITY.supported and "zarr.rechunk_f64" in _CAPABILITY.operations else "python"
+        self.assertEqual(resolve_backend("auto", "rechunk_f64"), expected)
 
 
 @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
@@ -116,6 +122,57 @@ class RustZarrCrossBackendTests(unittest.TestCase):
         region = self.native.read_region_f32(root, "/value", [1, 1, 0], [2, 2, 2])
         np.testing.assert_array_equal(region, values[1:3, 1:3, :].ravel())
         np.testing.assert_array_equal(chunk, [0.0, 2.0, 6.0, 8.0])
+    def test_float64_rust_write_is_readable_by_python_and_rust(self) -> None:
+        root = f"{self.tempdir.name}/rust-float64-output.zarr"
+        values = (np.arange(4 * 3 * 2, dtype="float64") / 10).reshape(4, 3, 2)
+        self.native.write_f64_array(
+            root,
+            "/value",
+            [4, 3, 2],
+            [2, 2, 1],
+            values.ravel().tolist(),
+        )
+        summary = json.loads(self.native.inspect_array_json(root, "/value"))
+        self.assertEqual(summary["data_type"], "float64")
+        chunk = self.native.read_chunk_f64(root, "/value", [0, 0, 0])
+        region = self.native.read_region_f64(root, "/value", [1, 1, 0], [2, 2, 2])
+        np.testing.assert_array_equal(chunk, values[:2, :2, :1].ravel())
+        np.testing.assert_array_equal(region, values[1:3, 1:3, :].ravel())
+        with xr.open_zarr(root, consolidated=False, chunks=None, decode_times=False) as dataset:
+            self.assertEqual(dataset["value"].dtype, np.dtype("float64"))
+            np.testing.assert_array_equal(dataset["value"].values, values)
+    def test_float64_rust_rechunk_is_lossless(self) -> None:
+        source = f"{self.tempdir.name}/float64-rechunk-source.zarr"
+        target = f"{self.tempdir.name}/float64-rechunk-target.zarr"
+        values = (np.arange(4 * 3 * 2, dtype="float64") / 10).reshape(4, 3, 2)
+        xr.Dataset(
+            {"value": (("time", "lat", "lon"), values)},
+            coords={"time": np.arange(4), "lat": np.arange(3), "lon": np.arange(2)},
+        ).to_zarr(
+            source,
+            mode="w",
+            consolidated=False,
+            zarr_format=3,
+            encoding={"value": {"chunks": (2, 2, 1)}},
+        )
+        metrics = run_rust_rechunk(
+            RustRechunkPlan(
+                source=Path(source),
+                target=Path(target),
+                array_path="/value",
+                target_chunks=(1, 3, 2),
+                expected_dtype="float64",
+                requested_workers=2,
+                worker_ceiling=2,
+                memory_budget_bytes=1024 * 1024,
+            )
+        )
+        self.assertEqual(metrics["logical_bytes"], values.nbytes)
+        with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as result:
+            self.assertEqual(result["value"].dtype, np.dtype("float64"))
+            np.testing.assert_array_equal(result["value"].values, values)
+
+
 
 
     def test_rust_rechunk_uses_bounded_parallel_workers(self) -> None:

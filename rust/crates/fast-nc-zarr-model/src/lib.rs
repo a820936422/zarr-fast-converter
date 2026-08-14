@@ -132,6 +132,17 @@ impl BackendCapability {
             ("zarr.read_chunk_f32", &["float32 arrays"][..]),
             ("zarr.read_region_f32", &["float32 arrays"][..]),
             ("zarr.write_f32", &["float32 arrays"][..]),
+            ("zarr.read_chunk_f64", &["float64 arrays"][..]),
+            ("zarr.read_region_f64", &["float64 arrays"][..]),
+            ("zarr.write_f64", &["float64 arrays"][..]),
+            (
+                "zarr.rechunk_f64",
+                &["single float64 data variable", "source codec preserved"][..],
+            ),
+            (
+                "zarr.rechunk_f64_cancel",
+                &["cooperative cancellation", "source codec preserved"][..],
+            ),
             ("zarr.rechunk_f32", &["single float32 data variable"][..]),
             (
                 "zarr.rechunk_f32_codec",
@@ -198,8 +209,8 @@ mod tests {
     fn smoke_capability_has_stable_protocol_and_matrix() {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
-        assert_eq!(capability.operations.len(), 8);
-        assert_eq!(capability.capabilities.len(), 13);
+        assert_eq!(capability.operations.len(), 13);
+        assert_eq!(capability.capabilities.len(), 18);
         let supported = capability
             .capabilities
             .iter()
@@ -211,6 +222,18 @@ mod tests {
             !capability
                 .operation("raw.netcdf.convert")
                 .unwrap()
+                .supported
+        );
+        assert!(
+            capability
+                .operation("zarr.write_f64")
+                .expect("f64 write")
+                .supported
+        );
+        assert!(
+            capability
+                .operation("zarr.rechunk_f64")
+                .expect("f64 rechunk")
                 .supported
         );
     }
