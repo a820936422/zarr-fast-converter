@@ -704,6 +704,102 @@ def _inspect_filename_file_low_level(task) -> FileRecord:
         mtime_ns=stat.st_mtime_ns,
     )
 
+def _rasterio_metadata(path: Path) -> tuple[np.ndarray, np.ndarray, tuple[VariableSpec, ...], tuple[Any, ...]]:
+    """Read a single-band GeoTIFF schema without constructing xarray."""
+    try:
+        import rasterio
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise _LowLevelUnsupported("未安装 rasterio；回退到 xarray。") from exc
+    try:
+        with rasterio.open(path) as dataset:
+            if dataset.count != 1:
+                raise _LowLevelUnsupported("多 band raster 需要 xarray 归一化。")
+            transform = dataset.transform
+            if not np.isclose(transform.b, 0.0) or not np.isclose(transform.d, 0.0):
+                raise _LowLevelUnsupported("旋转 raster 网格需要 xarray 归一化。")
+            rows = np.arange(dataset.height, dtype=np.int64)
+            cols = np.arange(dataset.width, dtype=np.int64)
+            _xs, lat_values = rasterio.transform.xy(
+                transform, rows, np.zeros(dataset.height, dtype=np.int64), offset="center"
+            )
+            lon_values, _ys = rasterio.transform.xy(
+                transform, np.zeros(dataset.width, dtype=np.int64), cols, offset="center"
+            )
+            lat = np.asarray(lat_values, dtype="float64")
+            lon = np.asarray(lon_values, dtype="float64")
+            attrs: dict[str, Any] = {}
+            nodata = dataset.nodata
+            if nodata is not None:
+                attrs["_FillValue"] = _clean_attr(nodata)
+            scale = float(dataset.scales[0]) if dataset.scales else 1.0
+            offset = float(dataset.offsets[0]) if dataset.offsets else 0.0
+            if scale != 1.0:
+                attrs["scale_factor"] = scale
+            if offset != 0.0:
+                attrs["add_offset"] = offset
+            dtype = np.dtype(dataset.dtypes[0])
+            shape = (int(dataset.height), int(dataset.width))
+    except _LowLevelUnsupported:
+        raise
+    except Exception as exc:  # pragma: no cover - backend-specific
+        raise _LowLevelUnsupported("rasterio 无法读取元数据；回退到 xarray。") from exc
+    signature = (
+        "band_data",
+        dtype.name,
+        ("lat", "lon"),
+        shape,
+        tuple(sorted((str(key), repr(value)) for key, value in attrs.items())),
+    )
+    spec = VariableSpec(
+        name="band_data",
+        dims=("time", "lat", "lon"),
+        dtype=dtype.name,
+        shape_without_time=shape,
+        native_chunks=None,
+        attrs=attrs,
+    )
+    return lat, lon, (spec,), (signature,)
+
+
+def _inspect_filename_file_rasterio(task) -> FileRecord:
+    """Validate a GeoTIFF file using metadata only."""
+    (
+        path,
+        engine,
+        expected_signature,
+        expected_lat_hash,
+        expected_lon_hash,
+        expected_lat_size,
+        expected_lon_size,
+        reference_specs,
+        time_value,
+    ) = task
+    if engine != "rasterio":
+        raise _LowLevelUnsupported("当前引擎不适用 rasterio 低层扫描。")
+    lat, lon, _specs, actual_signature = _rasterio_metadata(path)
+    if actual_signature != expected_signature:
+        raise FilenameTimeError(f"{path.name} 的变量结构或属性与首文件不一致。")
+    if (
+        lat.size != expected_lat_size
+        or lon.size != expected_lon_size
+        or _hash_axis(lat) != expected_lat_hash
+        or _hash_axis(lon) != expected_lon_hash
+    ):
+        raise FilenameTimeError(f"{path.name} 的经纬度网格与首文件不一致。")
+    stat = path.stat()
+    return FileRecord(
+        path=path,
+        size_bytes=stat.st_size,
+        times=(np.datetime64(time_value, "ns"),),
+        time_keys=(time_key(np.datetime64(time_value, "ns")),),
+        lat_hash=expected_lat_hash,
+        lon_hash=expected_lon_hash,
+        lat_size=expected_lat_size,
+        lon_size=expected_lon_size,
+        variables=reference_specs,
+        mtime_ns=stat.st_mtime_ns,
+    )
+
 
 def _rename_spatial_dims(ds):
     dims = set(ds.dims)
@@ -932,11 +1028,14 @@ def _inspect_filename_file_xarray(task) -> FileRecord:
 
 
 def _inspect_filename_file(task) -> FileRecord:
-    """Inspect one file, preferring the direct NetCDF4 metadata path."""
+    """Inspect one file, preferring direct metadata readers."""
     try:
         return _inspect_filename_file_low_level(task)
     except _LowLevelUnsupported:
-        return _inspect_filename_file_xarray(task)
+        try:
+            return _inspect_filename_file_rasterio(task)
+        except _LowLevelUnsupported:
+            return _inspect_filename_file_xarray(task)
 
 
 def inspect_filename_inventory(
@@ -950,44 +1049,57 @@ def inspect_filename_inventory(
 ) -> Inventory:
     if progress:
         print(f"扫描到 {len(scan.files)} 个文件，使用文件名时间模式。")
-    with _normalized_filename_dataset(scan.files[0], requested_engine) as (reference_ds, engine):
-        if (
-            "lat" not in reference_ds.coords
-            or "lon" not in reference_ds.coords
-            or reference_ds.lat.dims != ("lat",)
-            or reference_ds.lon.dims != ("lon",)
+    engine = engine_for_path(scan.files[0], requested_engine)
+    rasterio_reference = False
+    if engine == "rasterio":
+        try:
+            lat, lon, reference_specs, expected_signature = _rasterio_metadata(scan.files[0])
+        except _LowLevelUnsupported:
+            pass
+        else:
+            rasterio_reference = True
+    if not rasterio_reference:
+        with _normalized_filename_dataset(scan.files[0], requested_engine) as (
+            reference_ds,
+            engine,
         ):
-            raise FilenameTimeError("源文件缺少可用的一维 lat/lon 坐标。")
-        lat = np.asarray(reference_ds.lat.values).copy()
-        lon = np.asarray(reference_ds.lon.values).copy()
-        reference_specs = []
-        for name, variable in reference_ds.data_vars.items():
-            if variable.dims != ("lat", "lon") or np.dtype(variable.dtype).kind not in "biufc":
-                continue
-            reference_specs.append(
-                VariableSpec(
-                    name=name,
-                    dims=("time", "lat", "lon"),
-                    dtype=str(variable.dtype),
-                    shape_without_time=(int(variable.sizes["lat"]), int(variable.sizes["lon"])),
-                    native_chunks=None,
-                    attrs=_variable_attrs(variable),
+            if (
+                "lat" not in reference_ds.coords
+                or "lon" not in reference_ds.coords
+                or reference_ds.lat.dims != ("lat",)
+                or reference_ds.lon.dims != ("lon",)
+            ):
+                raise FilenameTimeError("源文件缺少可用的一维 lat/lon 坐标。")
+            lat = np.asarray(reference_ds.lat.values).copy()
+            lon = np.asarray(reference_ds.lon.values).copy()
+            reference_specs = []
+            for name, variable in reference_ds.data_vars.items():
+                if variable.dims != ("lat", "lon") or np.dtype(variable.dtype).kind not in "biufc":
+                    continue
+                reference_specs.append(
+                    VariableSpec(
+                        name=name,
+                        dims=("time", "lat", "lon"),
+                        dtype=str(variable.dtype),
+                        shape_without_time=(int(variable.sizes["lat"]), int(variable.sizes["lon"])),
+                        native_chunks=None,
+                        attrs=_variable_attrs(variable),
+                    )
+                )
+            if not reference_specs:
+                raise FilenameTimeError("源文件没有可转换的二维 lat/lon 变量。")
+            expected_signature = tuple(
+                sorted(
+                    (
+                        _filename_variable_signature(variable)
+                        for variable in reference_ds.data_vars.values()
+                        if variable.dims == ("lat", "lon")
+                        and np.dtype(variable.dtype).kind in "biufc"
+                    ),
+                    key=lambda item: item[0],
                 )
             )
-        if not reference_specs:
-            raise FilenameTimeError("源文件没有可转换的二维 lat/lon 变量。")
-        expected_signature = tuple(
-            sorted(
-                (
-                    _filename_variable_signature(variable)
-                    for variable in reference_ds.data_vars.values()
-                    if variable.dims == ("lat", "lon")
-                    and np.dtype(variable.dtype).kind in "biufc"
-                ),
-                key=lambda item: item[0],
-            )
-        )
-        del reference_ds
+            del reference_ds
     expected_lat_hash = _hash_axis(lat)
     expected_lon_hash = _hash_axis(lon)
     tasks = tuple(
@@ -1037,6 +1149,8 @@ def inspect_filename_inventory(
         method = (
             "NetCDF4 低层元数据优先，失败时回退 xarray"
             if engine == "netcdf4"
+            else "rasterio 低层元数据优先，失败时回退 xarray"
+            if engine == "rasterio"
             else "xarray"
         )
         print(

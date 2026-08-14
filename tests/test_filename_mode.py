@@ -355,6 +355,39 @@ class FilenameModeTests(unittest.TestCase):
         self.assertEqual(inventory.variables["value"].attrs["_FillValue"], -1)
         self.assertEqual(inventory.variables["value"].attrs["scale_factor"], 0.01)
 
+    def test_rasterio_low_level_metadata_scan_avoids_xarray(self) -> None:
+        try:
+            import rasterio
+            from rasterio.transform import from_origin
+        except ImportError:  # pragma: no cover - optional dependency
+            self.skipTest("rasterio 未安装")
+        folder = ROOT / "rasterio-low-level"
+        folder.mkdir()
+        for index, doy in enumerate(("001", "009")):
+            path = folder / f"product_2001{doy}.tif"
+            with rasterio.open(
+                path,
+                "w",
+                driver="GTiff",
+                height=2,
+                width=3,
+                count=1,
+                dtype="uint16",
+                transform=from_origin(-180, 90, 1, 1),
+            ) as dataset:
+                dataset.write(np.full((1, 2, 3), index, dtype="uint16"))
+        scan = scan_filename_times(folder)
+        with patch(
+            "fast_nc_zarr.filename_mode._open_dataset",
+            side_effect=AssertionError("rasterio metadata scan unexpectedly opened xarray"),
+        ):
+            inventory = inspect_filename_inventory(
+                scan, requested_engine="rasterio", workers=1, progress=False
+            )
+        self.assertEqual(inventory.variables["band_data"].dtype, "uint16")
+        np.testing.assert_allclose(inventory.lat_values, [89.5, 88.5])
+        np.testing.assert_allclose(inventory.lon_values, [-179.5, -178.5, -177.5])
+
     def test_rasterio_dataset_cleanup_in_subprocess(self) -> None:
         try:
             import rasterio
