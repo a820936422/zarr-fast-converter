@@ -95,7 +95,6 @@ jobs:
         run: bash scripts/build_desktop.sh --target x86_64-unknown-linux-gnu --ci --no-sign
       - name: Verify Linux package counts
         id: package_count
-        continue-on-error: true
         shell: bash
         run: |
           shopt -s nullglob
@@ -106,7 +105,6 @@ jobs:
           test "${#rpms[@]}" -eq 1
       - name: Verify deb metadata
         id: deb_metadata
-        continue-on-error: true
         shell: bash
         run: |
           shopt -s nullglob
@@ -115,7 +113,6 @@ jobs:
           dpkg-deb --info "${debs[0]}"
       - name: Verify deb worker path
         id: deb_worker
-        continue-on-error: true
         shell: bash
         run: |
           shopt -s nullglob
@@ -124,7 +121,6 @@ jobs:
           dpkg-deb --contents "${debs[0]}" | grep -F 'usr/bin/fast-nc-zarr-worker'
       - name: Verify rpm metadata
         id: rpm_metadata
-        continue-on-error: true
         shell: bash
         run: |
           shopt -s nullglob
@@ -133,21 +129,12 @@ jobs:
           rpm -qpi "${rpms[0]}"
       - name: Verify rpm worker path
         id: rpm_worker
-        continue-on-error: true
         shell: bash
         run: |
           shopt -s nullglob
           rpms=(target/release/bundle/rpm/*.rpm)
           test "${#rpms[@]}" -eq 1
           rpm -qpl "${rpms[0]}" | grep -F '/usr/bin/fast-nc-zarr-worker'
-      - name: Enforce Linux package verification
-        if: |
-          steps.package_count.outcome == 'failure' ||
-          steps.deb_metadata.outcome == 'failure' ||
-          steps.deb_worker.outcome == 'failure' ||
-          steps.rpm_metadata.outcome == 'failure' ||
-          steps.rpm_worker.outcome == 'failure'
-        run: exit 1
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:
