@@ -76,3 +76,19 @@ h2 { margin-bottom: 12px; font-size: 20px; }
 .manifest-path { max-width: 220px; overflow: hidden; color: #537092; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .event-log { max-height: 320px; overflow: auto; margin-top: 18px; padding: 10px; border-radius: 8px; color: #506278; background: #f6f9fc; font-family: ui-monospace, monospace; font-size: 11px; }
 .event-log p { margin: 0 0 8px; white-space: pre-wrap; }
+.helper-text { color: #6b7c90; font-size: 12px; line-height: 1.55; }
+.hero-card > input { width: 100%; border: 1px solid #cbd7e5; border-radius: 8px; padding: 11px 12px; color: #172033; background: #fbfdff; }
+.small-input { width: 92px; margin-left: 5px; border: 1px solid #cbd7e5; border-radius: 6px; padding: 5px 8px; background: #fff; }
+.capability-list { display: grid; gap: 7px; max-height: 390px; overflow: auto; margin-top: 16px; }
+.capability-item { display: grid; gap: 3px; border-left: 3px solid #cbd5e1; padding: 7px 9px; background: #f8fafc; }
+.capability-item strong { color: #315273; font-family: ui-monospace, monospace; font-size: 11px; }
+.capability-item small { color: #708198; font-size: 11px; line-height: 1.35; }
+.capability-item.supported { border-left-color: #22c55e; background: #f0fdf4; }
+.capability-item.unavailable { border-left-color: #f59e0b; background: #fffbeb; }
+.path-history { display: grid; gap: 10px; margin-top: 16px; }
+.path-history > strong { margin-top: 8px; color: #315273; font-size: 13px; }
+.history-row { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #edf1f5; padding: 7px 0; }
+.path-link { min-width: 0; flex: 1; overflow: hidden; border: 0; color: #537092; background: transparent; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.icon-button { border: 0; color: #537092; background: transparent; font-size: 11px; cursor: pointer; }
+.variable-picker { display: grid; gap: 7px; margin-top: 16px; border-top: 1px solid #edf1f5; padding-top: 13px; color: #607188; font-size: 13px; }
+.variable-picker strong { color: #315273; }

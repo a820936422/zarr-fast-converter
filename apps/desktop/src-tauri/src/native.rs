@@ -390,4 +390,49 @@ mod tests {
         let _ = fs::remove_file(progress);
         let _ = fs::remove_file(cancellation);
     }
+
+    #[test]
+    fn native_rechunk_pre_cancelled_does_not_publish_target() {
+        let source = store("cancel-source.zarr");
+        let target = store("cancel-target.zarr");
+        let cancellation = store("cancel-request");
+        write_f32_array(&source, "/value", &[2, 2, 2], &[1, 2, 2], &[0.0; 8])
+            .expect("write source");
+        fs::write(&cancellation, b"cancel").expect("write cancellation");
+        let payload: Map<String, Value> = serde_json::from_value(json!({
+            "source": source,
+            "target": target,
+            "array_path": "/value",
+            "target_chunks": [2, 1, 2],
+            "expected_dtype": "float32",
+            "requested_workers": 1,
+            "worker_ceiling": 1,
+            "memory_budget_bytes": 1048576,
+            "codec_concurrent_target": 1,
+            "codec": "none",
+            "codec_shuffle": "auto"
+        }))
+        .expect("payload");
+        let result = native_rechunk(
+            &payload,
+            &cancellation,
+            None,
+            &mut |_event, _stage, _payload| {
+                Ok(EventEnvelope {
+                    protocol_version: 1,
+                    request_id: "request".to_string(),
+                    task_id: Some("task".to_string()),
+                    sequence: 0,
+                    event: "progress".to_string(),
+                    stage: Some("native".to_string()),
+                    payload: Map::new(),
+                })
+            },
+        );
+        assert!(result.is_err());
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(target);
+        let _ = fs::remove_file(cancellation);
+    }
 }

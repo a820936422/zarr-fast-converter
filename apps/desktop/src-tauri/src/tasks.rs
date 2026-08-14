@@ -330,7 +330,9 @@ pub(crate) fn cancellation_path(task_id: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskEvent, TaskRegistry, TaskStatus, TaskSummary};
+    use super::{failed_event, TaskEvent, TaskRegistry, TaskStatus, TaskSummary};
+    use crate::error::{AppError, ErrorKind};
+    use crate::protocol::RequestEnvelope;
     use crate::resource::ResourceSnapshot;
     use serde_json::json;
     use std::fs;
@@ -387,5 +389,21 @@ mod tests {
             .cancellation_file("task-1")
             .expect("cancel handle")
             .is_none());
+    }
+    #[test]
+    fn failed_event_preserves_sequence_and_wire_error() {
+        let request = RequestEnvelope {
+            protocol_version: 1,
+            request_id: "request-1".to_string(),
+            task_id: Some("task-1".to_string()),
+            command: "run_pipeline".to_string(),
+            payload: Default::default(),
+        };
+        let error = AppError::new(ErrorKind::WorkerProtocolError, "bad event").at_stage("worker");
+        let event = failed_event(&request, &error, 4);
+        assert_eq!(event.sequence, 4);
+        assert_eq!(event.event, "failed");
+        assert_eq!(event.stage.as_deref(), Some("worker"));
+        assert_eq!(event.payload["error"]["kind"], "worker_protocol_error");
     }
 }

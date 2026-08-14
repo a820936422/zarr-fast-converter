@@ -1,3 +1,4 @@
+use fast_nc_zarr_model::BackendCapability;
 use serde_json::{Map, Value};
 use std::path::Path;
 use tauri::State;
@@ -67,7 +68,13 @@ pub fn worker_capabilities(state: State<'_, AppState>) -> Result<Value, AppError
     let process = worker
         .as_mut()
         .ok_or_else(|| AppError::new(ErrorKind::WorkerStartFailed, "worker was not initialized"))?;
+
     terminal_payload(process.send(&request)?)
+}
+
+#[tauri::command]
+pub fn native_capabilities() -> Result<BackendCapability, AppError> {
+    Ok(BackendCapability::smoke())
 }
 
 #[tauri::command]

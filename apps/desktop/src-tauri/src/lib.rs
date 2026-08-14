@@ -31,6 +31,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_backend_info,
             commands::worker_capabilities,
+            commands::native_capabilities,
             commands::inspect_source,
             commands::inspect_zarr,
             commands::inspect_time_metadata,

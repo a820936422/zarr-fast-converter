@@ -116,6 +116,7 @@ export type TaskEvent = {
 export const getBackendInfo = () => invoke<BackendInfo>("get_backend_info");
 export const getWorkerCapabilities = () => invoke<WorkerCapabilities>("worker_capabilities");
 export const inspectSource = (request: InspectionRequest) => invoke<InspectionResult>("inspect_source", { payload: request });
+export const getNativeCapabilities = () => invoke<BackendCapability>("native_capabilities");
 export const inspectZarr = (path: string) => invoke<InspectionResult>("inspect_zarr", { path });
 export const inspectTimeMetadata = (inputDir: string, recursive = false, engine = "auto") =>
   invoke<TimeInspection>("inspect_time_metadata", { inputDir, recursive, engine });
