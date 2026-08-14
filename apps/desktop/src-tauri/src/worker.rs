@@ -174,3 +174,81 @@ pub type SharedWorker = Arc<Mutex<Option<WorkerProcess>>>;
 pub fn new_shared_worker() -> SharedWorker {
     Arc::new(Mutex::new(None))
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::WorkerProcess;
+    use crate::error::ErrorKind;
+    use crate::protocol::RequestEnvelope;
+    use std::env;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        LOCK.lock().expect("worker env lock")
+    }
+
+    fn test_path(label: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "fast-nc-zarr-worker-{label}-{}",
+            std::process::id()
+        ))
+    }
+
+    fn with_worker_path(path: &PathBuf, action: impl FnOnce() -> Result<(), ErrorKind>) {
+        let previous = env::var_os("FAST_NC_ZARR_WORKER");
+        env::set_var("FAST_NC_ZARR_WORKER", path);
+        let result = action();
+        match previous {
+            Some(value) => env::set_var("FAST_NC_ZARR_WORKER", value),
+            None => env::remove_var("FAST_NC_ZARR_WORKER"),
+        }
+        result.expect("sidecar failure assertion");
+    }
+
+    #[test]
+    fn non_executable_worker_is_typed_start_failure() {
+        let _guard = env_lock();
+        let path = test_path("permission");
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write worker fixture");
+        let result = with_worker_path(&path, || {
+            let error = match WorkerProcess::spawn() {
+                Ok(_) => panic!("non-executable worker must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind, ErrorKind::WorkerStartFailed);
+            Ok(())
+        });
+        let _ = fs::remove_file(path);
+        result;
+    }
+
+    #[test]
+    fn worker_exit_before_terminal_event_is_protocol_error() {
+        let _guard = env_lock();
+        let path = test_path("exit");
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write worker fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("chmod worker fixture");
+        let result = with_worker_path(&path, || {
+            let mut worker = WorkerProcess::spawn().expect("executable worker should spawn");
+            let request = RequestEnvelope {
+                protocol_version: 1,
+                request_id: "worker-exit-test".to_string(),
+                task_id: None,
+                command: "get_capabilities".to_string(),
+                payload: Default::default(),
+            };
+            let error = worker
+                .send(&request)
+                .expect_err("early exit must fail protocol");
+            assert_eq!(error.kind, ErrorKind::WorkerProtocolError);
+            Ok(())
+        });
+        let _ = fs::remove_file(path);
+        result;
+    }
+}

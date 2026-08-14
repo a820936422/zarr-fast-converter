@@ -149,10 +149,6 @@ fn run_native_task(
     let _ = emit("accepted", "transport", Map::new());
     let _ = emit("started", &operation, Map::new());
     let _ = registry.update_resource(&task_id, resource.clone());
-    let resource_payload = serde_json::to_value(resource)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
     let result = match operation.as_str() {
         "zarr.inspect" => native_inspect(&request.payload),
         "raw.netcdf.inspect" => native_netcdf_inspect(&request.payload),

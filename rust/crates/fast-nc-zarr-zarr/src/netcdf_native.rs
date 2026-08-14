@@ -187,7 +187,7 @@ fn store_f32_array(
 ) -> Result<u64, String> {
     let chunks = shape
         .iter()
-        .map(|value| (*value).min(64).max(1))
+        .map(|value| (*value).clamp(1, 64))
         .collect::<Vec<_>>();
     let mut builder = zarrs::array::ArrayBuilder::new(
         shape.to_vec(),
@@ -227,7 +227,7 @@ fn store_f32_array(
             break;
         }
     }
-    Ok((values.len() * std::mem::size_of::<f32>()) as u64)
+    Ok(std::mem::size_of_val(values) as u64)
 }
 
 fn store_f64_array(
@@ -240,7 +240,7 @@ fn store_f64_array(
 ) -> Result<u64, String> {
     let chunks = shape
         .iter()
-        .map(|value| (*value).min(64).max(1))
+        .map(|value| (*value).clamp(1, 64))
         .collect::<Vec<_>>();
     let mut builder = zarrs::array::ArrayBuilder::new(
         shape.to_vec(),
@@ -280,7 +280,7 @@ fn store_f64_array(
             break;
         }
     }
-    Ok((values.len() * std::mem::size_of::<f64>()) as u64)
+    Ok(std::mem::size_of_val(values) as u64)
 }
 
 fn integer_chunk_values<T: Copy + Default>(
@@ -350,12 +350,12 @@ fn store_integer_array<
     dimensions: &[String],
     values: &[T],
     attrs: &Map<String, Value>,
-    data_type: zarrs::array::builder::ArrayBuilderDataType,
-    fill_value: T,
+    data_type_and_fill_value: (zarrs::array::builder::ArrayBuilderDataType, T),
 ) -> Result<u64, String> {
+    let (data_type, fill_value) = data_type_and_fill_value;
     let chunks = shape
         .iter()
-        .map(|value| (*value).min(64).max(1))
+        .map(|value| (*value).clamp(1, 64))
         .collect::<Vec<_>>();
     let mut builder =
         zarrs::array::ArrayBuilder::new(shape.to_vec(), chunks, data_type, fill_value);
@@ -390,7 +390,7 @@ fn store_integer_array<
             break;
         }
     }
-    Ok((values.len() * std::mem::size_of::<T>()) as u64)
+    Ok(std::mem::size_of_val(values) as u64)
 }
 
 pub fn convert_netcdf_to_zarr(
@@ -471,8 +471,7 @@ pub fn convert_netcdf_to_zarr(
                     .get_values::<i8, _>(..)
                     .map_err(|error| error.to_string())?,
                 &attrs,
-                zarrs::array::data_type::int8().into(),
-                0_i8,
+                (zarrs::array::data_type::int8().into(), 0_i8),
             )?,
             "int16" => store_integer_array(
                 store.clone(),
@@ -483,8 +482,7 @@ pub fn convert_netcdf_to_zarr(
                     .get_values::<i16, _>(..)
                     .map_err(|error| error.to_string())?,
                 &attrs,
-                zarrs::array::data_type::int16().into(),
-                0_i16,
+                (zarrs::array::data_type::int16().into(), 0_i16),
             )?,
             "int32" => store_integer_array(
                 store.clone(),
@@ -495,8 +493,7 @@ pub fn convert_netcdf_to_zarr(
                     .get_values::<i32, _>(..)
                     .map_err(|error| error.to_string())?,
                 &attrs,
-                zarrs::array::data_type::int32().into(),
-                0_i32,
+                (zarrs::array::data_type::int32().into(), 0_i32),
             )?,
             "int64" => store_integer_array(
                 store.clone(),
@@ -507,8 +504,7 @@ pub fn convert_netcdf_to_zarr(
                     .get_values::<i64, _>(..)
                     .map_err(|error| error.to_string())?,
                 &attrs,
-                zarrs::array::data_type::int64().into(),
-                0_i64,
+                (zarrs::array::data_type::int64().into(), 0_i64),
             )?,
             "uint8" => store_integer_array(
                 store.clone(),
@@ -519,8 +515,7 @@ pub fn convert_netcdf_to_zarr(
                     .get_values::<u8, _>(..)
                     .map_err(|error| error.to_string())?,
                 &attrs,
-                zarrs::array::data_type::uint8().into(),
-                0_u8,
+                (zarrs::array::data_type::uint8().into(), 0_u8),
             )?,
             "uint16" => store_integer_array(
                 store.clone(),
@@ -531,8 +526,7 @@ pub fn convert_netcdf_to_zarr(
                     .get_values::<u16, _>(..)
                     .map_err(|error| error.to_string())?,
                 &attrs,
-                zarrs::array::data_type::uint16().into(),
-                0_u16,
+                (zarrs::array::data_type::uint16().into(), 0_u16),
             )?,
             "uint32" => store_integer_array(
                 store.clone(),
@@ -543,8 +537,7 @@ pub fn convert_netcdf_to_zarr(
                     .get_values::<u32, _>(..)
                     .map_err(|error| error.to_string())?,
                 &attrs,
-                zarrs::array::data_type::uint32().into(),
-                0_u32,
+                (zarrs::array::data_type::uint32().into(), 0_u32),
             )?,
             "uint64" => store_integer_array(
                 store.clone(),
@@ -555,8 +548,7 @@ pub fn convert_netcdf_to_zarr(
                     .get_values::<u64, _>(..)
                     .map_err(|error| error.to_string())?,
                 &attrs,
-                zarrs::array::data_type::uint64().into(),
-                0_u64,
+                (zarrs::array::data_type::uint64().into(), 0_u64),
             )?,
             _ => unreachable!(),
         };
