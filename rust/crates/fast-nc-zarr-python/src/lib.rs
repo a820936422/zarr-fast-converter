@@ -5,8 +5,8 @@ use fast_nc_zarr_zarr::{
     convert_netcdf_to_zarr, inspect_array, inspect_netcdf, read_chunk_f32 as read_zarr_chunk_f32,
     read_chunk_f64 as read_zarr_chunk_f64, read_region_f32 as read_zarr_region_f32,
     read_region_f64 as read_zarr_region_f64, rechunk_f32_array, rechunk_f64_array,
-    rechunk_multi_array, write_f32_array as write_zarr_f32_array,
-    write_f64_array as write_zarr_f64_array,
+    rechunk_multi_array, resample_f32, write_f32_array as write_zarr_f32_array,
+    write_f64_array as write_zarr_f64_array, ResampleF32Request,
 };
 use pyo3::prelude::*;
 
@@ -125,8 +125,16 @@ fn convert_netcdf_json(py: Python<'_>, input: &str, output: &str) -> PyResult<St
     serde_json::to_string(&summary).map_err(runtime_error)
 }
 
+#[pyfunction]
+fn resample_f32_json(plan_json: &str) -> PyResult<String> {
+    let plan: ResampleF32Request = serde_json::from_str(plan_json).map_err(runtime_error)?;
+    let result = resample_f32(&plan).map_err(runtime_error)?;
+    serde_json::to_string(&result).map_err(runtime_error)
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(resample_f32_json, module)?)?;
     module.add_function(wrap_pyfunction!(convert_netcdf_json, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_netcdf_json, module)?)?;
     module.add_function(wrap_pyfunction!(capability_json, module)?)?;

@@ -6,7 +6,7 @@ use std::time::Duration;
 use fast_nc_zarr_model::{MultiRechunkExecutionPlan, RechunkExecutionPlan};
 use fast_nc_zarr_zarr::{
     convert_netcdf_to_zarr, inspect_array, inspect_netcdf, rechunk_f32_array, rechunk_multi_array,
-    write_f64_array,
+    resample_f32, write_f64_array, ResampleF32Request,
 };
 use serde_json::{Map, Value};
 use tauri::{AppHandle, State};
@@ -22,6 +22,8 @@ const NATIVE_OPERATIONS: &[&str] = &[
     "zarr.inspect",
     "raw.netcdf.inspect",
     "raw.netcdf.convert",
+    "resample.nearest",
+    "resample.bilinear",
     "zarr.rechunk_f32",
     "zarr.rechunk_multi",
     "zarr.write_f64",
@@ -155,6 +157,7 @@ fn run_native_task(
         "zarr.inspect" => native_inspect(&request.payload),
         "raw.netcdf.inspect" => native_netcdf_inspect(&request.payload),
         "raw.netcdf.convert" => native_netcdf_convert(&request.payload),
+        "resample.nearest" | "resample.bilinear" => native_resample(&request.payload),
         "zarr.write_f64" => native_write_f64(&request.payload),
         "zarr.rechunk_f32" => native_rechunk(
             &request.payload,
@@ -263,6 +266,26 @@ fn native_netcdf_convert(payload: &Map<String, Value>) -> Result<Map<String, Val
             .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
     );
     Ok(result)
+}
+
+fn native_resample(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+    let request: ResampleF32Request = serde_json::from_value(Value::Object(payload.clone()))
+        .map_err(|error| {
+            AppError::new(ErrorKind::InvalidRequest, error.to_string()).at_stage("resampling")
+        })?;
+    let result = resample_f32(&request)
+        .map_err(|error| AppError::new(ErrorKind::InputInvalid, error).at_stage("resampling"))?;
+    let mut output = Map::new();
+    output.insert(
+        "operation".to_string(),
+        Value::String(format!("resample.{}", result.method)),
+    );
+    output.insert(
+        "result".to_string(),
+        serde_json::to_value(result)
+            .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
+    );
+    Ok(output)
 }
 fn native_write_f64(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
     let root = required_string(payload, "path")?;
@@ -560,6 +583,8 @@ mod tests {
         assert!(validate_operation("zarr.inspect").is_ok());
         assert!(validate_operation("raw.netcdf.inspect").is_ok());
         assert!(validate_operation("raw.netcdf.convert").is_ok());
+        assert!(validate_operation("resample.nearest").is_ok());
+        assert!(validate_operation("resample.bilinear").is_ok());
     }
 
     #[test]

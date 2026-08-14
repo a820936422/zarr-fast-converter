@@ -22,10 +22,11 @@ Rust desktop runtime
 - fill_value、scale_factor、add_offset 和 CF attrs 保持；
 - zstd、Blosc 系列和 gzip 显式无损 codec；
 - 标准 NetCDF-4/classic 的 `time/lat/lon` 数值变量 metadata inspect 和 float32/float64 → Zarr v3 conversion；
+- float32 规则经纬度网格的 native nearest/bilinear，支持 latitude 方向和越界 NaN；
 - 有界并行、取消、进度、staging 校验和原子发布；
 - capability matrix、manifest 和事件证据。
 
-复杂 HDF、整数 NetCDF conversion、非标准 calendar 和规则网格 native resampling 仍由兼容路径负责，并在 capability 中明确记录。多变量 native 不执行自动压缩候选调优。
+复杂 HDF、整数 NetCDF conversion、非标准 calendar、复杂 xESMF 方法和非规则网格仍由兼容路径负责，并在 capability 中明确记录。多变量 native 不执行自动压缩候选调优。
 
 ## 安装环境
 

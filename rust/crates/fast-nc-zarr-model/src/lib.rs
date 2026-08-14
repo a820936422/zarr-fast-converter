@@ -179,6 +179,22 @@ impl BackendCapability {
                     "Zarr v3 output",
                 ][..],
             ),
+            (
+                "resample.nearest",
+                &[
+                    "float32",
+                    "regular latitude/longitude grids",
+                    "NaN outside source bounds",
+                ][..],
+            ),
+            (
+                "resample.bilinear",
+                &[
+                    "float32",
+                    "regular latitude/longitude grids",
+                    "NaN outside source bounds",
+                ][..],
+            ),
         ];
         let operations = supported
             .iter()
@@ -188,23 +204,11 @@ impl BackendCapability {
             .iter()
             .map(|(operation, limitations)| OperationCapability::supported(operation, limitations))
             .collect::<Vec<_>>();
-        capabilities.extend([
-            OperationCapability::unsupported(
-                "resample.nearest",
-                "native resampling is not implemented in this phase",
-                &["use Python fallback"],
-            ),
-            OperationCapability::unsupported(
-                "resample.bilinear",
-                "native resampling is not implemented in this phase",
-                &["use Python fallback"],
-            ),
-            OperationCapability::unsupported(
-                "pipeline.native",
-                "native pipeline runtime is not implemented in this phase",
-                &["use Python fallback"],
-            ),
-        ]);
+        capabilities.extend([OperationCapability::unsupported(
+            "pipeline.native",
+            "native pipeline runtime is not implemented in this phase",
+            &["use Python fallback"],
+        )]);
         Self {
             backend: "rust".to_owned(),
             protocol_version: BACKEND_PROTOCOL_VERSION,
@@ -229,7 +233,7 @@ mod tests {
     fn smoke_capability_has_stable_protocol_and_matrix() {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
-        assert_eq!(capability.operations.len(), 16);
+        assert_eq!(capability.operations.len(), 18);
         assert_eq!(capability.capabilities.len(), 19);
         let supported = capability
             .capabilities

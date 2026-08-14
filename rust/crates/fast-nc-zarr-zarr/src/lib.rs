@@ -1,3 +1,7 @@
+mod resample_native;
+
+pub use resample_native::{resample_f32, ResampleF32Request, ResampleF32Response};
+
 mod netcdf_native;
 
 pub use netcdf_native::{

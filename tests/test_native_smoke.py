@@ -23,7 +23,7 @@ from fast_nc_zarr.rechunking.native import (
 
 _CAPABILITY = rust_capability()
 _RUST_NETCDF_READY = _CAPABILITY.supported and "raw.netcdf.inspect" in _CAPABILITY.operations
-
+_RUST_RESAMPLE_READY = _CAPABILITY.supported and {"resample.nearest", "resample.bilinear"}.issubset(_CAPABILITY.operations)
 
 _RUST_ZARR_READY = _CAPABILITY.supported and {
     "zarr.inspect",
@@ -83,14 +83,13 @@ class NativePreparationTests(unittest.TestCase):
         expected = "rust" if _RUST_ZARR_READY else "python"
         self.assertEqual(resolve_backend("auto", "zarr.rechunk_f32"), expected)
 
-    def test_standard_raw_and_resample_operations_remain_explainable_fallbacks(self) -> None:
-        expected = "rust" if _RUST_NETCDF_READY else "python"
-        self.assertEqual(resolve_backend("auto", "raw.netcdf.inspect"), expected)
-        self.assertEqual(resolve_backend("auto", "raw.netcdf.convert"), expected)
-        for operation in ("resample.nearest", "resample.bilinear"):
-            self.assertEqual(resolve_backend("auto", operation), "python")
-            with self.assertRaises(BackendUnavailableError):
-                resolve_backend("rust", operation)
+    def test_standard_raw_and_resample_operations_resolve_native_capabilities(self) -> None:
+        netcdf_expected = "rust" if _RUST_NETCDF_READY else "python"
+        resample_expected = "rust" if _RUST_RESAMPLE_READY else "python"
+        self.assertEqual(resolve_backend("auto", "raw.netcdf.inspect"), netcdf_expected)
+        self.assertEqual(resolve_backend("auto", "raw.netcdf.convert"), netcdf_expected)
+        self.assertEqual(resolve_backend("auto", "resample.nearest"), resample_expected)
+        self.assertEqual(resolve_backend("auto", "resample.bilinear"), resample_expected)
 
 
 
@@ -145,6 +144,7 @@ class RustZarrCrossBackendTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.native = importlib.import_module("fast_nc_zarr._native")
+
         cls.tempdir = tempfile.TemporaryDirectory(prefix="fast-nc-zarr-rust-zarr-")
 
     @classmethod
@@ -575,6 +575,26 @@ class RustZarrCrossBackendTests(unittest.TestCase):
                     target_chunks=(1, 2, 2),
                 )
             )
+
+@unittest.skipUnless(_RUST_RESAMPLE_READY, "Rust resampling extension is not built")
+class RustResamplingTests(unittest.TestCase):
+    def test_nearest_and_bilinear_regular_grid(self) -> None:
+        native = importlib.import_module("fast_nc_zarr._native")
+        request = {
+            "values": [0.0, 1.0, 2.0, 3.0],
+            "shape": [1, 2, 2],
+            "source_lat": [0.0, 1.0],
+            "source_lon": [0.0, 1.0],
+            "target_lat": [0.5],
+            "target_lon": [0.5],
+            "method": "bilinear",
+        }
+        bilinear = json.loads(native.resample_f32_json(json.dumps(request)))
+        self.assertEqual(bilinear["shape"], [1, 1, 1])
+        self.assertAlmostEqual(bilinear["values"][0], 1.5)
+        request["method"] = "nearest"
+        nearest = json.loads(native.resample_f32_json(json.dumps(request)))
+        self.assertEqual(nearest["values"], [0.0])
 
 if __name__ == "__main__":
     unittest.main()
