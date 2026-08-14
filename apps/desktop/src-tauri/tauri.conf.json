@@ -34,6 +34,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "linux": {
+      "rpm": {
+        "compression": {
+          "type": "zstd",
+          "level": 1
+        }
+      }
+    },
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }
