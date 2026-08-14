@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fast-nc-zarr.dev/contracts/request-v1.json",
+  "title": "Fast NC Zarr IPC request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "request_id", "command", "payload"],
+  "properties": {
+    "protocol_version": {"const": 1},
+    "request_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": ["string", "null"]},
+    "command": {
+      "enum": ["get_capabilities", "inspect_source", "inspect_zarr", "inspect_time_metadata", "save_inspection_snapshot", "preview_pipeline", "run_pipeline", "resume_pipeline", "native_task", "cancel_task", "shutdown"]
+    },
+    "payload": {"type": "object"}
+  }
+}

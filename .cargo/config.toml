@@ -1,0 +1,4 @@
+[env]
+# GCC 16 defaults to C23 mode for C sources; conda's linker sysroot
+# does not provide __isoc23_strtol. Keep bundled C codecs portable.
+CFLAGS = { value = "-std=gnu17", force = false }

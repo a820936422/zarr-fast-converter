@@ -1,96 +1,126 @@
-# 图形界面模块
+# Tauri 桌面应用
 
 ## 定位
 
-`fast_nc_zarr.gui` 是 PySide6 桌面界面。它通过 `application.services` 直接调用核心引擎，不启动外部 CLI 子进程。主流程围绕“数据检查、处理流程、任务中心”组织，旧的独立操作页面对象仅为兼容保留。
+桌面应用由 Tauri 2、React 19 和 TypeScript 构成。前端通过 `@tauri-apps/api` 调用 Rust commands；Rust 负责窗口生命周期、任务注册、取消、资源快照、事件流、native capability 和兼容处理路径编排。
 
-启动：
+源码位置：
 
-```bash
-pixi run gui
-python -m fast_nc_zarr.gui.app
+```text
+apps/desktop/src/              React + TypeScript UI
+apps/desktop/src-tauri/src/   Tauri/Rust runtime
+apps/desktop/src-tauri/       Tauri 配置、权限和图标
 ```
 
-## 字体与显示
+## 启动
 
-GUI 在创建主窗口前从 `src/fast_nc_zarr/gui/assets/NotoSansSC-VF.ttf` 注册 Noto Sans SC，并设置为 QApplication 全局字体。字体依据 SIL Open Font License 1.1 随项目分发，因此 WSL、原生 Linux 和其他可运行 PySide6 的环境不依赖系统中文字体。资源缺失或注册失败会明确报错，不静默切换到不同字体。
+从项目根目录执行：
 
-## v1.6.8 视觉与交互
+```bash
+nvm use
+npm --prefix apps/desktop ci
+pixi run gui
+```
 
-v1.6.8 将 GUI 重排为统一应用壳：左侧固定导航只显示“数据检查、处理流程、任务中心”，顶部显示当前数据源、阶段和任务状态，页面底部使用固定操作栏。旧的转换、重采样和重分块页面对象仍为 Python API 兼容保留，但不再作为主导航入口。
+`pixi run gui` 调用 `scripts/desktop_dev.sh`，脚本会设置桌面 Rust linker 环境并启动 Tauri dev window。
+在 Linux Wayland 会话中，如果存在可用的 X11 display，Tauri 会自动使用 X11 fallback，避免 WebKitGTK 因 Wayland protocol error 无法创建窗口。需要强制选择时可设置 `FAST_NC_ZARR_DISPLAY_BACKEND=x11` 或 `FAST_NC_ZARR_DISPLAY_BACKEND=wayland`。
 
-默认主题使用浅色工作区、深蓝侧栏和白色卡片。颜色、字体层级、焦点边框和成功/警告/失败状态由 `gui/theme.py` 的语义令牌集中管理。状态同时使用文字、徽标和颜色表达，disabled 控件保持可读。
+直接使用 npm：
 
-数据检查页按“输入数据 → 时间规则 → 结构结果”三步显示；处理流程页使用操作配方、渐进式参数和右侧计划摘要；任务中心页提供当前任务卡、CPU/RSS/读写/磁盘指标、日志和会话历史。
+```bash
+npm --prefix apps/desktop run tauri:dev
+```
 
-所有路径字段显示可访问性状态，仅保留路径编辑和“浏览”入口；收藏、最近浏览和收藏管理集中在浏览打开的嵌入式路径选择界面左侧面板中完成。路径收藏设置从 `pathPicker/v1` 自动迁移到 `pathPicker/v2`，旧设置不会被删除，不可访问的收藏也会保留。
+只启动 Vite 浏览器预览：
 
+```bash
+npm --prefix apps/desktop run dev
+```
 
-## 页面工作流
+浏览器预览不会提供 Tauri commands；界面会进入 preview runtime，文件检查和任务执行需要在 Tauri desktop window 中验证。
+
+## 页面
+
+### 总览
+
+显示最近路径、native capability 数量、活动任务和当前执行策略，并提供数据检查与任务中心快捷入口。
 
 ### 数据检查
 
-1. 选择原始数据、现有 Zarr 或失败任务临时目录。
-2. 对原始文件单独执行时间字段检查。
-3. 确认完整日期来自文件名、源 `time`，或采用年份 + DOY 等组合规则。
-4. 完成全文件结构检查后，处理参数才解锁。
-5. 检查结果可以保存为 JSON 快照；导入时会验证文件大小和修改时间指纹。
+流程为：
+
+1. 选择原始数据目录或现有 Zarr；
+2. 对原始数据检查时间轴和时间规则；
+3. 读取完整结构；
+4. 查看变量、警告和 capability matrix；
+5. 保存检查快照或进入处理流程。
 
 ### 处理流程
 
-- 原始数据转换是必经操作。
-- 重采样、重分块和重压缩按最终产品需要选择。
-- 页面显示规划器对每项操作的决定、源读取范围、目标网格、chunks、codec、worker 和风险提示。
-- 现有 Zarr 可以直接进入重采样或存储优化。
-- 临时任务输入可恢复原配置，并从最近的有效检查点继续。
-- “兼容性最终化 worker”默认自动；压缩可选速度、平衡或体积目标，并显示运行时实测选择。
+Pipeline Builder 组织以下阶段：
+
+- 输入检查；
+- 空间重采样；
+- 重分块；
+- 重压缩；
+- staging 校验和输出发布。
+
+后端路由只有两种前端可见策略：
+
+- `auto`：按 capability 优先选择 native 操作；
+- `rust`：要求选中的操作具备 native capability，否则明确失败。
+
+兼容执行路径不会在界面中伪装成 native 成功，实际路由和原因由 manifest、事件和 capability 记录。
 
 ### 任务中心
 
-`TaskWorker(QThread)` 在后台线程调用同步服务，避免阻塞界面。任务中心提供：
+任务中心显示：
 
-- stdout/stderr 日志转发；
-- 从各执行器日志提取的实际百分比、阶段完成量和当前阶段文本；
-- CPU、RSS、读写速率和相关磁盘空间指标；
-- 时间检查、计划预览与数据执行任务的安全取消；
-- 当前会话任务历史。
-- 每项任务在 `~/.cache/fast-nc-zarr/task-logs` 下生成文本日志和结构化 `events.jsonl`，记录进度与资源样本，GUI 清空当前日志不会删除这些诊断文件；目录不可写、磁盘写满或运行中日志 I/O 失败时会禁用本次持久化，但不会改变任务执行和会话历史状态。
+- 运行中、已完成、失败和已取消任务；
+- CPU 和可用内存快照；
+- manifest 路径；
+- 实时事件流；
+- 取消操作；
+- checkpoint 检查和恢复到新输出。
 
-取消信号会在 I/O 块或阶段边界传播；部分输出不会被标记为成功产品。
-修改输入类型、路径、读取引擎、递归扫描、worker、源维度映射或时间规则时，已有检查结果会立即失效并锁定处理流程，必须按当前参数重新检查。
+### 路径设置
 
-所有主要输入、临时和输出路径使用统一选择器：路径字段显示可访问状态，字段内不再放置收藏或管理按钮；“浏览”打开带有左侧收藏/最近浏览面板的嵌入式文件选择界面，支持搜索、进入收藏目录、选择当前目录、收藏当前目录、管理收藏和清除最近浏览。收藏名称、顺序、各角色上次目录通过 `QSettings` 持久化；v1.6.8 使用 `pathPicker/v2` 并自动迁移 v1。暂时不可访问的目录会标记但不会被静默删除，设置写入失败不影响任务。
+路径设置只保存当前桌面用户的 localStorage 数据：
 
+- 当前输入目录；
+- 收藏路径；
+- 最近目录。
 
-## 配置能力
+## 前端 API 边界
 
-GUI 覆盖 CLI 的主要功能：
+`apps/desktop/src/api.ts` 只定义 TypeScript 到 Tauri command 的请求和响应类型。前端不直接访问兼容处理服务的进程、stdin/stdout 或内部模块；这些实现细节由 Rust runtime 隔离。
 
-- 时间、纬度、经度和变量选择；
-- 变量输出重命名；
-- 源填充值、缩放和输出填充值；
-- xESMF 方法、分辨率、缺测策略和值替换；
-- time/space/custom 分块策略与两阶段自动 worker；
-- 自动或显式无损 codec、等级、shuffle，以及 speed/balanced/compact 目标；
-- 源、临时、输出介质自动检测或 SSD/HDD/网络覆盖；
-- 路径收藏、最近目录、临时目录、调优预算和校验；
-- 检查快照和失败任务恢复。
+主要 command：
 
-## 模块边界
+- `get_backend_info`；
+- `native_capabilities`；
+- `inspect_source`；
+- `inspect_zarr`；
+- `inspect_time_metadata`；
+- `save_inspection_snapshot`；
+- `preview_pipeline`；
+- `start_pipeline`；
+- `resume_pipeline`；
+- `inspect_pipeline_recovery`；
+- `start_native_task`；
+- `list_tasks`；
+- `get_task`；
+- `cancel_task`。
 
-- `gui/app.py`：QApplication、统一字体、主题和主窗口生命周期。
-- `gui/main_window.py`：页面、控件、配置收集和任务路由；旧页面对象保留兼容性。
-- `gui/theme.py`：颜色、字体、控件状态和布局视觉令牌。
-- `gui/components.py`：步骤条、状态徽标、指标卡和计划摘要等可复用组件。
-- `gui/state.py`：跨页面检查结果、处理计划、恢复任务和任务状态。
-- `gui/path_picker.py`：路径选择、收藏迁移、最近目录和收藏管理对话框。
-- `gui/path_chooser.py`：嵌入式 QFileDialog、收藏/最近浏览侧栏和目录选择交互。
-- `gui/workers.py`：后台执行、取消、日志和资源监控。
-- `application/services.py`：无 Qt 的检查、预览和执行服务；CLI/API 也可复用。
+## 验证
 
-## 使用建议与限制
+```bash
+npm --prefix apps/desktop run typecheck
+npm --prefix apps/desktop run build
+```
 
-- 第一次处理一种真实产品时，先完成数据检查并保存快照，再做 dry-run。
-- 长任务应将临时目录放在空间充足且速度较快的磁盘。
-- GUI 退出不会把未校验 staging 当作最终输出；失败任务目录应保留到问题定位或成功恢复后。
-- GUI 不扩展底层数据模型范围；规则网格、日级时间和三维数值变量等限制与相应核心模块一致。
+Tauri Rust runtime：
+
+```bash
+cargo test -p fast-nc-zarr-desktop
+```

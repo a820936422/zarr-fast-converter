@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-"""GUI-facing orchestration around the existing conversion engines.
+"""Application orchestration around the existing conversion engines.
 
-The services in this module deliberately contain no Qt code.  A desktop
-client, the CLI, and future automation can all use the same checked data
-objects and operation configuration.
+The services deliberately contain no UI code. A desktop client, the CLI and
+automation can share the same checked data objects and operation configuration.
 """
 
 from dataclasses import dataclass, field
@@ -41,10 +40,11 @@ from ..models import (
 from ..planner import resolve_conversion_plan
 from ..selection import make_selection, selected_logical_bytes
 from ..rechunking.compression import make_compression_plan
-from ..rechunking.engine import run_rechunk as core_run_rechunk
+from ..rechunking.engine import RechunkExecutionError, run_rechunk as core_run_rechunk
 from ..rechunking.inspection import format_inspection, inspect_store
 from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo
 from ..rechunking.planning import DEFAULT_TARGET_MIB, plan_chunks
+from .._backend import BackendUnavailableError
 from ..system import EffectiveResourceBudget
 from ..resampling.engine import (
     format_plan as format_resample_plan,
@@ -100,7 +100,7 @@ class SourceInspectionConfig:
 
 @dataclass
 class InspectionResult:
-    """A checked source or Zarr input kept by the GUI session."""
+    """A checked source or Zarr input kept by the application session."""
 
     kind: Literal["source", "zarr", "temporary"]
     path: Path
@@ -278,10 +278,7 @@ class RechunkConfig:
     workers: int | str = "auto"
     overwrite: bool = False
     validate: bool = True
-    # ``compression_only`` is retained for callers of the previous two-page
-    # GUI/API.  New callers should select the two independent operations
-    # below; both can then be applied in one output-producing pass.
-    compression_only: bool = False
+    backend: Literal["auto", "python", "rust"] = "python"
     rechunk: bool = True
     recompress: bool | None = None
     temporary_dir: Path | None = None
@@ -732,12 +729,10 @@ def run_conversion(
 def preview_rechunk(config: RechunkConfig, info: DatasetInfo | None = None) -> RechunkPreview:
     info = info or inspect_store(config.input)
     rechunk_enabled = bool(config.rechunk)
-    if config.compression_only:
-        rechunk_enabled = False
     recompress_enabled = (
-        True
-        if config.compression_only
-        else (config.compression != "none" if config.recompress is None else bool(config.recompress))
+        config.compression != "none"
+        if config.recompress is None
+        else bool(config.recompress)
     )
     if not rechunk_enabled and not recompress_enabled:
         raise ValueError("请至少选择重分块或重压缩中的一项。")
@@ -779,7 +774,49 @@ def run_rechunk(
     cancel_event=None,
 ) -> dict[str, Any]:
     preview = preview_rechunk(config, info)
-    return core_run_rechunk(
+    if config.backend in {"auto", "rust"}:
+        from ..rechunking.native import run_rust_rechunk_for_config
+
+        try:
+            return run_rust_rechunk_for_config(
+                config,
+                preview.info,
+                preview.plan,
+                compression=preview.compression,
+                cancel_event=cancel_event,
+            )
+        except (BackendUnavailableError, ImportError, ModuleNotFoundError) as exc:
+            if config.backend == "rust":
+                raise RechunkExecutionError(f"Rust 重分块失败: {exc}") from exc
+            fallback_metrics = core_run_rechunk(
+                config.input,
+                config.output,
+                preview.info,
+                preview.plan,
+                preview.compression,
+                workers=config.workers,
+                overwrite=config.overwrite,
+                progress=True,
+                validate=config.validate,
+                cancel_event=cancel_event,
+                temporary_dir=config.temporary_dir,
+                compression_objective=config.compression_objective,
+                compression_tune_budget_seconds=config.compression_tune_budget,
+                tuning_objective=config.tuning_objective,
+                resource_budget=config.resource_budget,
+                storage_overrides=config.storage_overrides,
+            )
+            fallback_metrics = dict(fallback_metrics)
+            fallback_metrics.update(
+                {
+                    "backend": "python",
+                    "backend_fallback": True,
+                    "backend_fallback_reason": str(exc),
+                    "protocol_version": None,
+                }
+            )
+            return fallback_metrics
+    metrics = core_run_rechunk(
         config.input,
         config.output,
         preview.info,
@@ -797,6 +834,12 @@ def run_rechunk(
         resource_budget=config.resource_budget,
         storage_overrides=config.storage_overrides,
     )
+    metrics = dict(metrics)
+    metrics.setdefault("backend", "python")
+    metrics.setdefault("backend_fallback", False)
+    metrics.setdefault("backend_fallback_reason", None)
+    metrics.setdefault("protocol_version", None)
+    return metrics
 
 
 def preview_resample(

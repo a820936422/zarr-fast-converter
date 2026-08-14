@@ -116,6 +116,7 @@ class PipelineConfig:
     resampling: PipelineResamplingOptions = field(default_factory=PipelineResamplingOptions)
     chunking: PipelineChunkingOptions = field(default_factory=PipelineChunkingOptions)
     compression: PipelineCompressionOptions = field(default_factory=PipelineCompressionOptions)
+    backend: Literal["auto", "python", "rust"] = "python"
     validate: bool = True
     semantic_constraints: dict[str, dict[str, float | bool]] = field(default_factory=dict)
 

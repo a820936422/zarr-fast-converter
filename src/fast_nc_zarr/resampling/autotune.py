@@ -55,9 +55,9 @@ def _memory_limits() -> tuple[int, int]:
 def _memory_budget(available: int, total: int) -> int:
     """Keep the auto-selected working set well below system memory pressure."""
 
-    # ``available`` already accounts for the GUI and the current Python
-    # process.  The second cap prevents a mostly idle large machine from
-    # giving one regridding task an unnecessarily large working set.
+    # ``available`` already accounts for the desktop application and the
+    # current Python process. The second cap prevents a mostly idle large machine
+    # from giving one regridding task an unnecessarily large working set.
     # ESMF can reserve substantial native memory outside Python RSS.  Keep a
     # large system reserve, while allowing a realistic parallel group on a
     # machine with ample free memory.  The per-worker estimate below is

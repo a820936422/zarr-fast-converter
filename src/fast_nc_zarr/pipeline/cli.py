@@ -107,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--compression-tune-budget", type=float, default=60.0)
     parser.add_argument("--workers", type=_parse_workers, default="auto")
+    parser.add_argument("--backend", choices=("auto", "python", "rust"), default="python")
     parser.add_argument("--mode", choices=("auto", "complete", "filename"), default="auto")
     parser.add_argument("--engine", default="auto")
     parser.add_argument("--recursive", action="store_true")
@@ -232,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             objective=args.compression_objective,
             tune_budget=args.compression_tune_budget,
         ),
+        backend=args.backend,
         validate=not args.no_validate,
     )
     plan = preview_pipeline(inspection, config)

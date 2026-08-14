@@ -14,3 +14,33 @@ build/
 # Local converter scratch stores
 .fast_nc_zarr_*
 *.zarr.tmp/
+
+
+# Rust/Cargo and PyO3 native build products
+/target/
+src/fast_nc_zarr/_native*.so
+# Tauri/TypeScript frontend build products
+apps/desktop/node_modules/
+apps/desktop/dist/
+apps/desktop/.vite/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/binaries/*
+!apps/desktop/src-tauri/binaries/.gitkeep
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Generated desktop protocol bindings
+contracts/generated/
+# Locally built release packages; publish these as release assets instead of repository blobs
+release/*.deb
+release/*.rpm
+release/*.AppImage
+release/*.appimage
+release/*.tar.gz
+release/*.zip
+release/*.dmg
+release/*.msi
+release/*.whl

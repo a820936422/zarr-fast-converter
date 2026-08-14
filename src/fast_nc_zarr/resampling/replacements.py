@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Safe, chunk-friendly value replacement rules for resampling.
 
-The public GUI/CLI representation is two comma-separated strings.  This
+The public desktop/CLI representation is two comma-separated strings. This
 module normalizes that representation into immutable rules and evaluates a
 small arithmetic expression language without exposing Python ``eval``.
 """

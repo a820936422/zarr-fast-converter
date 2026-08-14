@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fast-nc-zarr.dev/contracts/event-v1.json",
+  "title": "Fast NC Zarr IPC event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "request_id", "sequence", "event", "payload"],
+  "properties": {
+    "protocol_version": {"const": 1},
+    "request_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": ["string", "null"]},
+    "sequence": {"type": "integer", "minimum": 0},
+    "event": {"enum": ["accepted", "started", "inspection_ready", "plan_ready", "progress", "resource", "log", "finished", "failed", "cancelled"]},
+    "stage": {"type": ["string", "null"]},
+    "payload": {"type": "object"}
+  }
+}

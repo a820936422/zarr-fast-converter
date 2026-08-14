@@ -1,0 +1,16 @@
+[package]
+name = "fast-nc-zarr-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "PyO3 bridge for the Fast NC Zarr native backend"
+
+[lib]
+name = "fast_nc_zarr_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+fast-nc-zarr-model.workspace = true
+pyo3.workspace = true
+fast-nc-zarr-zarr.workspace = true
+serde_json.workspace = true

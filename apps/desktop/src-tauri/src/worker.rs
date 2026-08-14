@@ -1,0 +1,176 @@
+use crate::error::{AppError, ErrorKind};
+use crate::protocol::{decode_event, EventEnvelope, RequestEnvelope};
+use std::collections::HashMap;
+use std::env;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
+
+pub struct WorkerProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    sequences: HashMap<String, u64>,
+    terminal_tasks: HashMap<String, bool>,
+}
+
+impl WorkerProcess {
+    pub fn spawn() -> Result<Self, AppError> {
+        let project_root = env::var_os("FAST_NC_ZARR_PROJECT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
+        let target = option_env!("TAURI_ENV_TARGET_TRIPLE").unwrap_or("");
+        let mut candidates = Vec::new();
+        if let Some(explicit) = env::var_os("FAST_NC_ZARR_WORKER") {
+            candidates.push(PathBuf::from(explicit));
+        }
+        if let Ok(executable) = env::current_exe() {
+            if let Some(directory) = executable.parent() {
+                candidates.push(directory.join("fast-nc-zarr-worker"));
+                if !target.is_empty() {
+                    candidates.push(directory.join(format!("fast-nc-zarr-worker-{target}")));
+                }
+            }
+        }
+        candidates.push(project_root.join("apps/desktop/src-tauri/binaries/fast-nc-zarr-worker"));
+        if !target.is_empty() {
+            candidates.push(project_root.join(format!(
+                "apps/desktop/src-tauri/binaries/fast-nc-zarr-worker-{target}"
+            )));
+        }
+        let sidecar = candidates.into_iter().find(|candidate| candidate.is_file());
+        let use_sidecar = sidecar.is_some();
+        let mut command = sidecar.map(Command::new).unwrap_or_else(|| {
+            Command::new(env::var_os("PYTHON").unwrap_or_else(|| "python".into()))
+        });
+        if !use_sidecar {
+            let mut python_path = project_root.join("src").into_os_string();
+            if let Some(existing) = env::var_os("PYTHONPATH") {
+                python_path.push(":");
+                python_path.push(existing);
+            }
+            command
+                .env("PYTHONPATH", python_path)
+                .args(["-m", "fast_nc_zarr.application.desktop_worker"]);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().map_err(|error| {
+            AppError::new(ErrorKind::WorkerStartFailed, error.to_string()).at_stage("worker_start")
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            AppError::new(ErrorKind::WorkerStartFailed, "worker stdin unavailable")
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            AppError::new(ErrorKind::WorkerStartFailed, "worker stdout unavailable")
+        })?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            sequences: HashMap::new(),
+            terminal_tasks: HashMap::new(),
+        })
+    }
+    pub fn send(&mut self, request: &RequestEnvelope) -> Result<Vec<EventEnvelope>, AppError> {
+        let mut events = Vec::new();
+        self.send_streaming(request, |event| {
+            events.push(event.clone());
+            Ok(())
+        })?;
+        Ok(events)
+    }
+
+    pub fn send_streaming<F>(
+        &mut self,
+        request: &RequestEnvelope,
+        mut on_event: F,
+    ) -> Result<EventEnvelope, AppError>
+    where
+        F: FnMut(&EventEnvelope) -> Result<(), AppError>,
+    {
+        request
+            .validate()
+            .map_err(|error| AppError::new(ErrorKind::InvalidRequest, error).at_stage("request"))?;
+        let line = serde_json::to_string(request)
+            .map_err(|error| AppError::new(ErrorKind::WorkerProtocolError, error.to_string()))?;
+        writeln!(self.stdin, "{line}")
+            .map_err(|error| AppError::new(ErrorKind::WorkerStartFailed, error.to_string()))?;
+        self.stdin
+            .flush()
+            .map_err(|error| AppError::new(ErrorKind::WorkerStartFailed, error.to_string()))?;
+        loop {
+            let mut line = String::new();
+            let count = self.stdout.read_line(&mut line).map_err(|error| {
+                AppError::new(ErrorKind::WorkerProtocolError, error.to_string())
+            })?;
+            if count == 0 {
+                let status = self.child.try_wait().map_err(|error| {
+                    AppError::new(ErrorKind::WorkerProtocolError, error.to_string())
+                })?;
+                return Err(AppError::new(
+                    ErrorKind::WorkerProtocolError,
+                    format!("worker exited before terminal event: {status:?}"),
+                ));
+            }
+            let event = decode_event(line.trim()).map_err(|error| {
+                AppError::new(ErrorKind::WorkerProtocolError, error).at_stage("worker_event")
+            })?;
+            if event.request_id != request.request_id {
+                return Err(AppError::new(
+                    ErrorKind::WorkerProtocolError,
+                    "worker response request_id mismatch",
+                ));
+            }
+            self.check_sequence(&event)?;
+            let terminal = event.is_terminal();
+            on_event(&event)?;
+            if terminal {
+                return Ok(event);
+            }
+        }
+    }
+    fn check_sequence(&mut self, event: &EventEnvelope) -> Result<(), AppError> {
+        if self
+            .terminal_tasks
+            .get(&event.request_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(AppError::new(
+                ErrorKind::WorkerProtocolError,
+                "event received after terminal event",
+            ));
+        }
+        if let Some(previous) = self.sequences.get(&event.request_id) {
+            if event.sequence <= *previous {
+                return Err(AppError::new(
+                    ErrorKind::WorkerProtocolError,
+                    "worker event sequence is not increasing",
+                ));
+            }
+        }
+        self.sequences
+            .insert(event.request_id.clone(), event.sequence);
+        if event.is_terminal() {
+            self.terminal_tasks.insert(event.request_id.clone(), true);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub type SharedWorker = Arc<Mutex<Option<WorkerProcess>>>;
+
+pub fn new_shared_worker() -> SharedWorker {
+    Arc::new(Mutex::new(None))
+}

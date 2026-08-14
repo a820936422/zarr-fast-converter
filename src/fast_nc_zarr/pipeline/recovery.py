@@ -179,6 +179,7 @@ def _restore_config(
             objective=str(compression.get("objective", "balanced")),
             tune_budget=float(compression.get("tune_budget", 60.0)),
         ),
+        backend=str(data.get("backend", (payload.get("backend") or {}).get("requested", "python"))),
         validate=bool(data.get("validate", True)),
         semantic_constraints={
             str(name): dict(value)

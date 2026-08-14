@@ -1,0 +1,2 @@
+{"protocol_version":1,"request_id":"request-fixture-001","task_id":"task-fixture-001","sequence":0,"event":"accepted","stage":"capabilities","payload":{}}
+{"protocol_version":1,"request_id":"request-fixture-001","task_id":"task-fixture-001","sequence":1,"event":"finished","stage":"capabilities","payload":{"backend":"python","operations":["inspection","pipeline"]}}
