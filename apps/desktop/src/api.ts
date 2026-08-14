@@ -21,12 +21,6 @@ export type BackendCapability = {
   capabilities: OperationCapability[];
 };
 
-export type WorkerCapabilities = {
-  backend: string;
-  native: BackendCapability;
-  operations: string[];
-};
-
 export type TimeRef = {
   source: "filename" | "time";
   component: "full" | "year" | "month" | "day" | "doy";
@@ -118,7 +112,6 @@ export type TaskEvent = {
 
 
 export const getBackendInfo = () => invoke<BackendInfo>("get_backend_info");
-export const getWorkerCapabilities = () => invoke<WorkerCapabilities>("worker_capabilities");
 export const inspectSource = (request: InspectionRequest) => invoke<InspectionResult>("inspect_source", { payload: request });
 export const getNativeCapabilities = () => invoke<BackendCapability>("native_capabilities");
 export const inspectZarr = (path: string) => invoke<InspectionResult>("inspect_zarr", { path });

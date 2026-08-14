@@ -9,15 +9,17 @@ import {
   pickDirectory,
   pickSnapshotDestination,
   previewPipeline,
+  resumePipeline,
   saveInspectionSnapshot,
   startNativeTask,
   startPipeline,
-  resumePipeline,
   type BackendCapability,
   type BackendInfo,
   type InspectionRequest,
   type InspectionResult,
   type PipelinePayload,
+  type TaskEvent,
+  type TaskSummary,
   type TimeInspection,
   type TimeRule,
 } from "./api";
@@ -26,11 +28,120 @@ import "./styles.css";
 
 type InputKind = "source" | "zarr";
 type InspectionStage = "input" | "time" | "structure";
-type View = "inspection" | "pipeline" | "tasks" | "settings";
-type BackendMode = "python" | "auto" | "rust";
+type View = "overview" | "inspection" | "pipeline" | "tasks" | "settings";
+type BackendMode = "auto" | "rust";
+type IconName =
+  | "activity"
+  | "archive"
+  | "arrow"
+  | "chevron"
+  | "clock"
+  | "database"
+  | "folder"
+  | "grid"
+  | "layers"
+  | "play"
+  | "refresh"
+  | "settings"
+  | "spark"
+  | "tasks"
+  | "terminal"
+  | "upload";
+
+const ICON_PATHS: Record<IconName, string> = {
+  activity: "M3 12h4l2.2-7 4.2 14 2.2-7H21",
+  archive: "M4 7h16v13H4zM3 4h18v3H3zM9 11h6",
+  arrow: "M5 12h13M13 6l6 6-6 6",
+  chevron: "M9 5l7 7-7 7",
+  clock: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zm0-14v5l3 2",
+  database: "M5 6c0-1.7 3.1-3 7-3s7 1.3 7 3-3.1 3-7 3-7-1.3-7-3zm0 0v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6m-14 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6",
+  folder: "M3 6.5A1.5 1.5 0 0 1 4.5 5H10l2 2h7.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z",
+  grid: "M4 4h6v6H4zm10 0h6v6h-6zM4 14h6v6H4zm10 0h6v6h-6z",
+  layers: "M12 3l9 5-9 5-9-5 9-5zm-9 9 9 5 9-5M3 17l9 5 9-5",
+  play: "M8 5v14l11-7z",
+  refresh: "M20 11a8 8 0 0 0-14.7-3L3 11m0 0V5m0 6h6M4 13a8 8 0 0 0 14.7 3L21 13m0 0v6m0-6h-6",
+  settings: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0-5v3m0 8v3m0 5v-3m0-8V5m9 7h-3M8 12H5m14.4-6.4-2.1 2.1M7.7 16.3l-2.1 2.1m0-12.8 2.1 2.1m9.6 8.6 2.1 2.1",
+  spark: "M12 2l1.7 6.3L20 10l-6.3 1.7L12 18l-1.7-6.3L4 10l6.3-1.7zM19 16l.7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7z",
+  tasks: "M5 5h14v14H5zM8 9h8M8 13h5M8 17h3",
+  terminal: "M5 7l5 5-5 5m7 0h7",
+  upload: "M12 16V4m0 0L7 9m5-5 5 5M5 20h14",
+};
+
+const VIEW_TITLES: Record<View, string> = {
+  overview: "工作台",
+  inspection: "数据检查",
+  pipeline: "处理流程",
+  tasks: "任务中心",
+  settings: "路径设置",
+};
+
+const OPERATION_LABELS: Record<string, string> = {
+  "zarr.inspect": "Zarr 结构检查",
+  "zarr.read_chunk_f32": "Float32 chunk 读取",
+  "zarr.read_chunk_f64": "Float64 chunk 读取",
+  "zarr.read_region_f32": "Float32 region 读取",
+  "zarr.read_region_f64": "Float64 region 读取",
+  "zarr.write_f32": "Float32 数组写入",
+  "zarr.write_f64": "Float64 数组写入",
+  "zarr.rechunk_f32": "Float32 重分块",
+  "zarr.rechunk_f64": "Float64 重分块",
+};
+
+function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
+  return (
+    <svg className="icon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={ICON_PATHS[name]} />
+    </svg>
+  );
+}
 
 function reasonText(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
+}
+
+function formatBytes(value: number): string {
+  if (!value) return "—";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+  return `${(value / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function formatTaskStatus(status: TaskSummary["status"]): string {
+  return {
+    running: "运行中",
+    cancelling: "正在取消",
+    finished: "已完成",
+    failed: "失败",
+    cancelled: "已取消",
+  }[status];
+}
+
+function formatCommand(command: string): string {
+  return {
+    native_task: "原生任务",
+    run_pipeline: "数据处理",
+    resume_pipeline: "恢复处理",
+  }[command] || command;
+}
+
+function operationLabel(operation: string): string {
+  return OPERATION_LABELS[operation] || operation;
+}
+
+function capabilityReason(item: BackendCapability["capabilities"][number]): string {
+  if (item.supported) return "已就绪 · 原生执行";
+  return item.reason || "当前走兼容执行";
+}
+
+function eventText(event: TaskEvent): string {
+  if (event.event === "progress") {
+    const completed = event.payload.completed;
+    const total = event.payload.total;
+    if (typeof completed === "number" && typeof total === "number" && total > 0) {
+      return `${Math.round((completed / total) * 100)}%`;
+    }
+  }
+  return event.stage || "任务事件";
 }
 
 function App() {
@@ -50,7 +161,7 @@ function App() {
   const [stage, setStage] = useState<InspectionStage>("input");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<View>("inspection");
+  const [view, setView] = useState<View>("overview");
   const [plan, setPlan] = useState<Record<string, unknown> | null>(null);
   const [recoveryPath, setRecoveryPath] = useState("");
   const [recoveryInspection, setRecoveryInspection] = useState<InspectionResult | null>(null);
@@ -67,6 +178,10 @@ function App() {
   const { events, tasks, cancel } = useTaskEvents();
 
   useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) {
+      setBackend({ app: "fast-nc-zarr", version: "1.7.2", runtime: "browser-preview" });
+      return;
+    }
     void getBackendInfo().then(setBackend).catch((reason: unknown) => setBackendError(reasonText(reason)));
     void getNativeCapabilities().then(setNativeCapability).catch((reason: unknown) => setBackendError(reasonText(reason)));
   }, []);
@@ -76,9 +191,10 @@ function App() {
     if (event?.event !== "finished" || event.payload.operation !== "zarr.inspect") return;
     const summary = event.payload.summary;
     if (!summary || typeof summary !== "object" || Array.isArray(summary)) return;
-    setInspection({ kind: "zarr", path: inputPath, report: "Rust native Zarr inspection complete", warnings: [], snapshot: summary as Record<string, unknown> });
+    setInspection({ kind: "zarr", path: inputPath, report: "原生 Zarr 检查完成", warnings: [], snapshot: summary as Record<string, unknown> });
     setStage("structure");
   }, [events, inputPath]);
+
   useEffect(() => {
     try {
       setFavorites(JSON.parse(localStorage.getItem("fast-nc-zarr:favorites") || "[]") as string[]);
@@ -105,6 +221,15 @@ function App() {
     });
   };
 
+  const clearInspection = () => {
+    setTimeInspection(null);
+    setTimeRule(null);
+    setInspection(null);
+    setSelectedVariables([]);
+    setPlan(null);
+    setStage("input");
+  };
+
   const chooseInput = async () => {
     setError(null);
     try {
@@ -113,17 +238,14 @@ function App() {
         setInputPath(selected);
         rememberPath(selected);
         setOutputPath("");
-        setTimeInspection(null);
-        setTimeRule(null);
-        setInspection(null);
-        setSelectedVariables([]);
-        setPlan(null);
-        setStage("input");
+        clearInspection();
+        setView("inspection");
       }
     } catch (reason) {
       setError(reasonText(reason));
     }
   };
+
   const inspectNativeZarr = async () => {
     if (!inputPath || inputKind !== "zarr") return;
     setBusy(true);
@@ -235,6 +357,7 @@ function App() {
       setBusy(false);
     }
   };
+
   const inspectRecovery = async () => {
     if (!recoveryPath) return;
     setBusy(true);
@@ -275,12 +398,6 @@ function App() {
   const canInspectStructure = Boolean(inputPath) && (inputKind === "zarr" || Boolean(timeRule) || stage === "time") && !busy;
   const runningTasks = useMemo(() => tasks.filter((task) => task.status === "running" || task.status === "cancelling"), [tasks]);
   const supported = (operation: string) => nativeCapability?.capabilities.find((item) => item.operation === operation);
-  const formatBytes = (value: number) => {
-    if (!value) return "—";
-    const units = ["B", "KiB", "MiB", "GiB"];
-    const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
-    return `${(value / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
-  };
   const variableOptions = useMemo(() => {
     const raw = inspection?.snapshot.variables;
     if (!Array.isArray(raw)) return [];
@@ -298,55 +415,162 @@ function App() {
     });
   }, [variableOptions]);
 
+  const capabilityItems = nativeCapability?.capabilities || [];
+  const supportedCount = capabilityItems.filter((item) => item.supported).length;
+  const lastEvent = events[events.length - 1];
+  const statusLabel = busy ? "处理中" : runningTasks.length ? `${runningTasks.length} 个任务运行中` : inspection ? "检查已完成" : "系统就绪";
+
+  const renderNavigation = (items: Array<{ view: View; label: string; icon: IconName; shortcut: string }>) => items.map((item) => (
+    <button className={`nav-button ${view === item.view ? "active" : ""}`} type="button" key={item.view} onClick={() => setView(item.view)} disabled={item.view === "pipeline" && !inspection}>
+      <Icon name={item.icon} />
+      <span>{item.label}</span>
+      <kbd>{item.shortcut}</kbd>
+    </button>
+  ));
+
   return (
-    <main className="app-shell">
+    <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><span className="brand-mark">Z</span><div><strong>快速 Zarr 转换器</strong><small>桌面工作台</small></div></div>
-        <nav aria-label="主导航">
-          <button className={view === "inspection" ? "nav-item active" : "nav-item"} type="button" onClick={() => setView("inspection")}>数据检查</button>
-          <button className={view === "pipeline" ? "nav-item active" : "nav-item"} type="button" disabled={!inspection} onClick={() => setView("pipeline")}>处理流程</button>
-          <button className={view === "tasks" ? "nav-item active" : "nav-item"} type="button" onClick={() => setView("tasks")}>任务中心</button>
-          <button className={view === "settings" ? "nav-item active" : "nav-item"} type="button" onClick={() => setView("settings")}>路径设置</button>
+        <div className="brand-block">
+          <div className="brand-mark"><Icon name="spark" size={21} /></div>
+          <div><strong>Fast NC Zarr</strong><span>科学数据工作台</span></div>
+        </div>
+        <div className="workspace-switcher"><span className="workspace-dot" />默认工作区<Icon name="chevron" size={14} /></div>
+        <div className="nav-label">工作区</div>
+        <nav className="primary-nav" aria-label="主导航">
+          {renderNavigation([
+            { view: "overview", label: "总览", icon: "grid", shortcut: "01" },
+            { view: "inspection", label: "数据检查", icon: "database", shortcut: "02" },
+            { view: "pipeline", label: "处理流程", icon: "layers", shortcut: "03" },
+            { view: "tasks", label: "任务中心", icon: "activity", shortcut: "04" },
+          ])}
         </nav>
-        <div className="sidebar-footer">{backend ? `${backend.runtime} · v${backend.version}` : "连接后端…"}</div>
+        <div className="nav-label nav-label-spaced">管理</div>
+        <nav className="primary-nav" aria-label="管理导航">
+          {renderNavigation([{ view: "settings", label: "路径设置", icon: "settings", shortcut: "05" }])}
+        </nav>
+        <div className="sidebar-capability">
+          <div className="sidebar-capability-head"><span>原生执行能力</span><Icon name="arrow" size={14} /></div>
+          <strong>{supportedCount}<small> / {capabilityItems.length || "—"} 项可用</small></strong>
+          <div className="mini-progress"><span style={{ width: capabilityItems.length ? `${(supportedCount / capabilityItems.length) * 100}%` : "0%" }} /></div>
+          <p>能力不足时自动切换兼容路径。</p>
+        </div>
+        <div className="sidebar-footer">
+          <div className="connection-line"><span className={`connection-dot ${backend ? "online" : ""}`} />{backend ? "本地引擎已连接" : "正在连接本地引擎"}</div>
+          <span>{backend ? `${backend.runtime} · v${backend.version}` : "等待运行时"}</span>
+        </div>
       </aside>
-      <section className="workspace">
+
+      <main className="main-shell">
         <header className="topbar">
-          <div><span className="eyebrow">v1.7.2 / Native-first Tauri shell</span><h1>{view === "inspection" ? "数据检查" : view === "pipeline" ? "处理流程" : view === "tasks" ? "任务中心" : "路径设置"}</h1></div>
-          <span className="status-badge">{busy ? "处理中" : runningTasks.length ? "任务运行中" : inspection ? "检查完成" : "准备就绪"}</span>
+          <div className="breadcrumb"><span>FAST NC ZARR</span><Icon name="chevron" size={13} /><strong>{VIEW_TITLES[view]}</strong></div>
+          <div className="topbar-actions">
+            <div className={`status-pill ${busy ? "busy" : runningTasks.length ? "running" : ""}`}><span />{statusLabel}</div>
+            <button className="icon-text-button" type="button" onClick={() => setView("tasks")}><Icon name="tasks" size={16} />任务中心{runningTasks.length > 0 && <b>{runningTasks.length}</b>}</button>
+          </div>
         </header>
 
-        {view === "inspection" && <>
-          <div className="stepper" aria-label="检查步骤">{["输入数据", "时间规则", "结构结果"].map((label, index) => <div className={index + 1 <= stageIndex ? "step active" : "step"} key={label}><span>{index + 1}</span>{label}</div>)}</div>
-          <section className="content-grid">
-            <article className="card hero-card">
-              <span className="step-label">步骤 {stageIndex} / 3</span><h2>输入数据</h2>
-              <div className="segmented" role="group" aria-label="输入类型"><button className={inputKind === "source" ? "selected" : ""} type="button" onClick={() => setInputKind("source")}>原始数据目录</button><button className={inputKind === "zarr" ? "selected" : ""} type="button" onClick={() => setInputKind("zarr")}>现有 Zarr</button></div>
-              <label className="field-label" htmlFor="input-path">路径</label><div className="path-row"><input id="input-path" value={inputPath} onChange={(event) => setInputPath(event.target.value)} placeholder={inputKind === "source" ? "选择 NetCDF / HDF / TIFF 目录" : "选择 Zarr v3 目录"} /><button className="secondary-button" type="button" onClick={() => void chooseInput()}>浏览</button></div>
-              {inputKind === "zarr" && <div className="path-row"><input aria-label="Zarr array path" value={arrayPath} onChange={(event) => setArrayPath(event.target.value)} placeholder="array path，例如 /value" /><button className="secondary-button" type="button" disabled={!inputPath || busy} onClick={() => void inspectNativeZarr()}>Rust native 检查</button></div>}
-              <div className="options-row">{inputKind === "source" && <label><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} />递归扫描</label>}{inputKind === "source" && <label>引擎 <select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="auto">自动</option><option value="h5netcdf">h5netcdf</option><option value="netcdf4">netcdf4</option><option value="rasterio">rasterio</option></select></label>}</div>
-              <div className="actions">{inputKind === "source" && <button className="secondary-button" disabled={!canInspectTime} type="button" onClick={() => void inspectTime()}>检查时间信息</button>}<button className="primary-button" disabled={!canInspectStructure} type="button" onClick={() => void inspectStructure()}>检查数据结构</button></div>
-              {timeInspection && <div className="result-box"><strong>时间来源待确认</strong><p>{timeInspection.report}</p><select aria-label="时间规则" value={timeRule ? JSON.stringify(timeRule) : ""} onChange={(event) => setTimeRule(event.target.value ? JSON.parse(event.target.value) as TimeRule : null)}><option value="">请选择已确认规则</option><option value={timeInspection.suggested_rule ? JSON.stringify(timeInspection.suggested_rule) : ""}>使用建议规则</option></select></div>}
-              {inspection && <div className="result-box"><strong>结构检查完成</strong><p>{inspection.report}</p><p>{inspection.warnings.length ? `警告：${inspection.warnings.join("；")}` : "无警告"}</p><button className="secondary-button" type="button" onClick={() => void saveSnapshot()}>保存检查快照</button></div>}
-              {variableOptions.length > 0 && <div className="variable-picker"><strong>参与处理的变量</strong>{variableOptions.map((name) => <label key={name}><input type="checkbox" checked={selectedVariables.includes(name)} onChange={(event) => setSelectedVariables((current) => event.target.checked ? [...current, name] : current.filter((item) => item !== name))} />{name}</label>)}</div>}
-            </article>
-            <article className="card checklist-card"><h2>Native 能力</h2><p className="helper-text">能力查询由 Tauri Rust 直接完成，不启动 Python worker。</p>{nativeCapability ? <div className="capability-list">{nativeCapability.capabilities.map((item) => <div className={`capability-item ${item.supported ? "supported" : "unavailable"}`} key={item.operation}><strong>{item.operation}</strong><small>{item.supported ? "可用" : item.reason || "使用 Python fallback"}</small></div>)}</div> : <p className="helper-text">正在读取 capability…</p>}<div className="backend-state" role="status"><span className={backend ? "dot online" : "dot"} />{backend ? `${backend.app} · ${backend.runtime}` : "正在连接后端…"}</div></article>
-          </section>
-        </>}
+        <div className="page-content">
+          {view === "overview" && (
+            <>
+              <section className="welcome-panel">
+                <div className="welcome-copy">
+                  <span className="eyebrow"><Icon name="spark" size={14} /> NATIVE-FIRST DATA WORKSPACE</span>
+                  <h1>让每一次转换<br /><em>都可解释、可恢复。</em></h1>
+                  <p>从原始科学数据到高性能 Zarr。检查结构、配置处理流程，并在一个清晰的工作台中追踪每个结果。</p>
+                  <div className="button-row">
+                    <button className="primary-button large" type="button" onClick={() => setView("inspection")}><Icon name="upload" size={17} />开始检查数据</button>
+                    <button className="quiet-button large" type="button" onClick={() => setView("tasks")}><Icon name="activity" size={17} />查看任务</button>
+                  </div>
+                </div>
+                <div className="welcome-visual" aria-hidden="true">
+                  <div className="visual-grid" />
+                  <div className="visual-orbit orbit-one" />
+                  <div className="visual-orbit orbit-two" />
+                  <div className="visual-core"><Icon name="database" size={32} /></div>
+                  <div className="visual-chip chip-top"><span />ZARR V3</div>
+                  <div className="visual-chip chip-bottom"><Icon name="activity" size={13} /> READY TO FLOW</div>
+                </div>
+              </section>
 
-        {view === "pipeline" && <section className="content-grid"><article className="card hero-card"><span className="step-label">已锁定检查结果</span><h2>处理流程</h2><p>输入：{inputPath}</p><label className="field-label" htmlFor="output-path">输出 Zarr 目录</label><input id="output-path" value={outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`} onChange={(event) => setOutputPath(event.target.value)} /><div className="options-row"><label><input type="checkbox" checked={resample} onChange={(event) => setResample(event.target.checked)} />空间重采样</label><label><input type="checkbox" checked={rechunk} onChange={(event) => setRechunk(event.target.checked)} />重分块</label><label><input type="checkbox" checked={recompress} onChange={(event) => setRecompress(event.target.checked)} />重压缩</label></div>{resample && <div className="options-row"><label>方法 <select value={resampleMethod} onChange={(event) => setResampleMethod(event.target.value)}><option value="nearest_s2d">nearest_s2d</option><option value="nearest_d2s">nearest_d2s</option><option value="bilinear">bilinear</option><option value="conservative">conservative（Python）</option></select></label><label>分辨率 <input className="small-input" type="number" min="0" step="any" value={resolution} onChange={(event) => setResolution(Number(event.target.value))} /></label></div>}{rechunk && <div className="options-row"><label>目标 chunk MiB <input className="small-input" type="number" min="1" step="1" value={targetMib} onChange={(event) => setTargetMib(Number(event.target.value))} /></label></div>}{recompress && <div className="options-row"><label>压缩 <select value={compression} onChange={(event) => setCompression(event.target.value)}><option value="auto">自动</option><option value="zstd">Zstd</option><option value="blosc-lz4">Blosc LZ4</option><option value="gzip">Gzip</option></select></label></div>}<div className="options-row"><label>执行 backend <select value={backendMode} onChange={(event) => setBackendMode(event.target.value as BackendMode)}><option value="python">Python reference</option><option value="auto">Auto（按 capability）</option><option value="rust">Rust native（不支持则失败）</option></select></label></div>{backendMode !== "python" && <p className="helper-text">Auto/Rust 只会启用已通过 capability 的最终化操作；原始格式、复杂重采样和 pipeline 仍由 Python 处理。</p>}<div className="actions"><button className="secondary-button" disabled={busy} type="button" onClick={() => void runPreview()}>预览计划</button><button className="primary-button" disabled={busy} type="button" onClick={() => void runPipeline()}>启动任务</button></div>{plan && <div className="result-box"><strong>计划已生成</strong><p>{JSON.stringify(plan, null, 2)}</p></div>}</article><article className="card checklist-card"><h2>请求能力</h2><ul><li className="done">源数据检查</li><li className={resample ? "done" : ""}>空间重采样 {resample ? `（${resampleMethod}）` : "（未选择）"}</li><li className={rechunk ? "done" : ""}>重分块 {rechunk ? "（已选择）" : "（未选择）"}</li><li className={recompress ? "done" : ""}>重压缩 {recompress ? `（${compression}）` : "（未选择）"}</li></ul>{resampleMethod && <p className="helper-text">native status：{supported(`resample.${resampleMethod}`)?.supported ? "supported" : "Python fallback"}</p>}</article></section>}
+              <div className="metric-grid">
+                <article className="metric-card"><div className="metric-icon blue"><Icon name="layers" /></div><div><span>原生能力</span><strong>{supportedCount}<small> / {capabilityItems.length || "—"}</small></strong><p>已通过能力矩阵</p></div></article>
+                <article className="metric-card"><div className="metric-icon violet"><Icon name="activity" /></div><div><span>活动任务</span><strong>{runningTasks.length}</strong><p>{runningTasks.length ? "正在执行" : "当前没有运行任务"}</p></div></article>
+                <article className="metric-card"><div className="metric-icon green"><Icon name="folder" /></div><div><span>最近路径</span><strong>{recentPaths.length}</strong><p>本地工作区记录</p></div></article>
+                <article className="metric-card accent"><div className="metric-icon orange"><Icon name="spark" /></div><div><span>执行策略</span><strong>Auto</strong><p>按能力自动路由</p></div></article>
+              </div>
 
-        {view === "tasks" && <section className="content-grid">
-          <article className="card hero-card"><h2>任务历史</h2>{tasks.length === 0 ? <p>暂无任务。完成数据检查后可从处理流程启动。</p> : <div className="task-list">{tasks.map((task) => <div className="task-row" key={task.taskId}><div><strong>{task.command}</strong><small>{task.taskId}</small>{task.resource && <small>{task.resource.logicalCpus} CPU · 可用内存 {formatBytes(task.resource.memoryAvailableBytes)}</small>}</div><span className={`task-status ${task.status}`}>{task.status}</span>{(task.status === "running" || task.status === "cancelling") && <button className="secondary-button" type="button" onClick={() => void cancel(task.taskId)}>取消</button>}{task.manifest && <span className="manifest-path">{task.manifest}</span>}</div>)}</div>}</article>
-          <article className="card checklist-card"><h2>任务恢复</h2><p className="helper-text">输入保留的 pipeline 临时目录，先检查 manifest/checkpoint，再恢复到新的输出目录。</p><label className="field-label" htmlFor="recovery-path">临时任务目录</label><div className="path-row"><input id="recovery-path" value={recoveryPath} onChange={(event) => setRecoveryPath(event.target.value)} placeholder="例如 /tmp/.../pipeline-..." /><button className="secondary-button" type="button" onClick={() => void inspectRecovery()}>检查</button></div><div className="actions"><button className="primary-button" type="button" disabled={!recoveryInspection || busy} onClick={() => void resumeRecovery()}>恢复任务</button></div>{recoveryInspection && <div className="result-box"><strong>恢复检查完成</strong><p>{recoveryInspection.report}</p></div>}</article>
-          <article className="card checklist-card"><h2>实时日志</h2><div className="event-log">{events.slice(-20).map((eve) => <p key={`${eve.request_id}-${eve.sequence}`}><strong>{eve.event}</strong> · {eve.stage || "—"}<br />{JSON.stringify(eve.payload)}</p>)}</div></article>
-        </section>}
+              <div className="dashboard-grid">
+                <article className="surface recent-card">
+                  <div className="section-heading"><div><span className="section-kicker">QUICK ACCESS</span><h2>最近使用</h2></div><button className="link-button" type="button" onClick={() => setView("settings")}>管理路径 <Icon name="arrow" size={14} /></button></div>
+                  {recentPaths.length ? <div className="recent-list">{recentPaths.slice(0, 4).map((path) => <button className="recent-item" type="button" key={path} onClick={() => { setInputPath(path); setView("inspection"); }}><span className="recent-icon"><Icon name="folder" size={16} /></span><span><strong>{path.split(/[\\/]/).pop() || path}</strong><small>{path}</small></span><Icon name="chevron" size={15} /></button>)}</div> : <div className="empty-inline"><Icon name="folder" size={22} /><p>还没有最近路径<br /><button type="button" onClick={() => setView("inspection")}>选择一个数据目录开始</button></p></div>}
+                </article>
+                <article className="surface route-card">
+                  <div className="section-heading"><div><span className="section-kicker">EXECUTION ROUTE</span><h2>执行路线</h2></div><button className="link-button" type="button" onClick={() => setView("settings")}>查看设置 <Icon name="arrow" size={14} /></button></div>
+                  <div className="route-list"><div className="route-item"><span className="route-number">01</span><div><strong>检查输入结构</strong><small>识别变量、维度和时间规则</small></div><span className="route-status ready">READY</span></div><div className="route-item"><span className="route-number">02</span><div><strong>按能力编排</strong><small>原生路径优先，兼容路径兜底</small></div><span className="route-status ready">AUTO</span></div><div className="route-item"><span className="route-number">03</span><div><strong>校验并发布</strong><small>staging 完成后原子发布结果</small></div><span className="route-status wait">SAFE</span></div></div>
+                </article>
+              </div>
+            </>
+          )}
 
-        {view === "settings" && <section className="content-grid"><article className="card hero-card"><h2>路径设置</h2><p className="helper-text">路径只保存在当前桌面用户的 localStorage，不写入项目文件。</p><label className="field-label" htmlFor="settings-input-path">当前输入路径</label><div className="path-row"><input id="settings-input-path" value={inputPath} onChange={(event) => setInputPath(event.target.value)} placeholder="输入或选择目录" /><button className="secondary-button" type="button" onClick={() => void chooseInput()}>浏览</button></div><div className="actions"><button className="secondary-button" type="button" disabled={!inputPath} onClick={() => toggleFavorite(inputPath)}>{inputPath && favorites.includes(inputPath) ? "取消收藏" : "收藏当前路径"}</button><button className="primary-button" type="button" disabled={!inputPath} onClick={() => { rememberPath(inputPath); setView("inspection"); }}>使用此路径</button></div></article><article className="card checklist-card"><h2>收藏和最近目录</h2><div className="path-history"><strong>收藏</strong>{favorites.length ? favorites.map((path) => <div className="history-row" key={`favorite-${path}`}><button className="path-link" type="button" onClick={() => setInputPath(path)}>{path}</button><button className="icon-button" type="button" onClick={() => toggleFavorite(path)}>移除</button></div>) : <p className="helper-text">暂无收藏路径。</p>}<strong>最近使用</strong>{recentPaths.length ? recentPaths.map((path) => <div className="history-row" key={`recent-${path}`}><button className="path-link" type="button" onClick={() => setInputPath(path)}>{path}</button><button className="icon-button" type="button" onClick={() => toggleFavorite(path)}>{favorites.includes(path) ? "已收藏" : "收藏"}</button></div>) : <p className="helper-text">暂无最近目录。</p>}</div></article></section>}
+          {view === "inspection" && (
+            <>
+              <div className="page-heading"><div><span className="section-kicker">STEP {String(stageIndex).padStart(2, "0")} / 03</span><h1>检查数据结构</h1><p>先确认输入的变量、时间和坐标，再生成一份可追踪的处理计划。</p></div><div className="step-progress"><span className={stageIndex >= 1 ? "active" : ""}>输入</span><i /><span className={stageIndex >= 2 ? "active" : ""}>时间</span><i /><span className={stageIndex >= 3 ? "active" : ""}>结构</span></div></div>
+              <div className="inspection-layout">
+                <section className="surface inspection-surface">
+                  <div className="surface-title"><div><span className="section-kicker">INPUT SOURCE</span><h2>选择数据源</h2></div><span className="surface-number">01</span></div>
+                  <div className="source-tabs" role="group" aria-label="输入类型"><button className={inputKind === "source" ? "selected" : ""} type="button" onClick={() => setInputKind("source")}><Icon name="archive" size={17} /><span><strong>原始数据目录</strong><small>NetCDF · HDF · TIFF</small></span></button><button className={inputKind === "zarr" ? "selected" : ""} type="button" onClick={() => setInputKind("zarr")}><Icon name="database" size={17} /><span><strong>现有 Zarr</strong><small>直接检查数组结构</small></span></button></div>
+                  <label className="field-label" htmlFor="input-path">数据路径</label><div className="input-with-action"><Icon name="folder" size={17} /><input id="input-path" value={inputPath} onChange={(event) => setInputPath(event.target.value)} placeholder={inputKind === "source" ? "选择 NetCDF / HDF / TIFF 目录" : "选择 Zarr v3 目录"} /><button className="field-action" type="button" onClick={() => void chooseInput()}>浏览</button></div>
+                  {inputKind === "zarr" && <div className="input-with-action secondary-input"><Icon name="layers" size={17} /><input aria-label="Zarr array path" value={arrayPath} onChange={(event) => setArrayPath(event.target.value)} placeholder="array path，例如 /value" /><button className="field-action" type="button" disabled={!inputPath || busy} onClick={() => void inspectNativeZarr()}>原生检查</button></div>}
+                  {inputKind === "source" && <div className="inline-options"><label className="check-control"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /><span className="fake-check" />递归扫描</label><label className="select-control">读取引擎<select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="auto">自动选择</option><option value="h5netcdf">h5netcdf</option><option value="netcdf4">netcdf4</option><option value="rasterio">rasterio</option></select></label></div>}
+                  {timeInspection && <div className="inline-result"><div className="result-icon"><Icon name="clock" size={16} /></div><div><strong>时间规则待确认</strong><p>{timeInspection.report}</p><select aria-label="时间规则" value={timeRule ? JSON.stringify(timeRule) : ""} onChange={(event) => setTimeRule(event.target.value ? JSON.parse(event.target.value) as TimeRule : null)}><option value="">请选择已确认规则</option><option value={timeInspection.suggested_rule ? JSON.stringify(timeInspection.suggested_rule) : ""}>使用建议规则</option></select></div></div>}
+                  {inspection && <div className="inline-result success"><div className="result-icon"><Icon name="spark" size={16} /></div><div><strong>结构检查完成</strong><p>{inspection.report}</p><span>{inspection.warnings.length ? `${inspection.warnings.length} 条警告` : "未发现警告"}</span></div><button className="icon-button" type="button" title="保存检查快照" onClick={() => void saveSnapshot()}><Icon name="archive" size={16} /></button></div>}
+                  {variableOptions.length > 0 && <div className="variable-block"><div className="variable-heading"><strong>参与处理的变量</strong><span>{selectedVariables.length} / {variableOptions.length}</span></div><div className="variable-list">{variableOptions.map((name) => <label key={name}><input type="checkbox" checked={selectedVariables.includes(name)} onChange={(event) => setSelectedVariables((current) => event.target.checked ? [...current, name] : current.filter((item) => item !== name))} /><span className="fake-check" />{name}</label>)}</div></div>}
+                  <div className="surface-actions"><button className="quiet-button" type="button" disabled={!canInspectTime} onClick={() => void inspectTime()}><Icon name="clock" size={16} />检查时间轴</button><button className="primary-button" type="button" disabled={!canInspectStructure} onClick={() => void inspectStructure()}><Icon name="arrow" size={16} />读取结构</button></div>
+                </section>
+                <aside className="inspection-side">
+                  <section className="surface profile-card"><div className="surface-title compact"><div><span className="section-kicker">DATA PROFILE</span><h2>数据概览</h2></div><Icon name="activity" size={18} /></div>{inspection ? <div className="profile-stats"><div><span>输入类型</span><strong>{inspection.kind === "zarr" ? "Zarr v3" : "原始数据"}</strong></div><div><span>变量数量</span><strong>{variableOptions.length || "—"}</strong></div><div><span>时间状态</span><strong>{timeRule ? "已确认" : "待检查"}</strong></div><div><span>警告</span><strong className={inspection.warnings.length ? "warning-text" : "good-text"}>{inspection.warnings.length}</strong></div></div> : <div className="profile-empty"><Icon name="database" size={24} /><strong>等待输入数据</strong><span>完成结构检查后，这里会显示变量和坐标摘要。</span></div>}</section>
+                  <section className="surface capability-card"><div className="surface-title compact"><div><span className="section-kicker">CAPABILITY MATRIX</span><h2>原生能力</h2></div><span className="capability-count">{supportedCount}/{capabilityItems.length || "—"}</span></div><div className="capability-list">{capabilityItems.slice(0, 6).map((item) => <div className={`capability-row ${item.supported ? "supported" : "limited"}`} key={item.operation}><span className="capability-led" /><div><strong>{operationLabel(item.operation)}</strong><small>{capabilityReason(item)}</small></div></div>)}</div><button className="link-button full-link" type="button" onClick={() => setView("settings")}>查看执行设置 <Icon name="arrow" size={14} /></button></section>
+                </aside>
+              </div>
+            </>
+          )}
 
-        {(error || backendError) && <p className="error-text">{error || backendError}</p>}
-      </section>
-    </main>
+          {view === "pipeline" && (
+            <>
+              <div className="page-heading"><div><span className="section-kicker">PIPELINE BUILDER</span><h1>配置处理流程</h1><p>将已确认的数据检查结果编排为一条可恢复、可验证的执行路径。</p></div><span className="inspection-badge"><Icon name="spark" size={14} />检查结果已锁定</span></div>
+              <div className="pipeline-layout">
+                <section className="surface pipeline-surface">
+                  <div className="surface-title"><div><span className="section-kicker">PROCESS FLOW</span><h2>处理阶段</h2></div><span className="surface-number">02</span></div>
+                  <div className="stage-flow"><div className="flow-stage complete"><span>01</span><Icon name="database" size={16} /><div><strong>输入检查</strong><small>{inputPath.split(/[\\/]/).pop() || "已确认数据"}</small></div><Icon name="spark" size={14} /></div><div className="flow-connector" /><label className={`flow-stage toggle-stage ${resample ? "enabled" : ""}`}><span>02</span><Icon name="grid" size={16} /><div><strong>空间重采样</strong><small>{resample ? resampleMethod : "未启用"}</small></div><input type="checkbox" checked={resample} onChange={(event) => setResample(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${rechunk ? "enabled" : ""}`}><span>03</span><Icon name="layers" size={16} /><div><strong>重分块</strong><small>{rechunk ? `目标 ${targetMib} MiB` : "未启用"}</small></div><input type="checkbox" checked={rechunk} onChange={(event) => setRechunk(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${recompress ? "enabled" : ""}`}><span>04</span><Icon name="spark" size={16} /><div><strong>重压缩</strong><small>{recompress ? compression : "未启用"}</small></div><input type="checkbox" checked={recompress} onChange={(event) => setRecompress(event.target.checked)} /><span className="toggle-switch" /></label></div>
+                  {resample && <div className="advanced-panel"><div className="panel-label"><Icon name="grid" size={15} />重采样参数</div><div className="advanced-fields"><label>方法<select value={resampleMethod} onChange={(event) => setResampleMethod(event.target.value)}><option value="nearest_s2d">nearest_s2d</option><option value="nearest_d2s">nearest_d2s</option><option value="bilinear">bilinear</option><option value="conservative">conservative</option></select></label><label>目标分辨率<input type="number" min="0" step="any" value={resolution} onChange={(event) => setResolution(Number(event.target.value))} /></label></div></div>}
+                  {rechunk && <div className="advanced-panel"><div className="panel-label"><Icon name="layers" size={15} />重分块参数</div><div className="advanced-fields"><label>目标 chunk MiB<input type="number" min="1" step="1" value={targetMib} onChange={(event) => setTargetMib(Number(event.target.value))} /></label></div></div>}
+                  {recompress && <div className="advanced-panel"><div className="panel-label"><Icon name="spark" size={15} />压缩参数</div><div className="advanced-fields"><label>压缩配置<select value={compression} onChange={(event) => setCompression(event.target.value)}><option value="auto">自动选择</option><option value="zstd">Zstd</option><option value="blosc-lz4">Blosc LZ4</option><option value="gzip">Gzip</option></select></label></div></div>}
+                  <div className="output-block"><label className="field-label" htmlFor="output-path">输出 Zarr 目录</label><div className="input-with-action"><Icon name="upload" size={17} /><input id="output-path" value={outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`} onChange={(event) => setOutputPath(event.target.value)} /><span className="path-valid"><Icon name="spark" size={13} /></span></div></div>
+                  <div className="surface-actions"><button className="quiet-button" disabled={busy} type="button" onClick={() => void runPreview()}><Icon name="layers" size={16} />预览计划</button><button className="primary-button" disabled={busy} type="button" onClick={() => void runPipeline()}><Icon name="play" size={16} />启动处理</button></div>
+                </section>
+                <aside className="pipeline-side"><section className="surface execution-card"><div className="surface-title compact"><div><span className="section-kicker">EXECUTION POLICY</span><h2>执行策略</h2></div><Icon name="activity" size={18} /></div><label className="route-select-label">后端路由<select value={backendMode} onChange={(event) => setBackendMode(event.target.value as BackendMode)}><option value="auto">自动路由 · 推荐</option><option value="rust">原生强制 · 能力不足时失败</option></select></label><div className="policy-note"><span className="note-icon"><Icon name="spark" size={14} /></span><p><strong>Auto route</strong><br />优先使用已通过能力验证的原生操作，其他阶段保持结果语义不变。</p></div><div className="policy-list"><div><span className="policy-dot native" />原生能力优先</div><div><span className="policy-dot safe" />staging 校验后发布</div><div><span className="policy-dot trace" />manifest 全程留痕</div></div></section><section className="surface plan-card"><div className="surface-title compact"><div><span className="section-kicker">PLAN PREVIEW</span><h2>计划摘要</h2></div><span className="plan-state">{plan ? "READY" : "DRAFT"}</span></div>{plan ? <pre>{JSON.stringify(plan, null, 2)}</pre> : <div className="plan-empty"><Icon name="layers" size={22} /><span>点击“预览计划”<br />查看资源和阶段估算</span></div>}</section></aside>
+              </div>
+            </>
+          )}
+
+          {view === "tasks" && (
+            <>
+              <div className="page-heading"><div><span className="section-kicker">OBSERVABILITY</span><h1>任务中心</h1><p>所有任务、进度、资源和恢复点都集中在这里。</p></div><div className="task-summary"><strong>{tasks.length}</strong><span>历史任务</span></div></div>
+              <div className="tasks-layout"><section className="surface tasks-surface"><div className="surface-title"><div><span className="section-kicker">RUN HISTORY</span><h2>执行记录</h2></div><span className="live-label"><span />LIVE</span></div>{tasks.length === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="activity" size={24} /></div><strong>还没有任务</strong><p>完成一次数据检查后，可以从处理流程启动任务。</p><button className="primary-button" type="button" onClick={() => setView("inspection")}>开始检查</button></div> : <div className="task-table"><div className="task-table-head"><span>任务</span><span>状态</span><span>资源</span><span>操作</span></div>{tasks.map((task) => <div className="task-table-row" key={task.taskId}><div className="task-name"><span className={`task-icon ${task.status}`}><Icon name={task.command === "native_task" ? "spark" : "layers"} size={15} /></span><div><strong>{formatCommand(task.command)}</strong><small>{task.taskId}</small>{task.manifest && <small className="manifest-path"><Icon name="archive" size={11} />{task.manifest}</small>}</div></div><span className={`task-state ${task.status}`}>{formatTaskStatus(task.status)}</span><span className="task-resource">{task.resource ? `${task.resource.logicalCpus} CPU · ${formatBytes(task.resource.memoryAvailableBytes)}` : "—"}</span><div>{(task.status === "running" || task.status === "cancelling") && <button className="table-action" type="button" onClick={() => void cancel(task.taskId)}><Icon name="refresh" size={14} />取消</button>}</div></div>)}</div>}</section><aside className="tasks-side"><section className="surface recovery-card"><div className="surface-title compact"><div><span className="section-kicker">CHECKPOINT RECOVERY</span><h2>恢复任务</h2></div><Icon name="refresh" size={18} /></div><p className="surface-description">输入保留的临时目录，检查 checkpoint 后恢复到新的输出位置。</p><label className="field-label" htmlFor="recovery-path">临时任务目录</label><div className="input-with-action"><Icon name="folder" size={16} /><input id="recovery-path" value={recoveryPath} onChange={(event) => setRecoveryPath(event.target.value)} placeholder="/tmp/.../pipeline-..." /><button className="field-action" type="button" disabled={!recoveryPath || busy} onClick={() => void inspectRecovery()}>检查</button></div>{recoveryInspection && <div className="recovery-result"><span className="result-icon"><Icon name="spark" size={14} /></span><div><strong>恢复点可读取</strong><p>{recoveryInspection.report}</p></div></div>}<button className="primary-button full-button" type="button" disabled={!recoveryInspection || busy} onClick={() => void resumeRecovery()}><Icon name="refresh" size={15} />恢复到新输出</button></section><section className="surface event-card"><div className="surface-title compact"><div><span className="section-kicker">EVENT STREAM</span><h2>实时事件</h2></div><span className="event-count">{events.length}</span></div><div className="event-stream">{events.length ? events.slice(-8).reverse().map((event) => <div className="event-item" key={`${event.request_id}-${event.sequence}`}><span className={`event-dot ${event.event}`} /><div><strong>{event.event}</strong><small>{eventText(event)}</small></div><time>{event.sequence.toString().padStart(2, "0")}</time></div>) : <p className="empty-event">暂无事件流</p>}</div></section></aside></div>
+            </>
+          )}
+
+          {view === "settings" && (
+            <>
+              <div className="page-heading"><div><span className="section-kicker">WORKSPACE SETTINGS</span><h1>路径设置</h1><p>管理当前工作区的输入目录和快速访问记录。</p></div></div>
+              <div className="settings-layout"><section className="surface settings-surface"><div className="surface-title"><div><span className="section-kicker">ACTIVE PATH</span><h2>当前输入路径</h2></div><span className="surface-number">05</span></div><p className="surface-description">路径只保存在当前桌面用户的本地工作区，不会写入项目文件。</p><label className="field-label" htmlFor="settings-input-path">输入目录</label><div className="input-with-action"><Icon name="folder" size={17} /><input id="settings-input-path" value={inputPath} onChange={(event) => setInputPath(event.target.value)} placeholder="输入或选择目录" /><button className="field-action" type="button" onClick={() => void chooseInput()}>浏览</button></div><div className="surface-actions"><button className="quiet-button" type="button" disabled={!inputPath} onClick={() => toggleFavorite(inputPath)}><Icon name="spark" size={15} />{inputPath && favorites.includes(inputPath) ? "取消收藏" : "收藏当前路径"}</button><button className="primary-button" type="button" disabled={!inputPath} onClick={() => { rememberPath(inputPath); setView("inspection"); }}><Icon name="arrow" size={15} />使用此路径</button></div></section><aside className="surface saved-paths"><div className="surface-title compact"><div><span className="section-kicker">SAVED LOCATIONS</span><h2>收藏路径</h2></div><Icon name="folder" size={18} /></div>{favorites.length ? <div className="saved-list">{favorites.map((path) => <div className="saved-item" key={path}><button type="button" onClick={() => { setInputPath(path); setView("inspection"); }}><Icon name="folder" size={15} /><span>{path}</span></button><button className="remove-button" type="button" onClick={() => toggleFavorite(path)} aria-label={`移除 ${path}`}>×</button></div>)}</div> : <div className="small-empty">还没有收藏路径</div>}<div className="saved-divider" /><div className="surface-title compact"><div><span className="section-kicker">RECENT</span><h2>最近目录</h2></div><Icon name="clock" size={18} /></div>{recentPaths.length ? <div className="saved-list">{recentPaths.slice(0, 5).map((path) => <button className="saved-item single" type="button" key={path} onClick={() => { setInputPath(path); setView("inspection"); }}><Icon name="clock" size={15} /><span>{path}</span><Icon name="chevron" size={14} /></button>)}</div> : <div className="small-empty">还没有最近目录</div>}</aside></div>
+            </>
+          )}
+        </div>
+        {(error || backendError) && <div className="error-toast" role="alert"><Icon name="terminal" size={17} /><span>{error || backendError}</span><button type="button" onClick={() => { setError(null); setBackendError(null); }}>×</button></div>}
+      </main>
+    </div>
   );
 }
 

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-"""GUI-facing orchestration around the existing conversion engines.
+"""Application orchestration around the existing conversion engines.
 
-The services in this module deliberately contain no Qt code.  A desktop
-client, the CLI, and future automation can all use the same checked data
-objects and operation configuration.
+The services deliberately contain no UI code. A desktop client, the CLI and
+automation can share the same checked data objects and operation configuration.
 """
 
 from dataclasses import dataclass, field
@@ -101,7 +100,7 @@ class SourceInspectionConfig:
 
 @dataclass
 class InspectionResult:
-    """A checked source or Zarr input kept by the GUI session."""
+    """A checked source or Zarr input kept by the application session."""
 
     kind: Literal["source", "zarr", "temporary"]
     path: Path
@@ -280,10 +279,6 @@ class RechunkConfig:
     overwrite: bool = False
     validate: bool = True
     backend: Literal["auto", "python", "rust"] = "python"
-    # ``compression_only`` is retained for callers of the previous two-page
-    # GUI/API.  New callers should select the two independent operations
-    # below; both can then be applied in one output-producing pass.
-    compression_only: bool = False
     rechunk: bool = True
     recompress: bool | None = None
     temporary_dir: Path | None = None
@@ -734,12 +729,10 @@ def run_conversion(
 def preview_rechunk(config: RechunkConfig, info: DatasetInfo | None = None) -> RechunkPreview:
     info = info or inspect_store(config.input)
     rechunk_enabled = bool(config.rechunk)
-    if config.compression_only:
-        rechunk_enabled = False
     recompress_enabled = (
-        True
-        if config.compression_only
-        else (config.compression != "none" if config.recompress is None else bool(config.recompress))
+        config.compression != "none"
+        if config.recompress is None
+        else bool(config.recompress)
     )
     if not rechunk_enabled and not recompress_enabled:
         raise ValueError("请至少选择重分块或重压缩中的一项。")

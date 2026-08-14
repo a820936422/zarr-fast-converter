@@ -62,17 +62,6 @@ fn terminal_payload(events: Vec<EventEnvelope>) -> Result<Value, AppError> {
 }
 
 #[tauri::command]
-pub fn worker_capabilities(state: State<'_, AppState>) -> Result<Value, AppError> {
-    let request = request("get_capabilities".to_string(), Map::new(), None);
-    let mut worker = ensure_worker(&state)?;
-    let process = worker
-        .as_mut()
-        .ok_or_else(|| AppError::new(ErrorKind::WorkerStartFailed, "worker was not initialized"))?;
-
-    terminal_payload(process.send(&request)?)
-}
-
-#[tauri::command]
 pub fn native_capabilities() -> Result<BackendCapability, AppError> {
     Ok(BackendCapability::smoke())
 }

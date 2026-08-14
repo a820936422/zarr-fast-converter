@@ -113,7 +113,7 @@ pixi run rechunk -- --input /data/input.zarr --output /data/output.zarr --strate
 - `make_compression_plan(...)`
 - 核心执行器 `rechunking.engine.run_rechunk(...)`，或服务门面 `application.services.run_rechunk(RechunkConfig(...))`
 
-GUI 通常通过 `application.services.preview_rechunk` 和 `run_rechunk` 使用该模块。
+桌面应用通过 `application.services.preview_rechunk` 和 `run_rechunk` 使用该模块。
 
 ## 输出与安全
 

@@ -86,7 +86,7 @@ pixi run pipeline -- \
 - `preview_pipeline(inspection, config)`
 - `run_pipeline(inspection, config)`
 
-GUI 通常通过 `fast_nc_zarr.application.services.preview_pipeline` 和 `run_pipeline` 调用。
+桌面应用通过 `fast_nc_zarr.application.services.preview_pipeline` 和 `run_pipeline` 调用。
 
 ## Manifest 与恢复
 

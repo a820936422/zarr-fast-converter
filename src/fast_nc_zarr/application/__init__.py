@@ -1,4 +1,4 @@
-"""Application services shared by GUI, CLI, and desktop workers."""
+"""Application services shared by the CLI and Tauri compatibility runtime."""
 
 from importlib import import_module
 from typing import TYPE_CHECKING

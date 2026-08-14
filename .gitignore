@@ -23,10 +23,6 @@ src/fast_nc_zarr/_native*.so
 apps/desktop/node_modules/
 apps/desktop/dist/
 apps/desktop/.vite/
-apps/desktop/coverage/
-apps/desktop/playwright-report/
-apps/desktop/test-results/
-apps/desktop/*.tsbuildinfo
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/binaries/*
 !apps/desktop/src-tauri/binaries/.gitkeep
