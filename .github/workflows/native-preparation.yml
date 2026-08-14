@@ -99,17 +99,42 @@ jobs:
         shell: bash
         run: |
           exec > >(tee /tmp/linux-package-verify.log) 2>&1
-          set -euxo pipefail
+          set -uo pipefail
           shopt -s nullglob
+          failed=0
           debs=(target/release/bundle/deb/*.deb)
           rpms=(target/release/bundle/rpm/*.rpm)
           printf 'deb_count=%s rpm_count=%s\\n' "${#debs[@]}" "${#rpms[@]}"
-          test "${#debs[@]}" -eq 1
-          test "${#rpms[@]}" -eq 1
-          dpkg-deb --info "${debs[0]}"
-          dpkg-deb --contents "${debs[0]}" | grep -F 'usr/bin/fast-nc-zarr-worker'
-          rpm -qpi "${rpms[0]}"
-          rpm -qpl "${rpms[0]}" | grep -F '/usr/bin/fast-nc-zarr-worker'
+          if (( ${#debs[@]} != 1 || ${#rpms[@]} != 1 )); then
+            echo "::error title=Linux package verification::expected one deb and one rpm; got deb=${#debs[@]} rpm=${#rpms[@]}"
+            failed=1
+          else
+            if dpkg-deb --info "${debs[0]}"; then
+              echo 'deb metadata: ok'
+            else
+              echo '::error title=Linux package verification::dpkg-deb --info failed'
+              failed=1
+            fi
+            if dpkg-deb --contents "${debs[0]}" | grep -F 'usr/bin/fast-nc-zarr-worker'; then
+              echo 'deb worker path: ok'
+            else
+              echo '::error title=Linux package verification::deb worker path missing'
+              failed=1
+            fi
+            if rpm -qpi "${rpms[0]}"; then
+              echo 'rpm metadata: ok'
+            else
+              echo '::error title=Linux package verification::rpm -qpi failed'
+              failed=1
+            fi
+            if rpm -qpl "${rpms[0]}" | grep -F '/usr/bin/fast-nc-zarr-worker'; then
+              echo 'rpm worker path: ok'
+            else
+              echo '::error title=Linux package verification::rpm worker path missing'
+              failed=1
+            fi
+          fi
+          if (( failed != 0 )); then exit 1; fi
       - name: Upload Linux package verification log
         if: always()
         uses: actions/upload-artifact@v4
