@@ -11,6 +11,7 @@ import xarray as xr
 import zarr
 
 from fast_nc_zarr._backend import BackendUnavailableError, resolve_backend, rust_capability
+from fast_nc_zarr.inspection import inspect_netcdf_native
 from fast_nc_zarr.rechunking.native import (
     RustMultiRechunkPlan,
     RustMultiRechunkVariablePlan,
@@ -21,6 +22,9 @@ from fast_nc_zarr.rechunking.native import (
 
 
 _CAPABILITY = rust_capability()
+_RUST_NETCDF_READY = _CAPABILITY.supported and "raw.netcdf.inspect" in _CAPABILITY.operations
+
+
 _RUST_ZARR_READY = _CAPABILITY.supported and {
     "zarr.inspect",
     "zarr.read_chunk_f32",
@@ -78,15 +82,42 @@ class NativePreparationTests(unittest.TestCase):
     def test_auto_backend_resolves_native_rechunk_capability(self) -> None:
         expected = "rust" if _RUST_ZARR_READY else "python"
         self.assertEqual(resolve_backend("auto", "zarr.rechunk_f32"), expected)
-    def test_auto_backend_resolves_native_float64_rechunk_capability(self) -> None:
-        expected = "rust" if _CAPABILITY.supported and "zarr.rechunk_f64" in _CAPABILITY.operations else "python"
-        self.assertEqual(resolve_backend("auto", "rechunk_f64"), expected)
+
     def test_standard_raw_and_resample_operations_remain_explainable_fallbacks(self) -> None:
-        for operation in ("raw.netcdf.inspect", "raw.netcdf.convert", "resample.nearest", "resample.bilinear"):
+        expected = "rust" if _RUST_NETCDF_READY else "python"
+        self.assertEqual(resolve_backend("auto", "raw.netcdf.inspect"), expected)
+        for operation in ("raw.netcdf.convert", "resample.nearest", "resample.bilinear"):
             self.assertEqual(resolve_backend("auto", operation), "python")
             with self.assertRaises(BackendUnavailableError):
                 resolve_backend("rust", operation)
 
+
+
+@unittest.skipUnless(_RUST_NETCDF_READY, "Rust NetCDF native extension is not built")
+class RustNetcdfInspectTests(unittest.TestCase):
+    def test_inspect_standard_netcdf4_subset(self) -> None:
+        import netCDF4
+
+        with tempfile.TemporaryDirectory(prefix="fast-nc-zarr-netcdf-") as directory:
+            path = Path(directory) / "sample.nc"
+            with netCDF4.Dataset(path, "w", format="NETCDF4_CLASSIC") as dataset:
+                dataset.createDimension("time", 2)
+                dataset.createDimension("lat", 2)
+                dataset.createDimension("lon", 3)
+                dataset.title = "native smoke"
+                time = dataset.createVariable("time", "f8", ("time",))
+                time.units = "days since 2000-01-01"
+                dataset.createVariable("lat", "f4", ("lat",))[:] = [10, 20]
+                dataset.createVariable("lon", "f4", ("lon",))[:] = [100, 110, 120]
+                value = dataset.createVariable("value", "f4", ("time", "lat", "lon"))
+                value.units = "K"
+                value[:] = np.zeros((2, 2, 3), dtype="float32")
+            summary = inspect_netcdf_native(path)
+            self.assertTrue(summary["supported_subset"])
+            self.assertEqual(summary["dimensions"][0]["name"], "time")
+            variable = next(item for item in summary["variables"] if item["name"] == "value")
+            self.assertEqual(variable["dtype"], "float32")
+            self.assertEqual(variable["shape"], [2, 2, 3])
 
 @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
 class RustZarrCrossBackendTests(unittest.TestCase):

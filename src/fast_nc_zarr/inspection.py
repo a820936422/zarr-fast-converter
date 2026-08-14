@@ -750,3 +750,21 @@ def inventory_summary(info: Inventory) -> str:
             missing,
         ]
     )
+
+def inspect_netcdf_native(path: Path) -> dict[str, Any]:
+    """Inspect a standard NetCDF file through the Rust native reader."""
+    from ._backend import BackendUnavailableError, resolve_backend
+
+    if resolve_backend("rust", "raw.netcdf.inspect") != "rust":
+        raise BackendUnavailableError("Rust NetCDF native inspect is unavailable")
+    try:
+        native = __import__("fast_nc_zarr._native", fromlist=["inspect_netcdf_json"])
+        payload = native.inspect_netcdf_json(str(Path(path).expanduser().resolve()))
+    except (AttributeError, ImportError) as exc:
+        raise BackendUnavailableError("native extension lacks inspect_netcdf_json") from exc
+    import json
+
+    result = json.loads(payload)
+    if not isinstance(result, dict):
+        raise ValueError("native NetCDF inspect response must be an object")
+    return result

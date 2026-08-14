@@ -4,7 +4,9 @@ use std::thread;
 use std::time::Duration;
 
 use fast_nc_zarr_model::{MultiRechunkExecutionPlan, RechunkExecutionPlan};
-use fast_nc_zarr_zarr::{inspect_array, rechunk_f32_array, rechunk_multi_array, write_f64_array};
+use fast_nc_zarr_zarr::{
+    inspect_array, inspect_netcdf, rechunk_f32_array, rechunk_multi_array, write_f64_array,
+};
 use serde_json::{Map, Value};
 use tauri::{AppHandle, State};
 
@@ -15,9 +17,9 @@ use crate::tasks::{
     cancellation_path, emit_task_event, new_request, now_seconds, progress_path, TaskRegistry,
     TaskRequest, TaskStatus, TaskSummary,
 };
-
 const NATIVE_OPERATIONS: &[&str] = &[
     "zarr.inspect",
+    "raw.netcdf.inspect",
     "zarr.rechunk_f32",
     "zarr.rechunk_multi",
     "zarr.write_f64",
@@ -150,6 +152,7 @@ fn run_native_task(
     let _ = emit("resource", "resources", resource_payload);
     let result = match operation.as_str() {
         "zarr.inspect" => native_inspect(&request.payload),
+        "raw.netcdf.inspect" => native_netcdf_inspect(&request.payload),
         "zarr.write_f64" => native_write_f64(&request.payload),
         "zarr.rechunk_f32" => native_rechunk(
             &request.payload,
@@ -208,6 +211,26 @@ fn native_inspect(payload: &Map<String, Value>) -> Result<Map<String, Value>, Ap
     output.insert(
         "operation".to_string(),
         Value::String("zarr.inspect".to_string()),
+    );
+    output.insert(
+        "summary".to_string(),
+        serde_json::to_value(summary)
+            .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
+    );
+    Ok(output)
+}
+
+fn native_netcdf_inspect(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+    let path = required_string(payload, "path")?;
+    if !Path::new(&path).is_file() {
+        return Err(AppError::new(ErrorKind::PathNotFound, path).at_stage("inspection"));
+    }
+    let summary = inspect_netcdf(Path::new(&path))
+        .map_err(|error| AppError::new(ErrorKind::InputInvalid, error).at_stage("inspection"))?;
+    let mut output = Map::new();
+    output.insert(
+        "operation".to_string(),
+        Value::String("raw.netcdf.inspect".to_string()),
     );
     output.insert(
         "summary".to_string(),
@@ -489,7 +512,8 @@ fn read_progress(path: Option<&Path>) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_inspect, native_rechunk, native_rechunk_multi, native_write_f64, validate_operation,
+        native_inspect, native_netcdf_inspect, native_rechunk, native_rechunk_multi,
+        native_write_f64, validate_operation,
     };
     use crate::protocol::EventEnvelope;
     use fast_nc_zarr_zarr::write_f32_array;
@@ -509,6 +533,7 @@ mod tests {
     #[test]
     fn native_operation_gate_is_explicit() {
         assert!(validate_operation("zarr.inspect").is_ok());
+        assert!(validate_operation("raw.netcdf.inspect").is_ok());
         assert!(validate_operation("raw.netcdf.convert").is_err());
     }
 
@@ -522,7 +547,7 @@ mod tests {
             "chunks": [1, 2, 2],
             "values": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
         }))
-        .expect("payload");
+        .expect("write payload");
         let result = native_write_f64(&payload).expect("native write");
         assert_eq!(result["operation"], "zarr.write_f64");
         let summary = native_inspect(

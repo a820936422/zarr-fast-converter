@@ -163,6 +163,14 @@ impl BackendCapability {
                     "cooperative cancellation",
                 ][..],
             ),
+            (
+                "raw.netcdf.inspect",
+                &[
+                    "NetCDF-4/classic",
+                    "time/lat/lon dimensions",
+                    "numeric variables",
+                ][..],
+            ),
         ];
         let operations = supported
             .iter()
@@ -174,13 +182,8 @@ impl BackendCapability {
             .collect::<Vec<_>>();
         capabilities.extend([
             OperationCapability::unsupported(
-                "raw.netcdf.inspect",
-                "native reader is not implemented in this phase",
-                &["use Python fallback"],
-            ),
-            OperationCapability::unsupported(
                 "raw.netcdf.convert",
-                "native reader is not implemented in this phase",
+                "native conversion is not implemented in this phase",
                 &["use Python fallback"],
             ),
             OperationCapability::unsupported(
@@ -223,7 +226,7 @@ mod tests {
     fn smoke_capability_has_stable_protocol_and_matrix() {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
-        assert_eq!(capability.operations.len(), 14);
+        assert_eq!(capability.operations.len(), 15);
         assert_eq!(capability.capabilities.len(), 19);
         let supported = capability
             .capabilities

@@ -16,7 +16,8 @@
     "zarr.rechunk_f32",
     "zarr.rechunk_f32_codec",
     "zarr.rechunk_f32_cancel",
-    "zarr.rechunk_multi"
+    "zarr.rechunk_multi",
+    "raw.netcdf.inspect"
   ],
   "capabilities": [
     {"operation": "probe", "supported": true, "reason": null, "limitations": []},
@@ -33,8 +34,8 @@
     {"operation": "zarr.rechunk_f32_codec", "supported": true, "reason": null, "limitations": ["single float32 data variable", "explicit lossless codec"]},
     {"operation": "zarr.rechunk_f32_cancel", "supported": true, "reason": null, "limitations": ["cooperative cancellation"]},
     {"operation": "zarr.rechunk_multi", "supported": true, "reason": null, "limitations": ["float32, float64 and standard integer data variables", "fill_value and CF attributes preserved", "source or requested lossless codecs", "atomic staging", "cooperative cancellation"]},
-    {"operation": "raw.netcdf.inspect", "supported": false, "reason": "native reader is not implemented in this phase", "limitations": ["use Python fallback"]},
-    {"operation": "raw.netcdf.convert", "supported": false, "reason": "native reader is not implemented in this phase", "limitations": ["use Python fallback"]},
+    {"operation": "raw.netcdf.inspect", "supported": true, "reason": null, "limitations": ["NetCDF-4/classic", "time/lat/lon dimensions", "numeric variables"]},
+    {"operation": "raw.netcdf.convert", "supported": false, "reason": "native conversion is not implemented in this phase", "limitations": ["use Python fallback"]},
     {"operation": "resample.nearest", "supported": false, "reason": "native resampling is not implemented in this phase", "limitations": ["use Python fallback"]},
     {"operation": "resample.bilinear", "supported": false, "reason": "native resampling is not implemented in this phase", "limitations": ["use Python fallback"]},
     {"operation": "pipeline.native", "supported": false, "reason": "native pipeline runtime is not implemented in this phase", "limitations": ["use Python fallback"]}

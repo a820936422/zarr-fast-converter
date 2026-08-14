@@ -1,3 +1,9 @@
+mod netcdf_native;
+
+pub use netcdf_native::{
+    inspect_netcdf, NetcdfDimensionSummary, NetcdfSummary, NetcdfVariableSummary,
+};
+
 use fast_nc_zarr_model::{
     MultiRechunkExecutionPlan, MultiRechunkMetrics, RechunkExecutionPlan, RechunkMetrics,
 };
