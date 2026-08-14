@@ -11,7 +11,13 @@ import xarray as xr
 import zarr
 
 from fast_nc_zarr._backend import BackendUnavailableError, resolve_backend, rust_capability
-from fast_nc_zarr.rechunking.native import RustRechunkPlan, run_rust_rechunk
+from fast_nc_zarr.rechunking.native import (
+    RustMultiRechunkPlan,
+    RustMultiRechunkVariablePlan,
+    RustRechunkPlan,
+    run_rust_multi_rechunk,
+    run_rust_rechunk,
+)
 
 
 _CAPABILITY = rust_capability()
@@ -23,6 +29,7 @@ _RUST_ZARR_READY = _CAPABILITY.supported and {
     "zarr.rechunk_f32",
     "zarr.rechunk_f32_codec",
     "zarr.rechunk_f32_cancel",
+    "zarr.rechunk_multi",
 }.issubset(_CAPABILITY.operations)
 class NativePreparationTests(unittest.TestCase):
     def test_capability_probe_is_json_safe(self) -> None:
@@ -173,18 +180,11 @@ class RustZarrCrossBackendTests(unittest.TestCase):
             )
         )
         self.assertEqual(metrics["logical_bytes"], values.nbytes)
-        with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as result:
-            self.assertEqual(result["value"].dtype, np.dtype("float64"))
-            np.testing.assert_array_equal(result["value"].values, values)
-
-
-
-
-    def test_auto_multi_variable_rechunk_records_python_fallback(self) -> None:
+    def test_auto_multi_variable_rechunk_uses_native_when_available(self) -> None:
         from fast_nc_zarr.application.services import RechunkConfig, run_rechunk as run_service_rechunk
 
-        source = Path(self.tempdir.name) / "multi-fallback-source.zarr"
-        target = Path(self.tempdir.name) / "multi-fallback-target.zarr"
+        source = Path(self.tempdir.name) / "multi-source.zarr"
+        target = Path(self.tempdir.name) / "multi-target.zarr"
         values = np.arange(2 * 3 * 4, dtype="float32").reshape(2, 3, 4)
         xr.Dataset(
             {
@@ -203,12 +203,68 @@ class RustZarrCrossBackendTests(unittest.TestCase):
                 compression="none",
             )
         )
-        self.assertEqual(metrics["backend"], "python")
-        self.assertTrue(metrics["backend_fallback"])
-        self.assertIn("只支持一个数据变量", str(metrics["backend_fallback_reason"]))
+        expected_backend = "rust" if _RUST_ZARR_READY else "python"
+        self.assertEqual(metrics["backend"], expected_backend)
+        self.assertEqual(bool(metrics["backend_fallback"]), expected_backend == "python")
         with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as dataset:
             np.testing.assert_array_equal(dataset["value"].values, values)
             np.testing.assert_array_equal(dataset["quality"].values, values + 100)
+
+    def test_rust_multi_variable_rechunk_is_lossless_and_atomic(self) -> None:
+        source = Path(self.tempdir.name) / "multi-mixed-source.zarr"
+        target = Path(self.tempdir.name) / "multi-mixed-target.zarr"
+        values = np.arange(4 * 3 * 2, dtype="float32").reshape(4, 3, 2)
+        quality = (np.arange(4 * 3 * 2, dtype="float64") / 10).reshape(4, 3, 2)
+        xr.Dataset(
+            {
+                "value": (("time", "lat", "lon"), values),
+                "quality": (("time", "lat", "lon"), quality),
+            },
+            coords={"time": np.arange(4), "lat": np.arange(3), "lon": np.arange(2)},
+        ).to_zarr(source, mode="w", consolidated=False, zarr_format=3)
+        metrics = run_rust_multi_rechunk(
+            RustMultiRechunkPlan(
+                source=source,
+                target=target,
+                variables=(
+                    RustMultiRechunkVariablePlan("/value", (1, 3, 2), "float32"),
+                    RustMultiRechunkVariablePlan("/quality", (2, 1, 2), "float64"),
+                ),
+                requested_workers=2,
+                worker_ceiling=2,
+                memory_budget_bytes=1024 * 1024,
+            )
+        )
+        self.assertEqual(metrics["backend"], "rust")
+        self.assertEqual(len(metrics["variables"]), 2)
+        self.assertEqual(metrics["output"], str(target))
+        with xr.open_zarr(target, consolidated=False, chunks=None, decode_times=False) as dataset:
+            self.assertEqual(dataset["value"].dtype, np.dtype("float32"))
+            self.assertEqual(dataset["quality"].dtype, np.dtype("float64"))
+            np.testing.assert_array_equal(dataset["value"].values, values)
+            np.testing.assert_array_equal(dataset["quality"].values, quality)
+        self.assertFalse(any(target.parent.glob(f".{target.name}.native-multi-*.tmp")))
+
+    def test_rust_multi_variable_rechunk_pre_cancelled_does_not_publish(self) -> None:
+        source = Path(self.tempdir.name) / "multi-cancel-source.zarr"
+        target = Path(self.tempdir.name) / "multi-cancel-target.zarr"
+        cancellation = Path(self.tempdir.name) / "multi-cancel.request"
+        values = np.arange(2 * 2 * 2, dtype="float32").reshape(2, 2, 2)
+        xr.Dataset({"value": (("time", "lat", "lon"), values)}).to_zarr(
+            source, mode="w", consolidated=False, zarr_format=3
+        )
+        cancellation.touch()
+        with self.assertRaises(Exception):
+            run_rust_multi_rechunk(
+                RustMultiRechunkPlan(
+                    source=source,
+                    target=target,
+                    variables=(RustMultiRechunkVariablePlan("/value", (1, 2, 2), "float32"),),
+                    cancellation_file=cancellation,
+                )
+            )
+        self.assertFalse(target.exists())
+        self.assertFalse(any(target.parent.glob(f".{target.name}.native-multi-*.tmp")))
 
     def test_rust_rechunk_uses_bounded_parallel_workers(self) -> None:
         source = f"{self.tempdir.name}/parallel-source.zarr"

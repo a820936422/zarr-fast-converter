@@ -1,4 +1,6 @@
-use fast_nc_zarr_model::{RechunkExecutionPlan, RechunkMetrics};
+use fast_nc_zarr_model::{
+    MultiRechunkExecutionPlan, MultiRechunkMetrics, RechunkExecutionPlan, RechunkMetrics,
+};
 use ndarray::ArrayD;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -108,6 +110,15 @@ fn report_progress(
     total: u64,
     lock: &std::sync::Mutex<()>,
 ) -> Result<()> {
+    report_progress_with_total(plan, completed, total, lock)
+}
+
+fn report_progress_with_total(
+    plan: &RechunkExecutionPlan,
+    completed: u64,
+    total: u64,
+    lock: &std::sync::Mutex<()>,
+) -> Result<()> {
     let Some(path) = plan.progress_file.as_deref() else {
         return Ok(());
     };
@@ -132,7 +143,7 @@ fn copy_store_tree(
     source_root: &Path,
     source_dir: &Path,
     target_root: &Path,
-    skipped_array: &Path,
+    skipped_arrays: &[PathBuf],
 ) -> Result<()> {
     for entry in fs::read_dir(source_dir).map_err(ZarrError::from_display)? {
         let entry = entry.map_err(ZarrError::from_display)?;
@@ -140,7 +151,7 @@ fn copy_store_tree(
         let relative = source
             .strip_prefix(source_root)
             .map_err(ZarrError::from_display)?;
-        if relative == skipped_array {
+        if skipped_arrays.iter().any(|path| relative == path) {
             continue;
         }
         let target = target_root.join(relative);
@@ -153,7 +164,7 @@ fn copy_store_tree(
         }
         if file_type.is_dir() {
             fs::create_dir_all(&target).map_err(ZarrError::from_display)?;
-            copy_store_tree(source_root, &source, target_root, skipped_array)?;
+            copy_store_tree(source_root, &source, target_root, skipped_arrays)?;
         } else if file_type.is_file() {
             fs::copy(&source, &target).map_err(ZarrError::from_display)?;
         } else {
@@ -166,33 +177,31 @@ fn copy_store_tree(
     Ok(())
 }
 
+fn copy_store_without_arrays(
+    source_root: &Path,
+    target_root: &Path,
+    array_paths: &[String],
+) -> Result<()> {
+    if target_root.exists() {
+        return Err(ZarrError::message(format!(
+            "refusing to overwrite existing target store: {}",
+            target_root.display()
+        )));
+    }
+    fs::create_dir_all(target_root).map_err(ZarrError::from_display)?;
+    let skipped_arrays = array_paths
+        .iter()
+        .map(|path| array_relative_path(path))
+        .collect::<Result<Vec<_>>>()?;
+    copy_store_tree(source_root, source_root, target_root, &skipped_arrays)
+}
+
 fn copy_store_without_array(
     source_root: &Path,
     target_root: &Path,
     array_path: &str,
 ) -> Result<()> {
-    if target_root.exists() {
-        if !target_root.is_dir() {
-            return Err(ZarrError::message(format!(
-                "target path is not a directory: {}",
-                target_root.display()
-            )));
-        }
-        if fs::read_dir(target_root)
-            .map_err(ZarrError::from_display)?
-            .next()
-            .is_some()
-        {
-            return Err(ZarrError::message(format!(
-                "refusing to overwrite non-empty target store: {}",
-                target_root.display()
-            )));
-        }
-    } else {
-        fs::create_dir_all(target_root).map_err(ZarrError::from_display)?;
-    }
-    let skipped_array = array_relative_path(array_path)?;
-    copy_store_tree(source_root, source_root, target_root, &skipped_array)
+    copy_store_without_arrays(source_root, target_root, &[array_path.to_owned()])
 }
 
 pub fn inspect_array(root: impl AsRef<Path>, array_path: &str) -> Result<ArraySummary> {
@@ -1006,4 +1015,346 @@ pub fn rechunk_f64_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
         codec_concurrent_target: u32::try_from(codec_concurrent_target)
             .map_err(|_| ZarrError::message("codec worker count exceeds u32"))?,
     })
+}
+fn multi_target_chunk_count(shape: &[u64], chunks: &[u64]) -> Result<u64> {
+    if shape.is_empty() || shape.len() != chunks.len() || chunks.contains(&0) {
+        return Err(ZarrError::message(
+            "multi-variable shape and target chunks must have matching positive dimensions",
+        ));
+    }
+    shape
+        .iter()
+        .zip(chunks)
+        .try_fold(1_u64, |total, (size, chunk)| {
+            if *size == 0 {
+                return Err(ZarrError::message(
+                    "multi-variable arrays must have positive shapes",
+                ));
+            }
+            let count = size
+                .checked_add(*chunk - 1)
+                .ok_or_else(|| ZarrError::message("target chunk grid overflows u64"))?
+                / *chunk;
+            total
+                .checked_mul(count)
+                .ok_or_else(|| ZarrError::message("target chunk count overflows u64"))
+        })
+}
+
+fn variable_rechunk_plan(
+    plan: &MultiRechunkExecutionPlan,
+    variable: &fast_nc_zarr_model::RechunkVariablePlan,
+) -> RechunkExecutionPlan {
+    RechunkExecutionPlan {
+        source: plan.source.clone(),
+        target: plan.target.clone(),
+        array_path: variable.array_path.clone(),
+        target_chunks: variable.target_chunks.clone(),
+        expected_dtype: variable.expected_dtype.clone(),
+        requested_workers: plan.requested_workers,
+        worker_ceiling: plan.worker_ceiling,
+        memory_budget_bytes: plan.memory_budget_bytes,
+        codec_concurrent_target: plan.codec_concurrent_target,
+        codec: plan.codec.clone(),
+        codec_level: plan.codec_level,
+        codec_shuffle: plan.codec_shuffle.clone(),
+        cancellation_file: plan.cancellation_file.clone(),
+        progress_file: plan.progress_file.clone(),
+    }
+}
+
+fn rechunk_array_into(
+    source_array: ArrayStore,
+    target_store: Arc<Store>,
+    plan: &RechunkExecutionPlan,
+    progress_start: u64,
+    progress_total: u64,
+) -> Result<RechunkMetrics> {
+    if !matches!(plan.expected_dtype.as_str(), "float32" | "float64") {
+        return Err(ZarrError::message(format!(
+            "P1 multi-variable native rechunk supports float32/float64 only, got {}",
+            plan.expected_dtype
+        )));
+    }
+    if plan.target_chunks.is_empty() || plan.target_chunks.contains(&0) {
+        return Err(ZarrError::message(
+            "target_chunks must contain positive values",
+        ));
+    }
+    let source_metadata = serialised_metadata(&source_array)?;
+    if source_metadata.get("data_type") != Some(&Value::String(plan.expected_dtype.clone())) {
+        return Err(ZarrError::message(format!(
+            "source data_type does not match expected_dtype={} for {}",
+            plan.expected_dtype, plan.array_path
+        )));
+    }
+    let source_shape = source_array.shape().to_vec();
+    if plan.target_chunks.len() != source_shape.len() {
+        return Err(ZarrError::message(format!(
+            "target_chunks dimensionality does not match {}",
+            plan.array_path
+        )));
+    }
+    let source_chunk_shape = source_array
+        .chunk_shape_usize(&vec![0_u64; source_shape.len()])
+        .map_err(ZarrError::from_display)?;
+    let source_chunk_elements = source_chunk_shape.iter().try_fold(1_u64, |total, value| {
+        total
+            .checked_mul(
+                u64::try_from(*value)
+                    .map_err(|_| ZarrError::message("source chunk shape exceeds u64"))?,
+            )
+            .ok_or_else(|| ZarrError::message("source chunk element count overflows u64"))
+    })?;
+    let target_chunk_elements = checked_product(&plan.target_chunks)? as u64;
+    let item_size = if plan.expected_dtype == "float64" {
+        8
+    } else {
+        4
+    };
+    let peak_bytes_per_worker = source_chunk_elements
+        .checked_add(target_chunk_elements)
+        .and_then(|elements| elements.checked_mul(item_size))
+        .ok_or_else(|| ZarrError::message("per-worker memory estimate overflows u64"))?;
+    let requested_workers = u64::from(plan.requested_workers.max(1));
+    let worker_ceiling = if plan.worker_ceiling == 0 {
+        requested_workers
+    } else {
+        u64::from(plan.worker_ceiling).min(requested_workers)
+    };
+    let memory_limited_workers = if plan.memory_budget_bytes == 0 {
+        worker_ceiling
+    } else {
+        (plan.memory_budget_bytes / peak_bytes_per_worker.max(1)).max(1)
+    };
+    let mut array_builder = ArrayBuilder::from_array(&source_array);
+    array_builder.chunk_grid_metadata(plan.target_chunks.clone());
+    let target_path = normalise_array_path(&plan.array_path);
+    let target_array = array_builder
+        .build(target_store, &target_path)
+        .map_err(ZarrError::from_display)?;
+    target_array
+        .store_metadata_opt(&ArrayMetadataOptions::default().with_include_zarrs_metadata(false))
+        .map_err(ZarrError::from_display)?;
+    let target_grid_shape = target_array.chunk_grid_shape().to_vec();
+    let target_grid_count = target_grid_shape.iter().try_fold(1_u64, |total, value| {
+        total
+            .checked_mul(*value)
+            .ok_or_else(|| ZarrError::message("target chunk count overflows u64"))
+    })?;
+    let resolved_workers = worker_ceiling
+        .min(memory_limited_workers)
+        .min(target_grid_count)
+        .max(1);
+    let resolved_workers = usize::try_from(resolved_workers)
+        .map_err(|_| ZarrError::message("resolved worker count exceeds usize"))?;
+    let codec_concurrent_target = if plan.codec_concurrent_target == 0 {
+        1
+    } else {
+        usize::try_from(u64::from(plan.codec_concurrent_target).min(resolved_workers as u64))
+            .map_err(|_| ZarrError::message("codec worker count exceeds usize"))?
+            .max(1)
+    };
+    let codec_options = CodecOptions::default()
+        .with_concurrent_target(codec_concurrent_target)
+        .with_chunk_concurrent_minimum(1);
+    let source_array = source_array.with_codec_options(codec_options);
+    let target_array = target_array.with_codec_options(codec_options);
+    let target_indices = ArraySubset::new_with_shape(target_grid_shape).indices();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(resolved_workers)
+        .build()
+        .map_err(ZarrError::from_display)?;
+    let progress_lock = std::sync::Mutex::new(());
+    let completed = std::sync::atomic::AtomicU64::new(0);
+    if plan.expected_dtype == "float32" {
+        pool.install(|| {
+            target_indices
+                .into_par_iter()
+                .try_for_each(|chunk_indices| -> Result<()> {
+                    if cancellation_requested(plan) {
+                        return Err(ZarrError::message("任务已取消"));
+                    }
+                    let subset = target_array
+                        .chunk_subset_bounded(&chunk_indices)
+                        .map_err(ZarrError::from_display)?;
+                    let values: ArrayD<f32> = source_array
+                        .retrieve_array_subset_opt(&subset, &codec_options)
+                        .map_err(ZarrError::from_display)?;
+                    target_array
+                        .store_array_subset_opt(&subset, values, &codec_options)
+                        .map_err(ZarrError::from_display)?;
+                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    report_progress_with_total(
+                        plan,
+                        progress_start + done,
+                        progress_total,
+                        &progress_lock,
+                    )
+                })
+        })?;
+    } else {
+        pool.install(|| {
+            target_indices
+                .into_par_iter()
+                .try_for_each(|chunk_indices| -> Result<()> {
+                    if cancellation_requested(plan) {
+                        return Err(ZarrError::message("任务已取消"));
+                    }
+                    let subset = target_array
+                        .chunk_subset_bounded(&chunk_indices)
+                        .map_err(ZarrError::from_display)?;
+                    let values: ArrayD<f64> = source_array
+                        .retrieve_array_subset_opt(&subset, &codec_options)
+                        .map_err(ZarrError::from_display)?;
+                    target_array
+                        .store_array_subset_opt(&subset, values, &codec_options)
+                        .map_err(ZarrError::from_display)?;
+                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    report_progress_with_total(
+                        plan,
+                        progress_start + done,
+                        progress_total,
+                        &progress_lock,
+                    )
+                })
+        })?;
+    }
+    if cancellation_requested(plan) {
+        return Err(ZarrError::message("任务已取消"));
+    }
+    let logical_bytes = (checked_product(&source_shape)? as u64)
+        .checked_mul(item_size)
+        .ok_or_else(|| ZarrError::message("logical byte count overflows u64"))?;
+    Ok(RechunkMetrics {
+        execution_path: "rust-multi-variable-streaming".to_owned(),
+        output: plan.target.clone(),
+        source_shape,
+        source_chunks: source_chunk_shape,
+        target_chunks: plan.target_chunks.clone(),
+        logical_bytes,
+        target_chunk_count: target_grid_count,
+        resolved_workers: u32::try_from(resolved_workers)
+            .map_err(|_| ZarrError::message("resolved worker count exceeds u32"))?,
+        worker_reason: format!(
+            "P1 sequential variable orchestration with bounded target-chunk pools; requested_workers={}, ceiling={}, memory_limited_workers={}, peak_bytes_per_worker={}, codec_concurrent_target={}",
+            plan.requested_workers.max(1), plan.worker_ceiling, memory_limited_workers,
+            peak_bytes_per_worker, codec_concurrent_target
+        ),
+        peak_bytes_per_worker,
+        memory_budget_bytes: plan.memory_budget_bytes,
+        codec_concurrent_target: u32::try_from(codec_concurrent_target)
+            .map_err(|_| ZarrError::message("codec worker count exceeds u32"))?,
+    })
+}
+
+pub fn rechunk_multi_array(plan: &MultiRechunkExecutionPlan) -> Result<MultiRechunkMetrics> {
+    if plan.variables.is_empty() {
+        return Err(ZarrError::message(
+            "multi-variable rechunk requires at least one variable",
+        ));
+    }
+    if !matches!(plan.codec.as_str(), "" | "none") {
+        return Err(ZarrError::message(
+            "P1 multi-variable native rechunk preserves source codecs and does not apply a new codec",
+        ));
+    }
+    let source_root = Path::new(&plan.source);
+    let target_root = Path::new(&plan.target);
+    if !source_root.is_dir() {
+        return Err(ZarrError::message(format!(
+            "Zarr store directory does not exist: {}",
+            source_root.display()
+        )));
+    }
+    if source_root == target_root
+        || source_root.starts_with(target_root)
+        || target_root.starts_with(source_root)
+    {
+        return Err(ZarrError::message(
+            "multi-variable source and target stores cannot overlap",
+        ));
+    }
+    if target_root.exists() {
+        return Err(ZarrError::message(format!(
+            "refusing to overwrite existing target store: {}",
+            target_root.display()
+        )));
+    }
+    let mut array_paths = Vec::with_capacity(plan.variables.len());
+    let mut source_arrays = Vec::with_capacity(plan.variables.len());
+    let mut total_chunks = 0_u64;
+    for variable in &plan.variables {
+        if !matches!(variable.expected_dtype.as_str(), "float32" | "float64") {
+            return Err(ZarrError::message(format!(
+                "P1 multi-variable native rechunk supports float32/float64 only, got {}",
+                variable.expected_dtype
+            )));
+        }
+        array_relative_path(&variable.array_path)?;
+        let normalised = normalise_array_path(&variable.array_path);
+        if array_paths.iter().any(|path| path == &normalised) {
+            return Err(ZarrError::message(format!(
+                "multi-variable plan contains duplicate array_path: {}",
+                normalised
+            )));
+        }
+        let source_array = open_array(source_root, &variable.array_path)?;
+        let shape = source_array.shape().to_vec();
+        let metadata = serialised_metadata(&source_array)?;
+        if metadata.get("data_type") != Some(&Value::String(variable.expected_dtype.clone())) {
+            return Err(ZarrError::message(format!(
+                "source data_type does not match expected_dtype={} for {}",
+                variable.expected_dtype, variable.array_path
+            )));
+        }
+        total_chunks = total_chunks
+            .checked_add(multi_target_chunk_count(&shape, &variable.target_chunks)?)
+            .ok_or_else(|| ZarrError::message("multi-variable target chunk count overflows u64"))?;
+        array_paths.push(normalised);
+        source_arrays.push(source_array);
+    }
+    copy_store_without_arrays(source_root, target_root, &array_paths)?;
+    let target_store =
+        Arc::new(FilesystemStore::new(target_root).map_err(ZarrError::from_display)?);
+    let result = (|| {
+        let mut completed = 0_u64;
+        let mut metrics = Vec::with_capacity(plan.variables.len());
+        for (variable, source_array) in plan.variables.iter().zip(source_arrays) {
+            let variable_plan = variable_rechunk_plan(plan, variable);
+            let metric = rechunk_array_into(
+                source_array,
+                target_store.clone(),
+                &variable_plan,
+                completed,
+                total_chunks,
+            )?;
+            completed = completed
+                .checked_add(metric.target_chunk_count)
+                .ok_or_else(|| ZarrError::message("multi-variable progress count overflows u64"))?;
+            metrics.push(metric);
+        }
+        let logical_bytes = metrics.iter().try_fold(0_u64, |total, metric| {
+            total
+                .checked_add(metric.logical_bytes)
+                .ok_or_else(|| ZarrError::message("multi-variable logical bytes overflow u64"))
+        })?;
+        let resolved_workers = metrics
+            .iter()
+            .map(|metric| metric.resolved_workers)
+            .max()
+            .unwrap_or(1);
+        Ok(MultiRechunkMetrics {
+            execution_path: "rust-multi-variable-streaming".to_owned(),
+            output: plan.target.clone(),
+            variables: metrics,
+            logical_bytes,
+            target_chunk_count: total_chunks,
+            resolved_workers,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(target_root);
+    }
+    result
 }

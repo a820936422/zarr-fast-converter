@@ -18,11 +18,11 @@ Rust desktop runtime
 
 - Zarr v3 结构检查；
 - Float32/Float64 chunk、region 和数组写入；
-- 单变量 Float32/Float64 重分块；
+- 单变量和多变量 Float32/Float64 重分块；
 - 有界并行、取消、进度、staging 校验和原子发布；
 - capability matrix、manifest 和事件证据。
 
-复杂输入、多变量发布、整数 dtype、fill/scale/CF 属性、复杂 codec、标准 NetCDF native conversion 和规则网格 native resampling 仍由兼容路径负责，并在 capability 中明确记录。
+整数 dtype、fill/scale/CF 属性、复杂 codec、标准 NetCDF native conversion、复杂输入和规则网格 native resampling 仍由兼容路径负责，并在 capability 中明确记录。多变量 native 当前保留源 codec，不执行新的压缩配置。
 
 ## 安装环境
 

@@ -149,6 +149,15 @@ impl BackendCapability {
                 &["single float32 data variable", "explicit lossless codec"][..],
             ),
             ("zarr.rechunk_f32_cancel", &["cooperative cancellation"][..]),
+            (
+                "zarr.rechunk_multi",
+                &[
+                    "float32 and float64 data variables",
+                    "source codecs preserved",
+                    "atomic staging",
+                    "cooperative cancellation",
+                ][..],
+            ),
         ];
         let operations = supported
             .iter()
@@ -159,11 +168,6 @@ impl BackendCapability {
             .map(|(operation, limitations)| OperationCapability::supported(operation, limitations))
             .collect::<Vec<_>>();
         capabilities.extend([
-            OperationCapability::unsupported(
-                "zarr.rechunk_multi",
-                "native multi-variable publish path is not implemented in this phase",
-                &["use Python fallback"],
-            ),
             OperationCapability::unsupported(
                 "raw.netcdf.inspect",
                 "native reader is not implemented in this phase",
@@ -214,7 +218,7 @@ mod tests {
     fn smoke_capability_has_stable_protocol_and_matrix() {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
-        assert_eq!(capability.operations.len(), 13);
+        assert_eq!(capability.operations.len(), 14);
         assert_eq!(capability.capabilities.len(), 19);
         let supported = capability
             .capabilities
@@ -239,6 +243,12 @@ mod tests {
             capability
                 .operation("zarr.rechunk_f64")
                 .expect("f64 rechunk")
+                .supported
+        );
+        assert!(
+            capability
+                .operation("zarr.rechunk_multi")
+                .expect("multi-variable rechunk")
                 .supported
         );
     }

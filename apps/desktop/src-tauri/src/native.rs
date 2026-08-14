@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use fast_nc_zarr_model::RechunkExecutionPlan;
-use fast_nc_zarr_zarr::{inspect_array, rechunk_f32_array, write_f64_array};
+use fast_nc_zarr_model::{MultiRechunkExecutionPlan, RechunkExecutionPlan};
+use fast_nc_zarr_zarr::{inspect_array, rechunk_f32_array, rechunk_multi_array, write_f64_array};
 use serde_json::{Map, Value};
 use tauri::{AppHandle, State};
 
@@ -16,7 +16,12 @@ use crate::tasks::{
     TaskRequest, TaskStatus, TaskSummary,
 };
 
-const NATIVE_OPERATIONS: &[&str] = &["zarr.inspect", "zarr.rechunk_f32", "zarr.write_f64"];
+const NATIVE_OPERATIONS: &[&str] = &[
+    "zarr.inspect",
+    "zarr.rechunk_f32",
+    "zarr.rechunk_multi",
+    "zarr.write_f64",
+];
 
 #[tauri::command]
 pub fn start_native_task(
@@ -27,7 +32,11 @@ pub fn start_native_task(
     validate_operation(&request.operation)?;
     let task_id = uuid::Uuid::new_v4().to_string();
     let cancellation_file = cancellation_path(&task_id);
-    let progress_file = (request.operation == "zarr.rechunk_f32").then(|| progress_path(&task_id));
+    let progress_file = (matches!(
+        request.operation.as_str(),
+        "zarr.rechunk_f32" | "zarr.rechunk_multi"
+    ))
+    .then(|| progress_path(&task_id));
     let mut payload = request.payload;
     payload.insert(
         "operation".to_string(),
@@ -143,6 +152,12 @@ fn run_native_task(
         "zarr.inspect" => native_inspect(&request.payload),
         "zarr.write_f64" => native_write_f64(&request.payload),
         "zarr.rechunk_f32" => native_rechunk(
+            &request.payload,
+            &cancellation_file,
+            progress_file.as_deref(),
+            &mut emit,
+        ),
+        "zarr.rechunk_multi" => native_rechunk_multi(
             &request.payload,
             &cancellation_file,
             progress_file.as_deref(),
@@ -304,6 +319,107 @@ where
     );
     Ok(output)
 }
+fn native_multi_staging_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    target.with_file_name(format!(".{name}.native-multi-{}.tmp", uuid::Uuid::new_v4()))
+}
+
+fn native_rechunk_multi<F>(
+    payload: &Map<String, Value>,
+    cancellation_file: &Path,
+    progress_file: Option<&Path>,
+    emit: &mut F,
+) -> Result<Map<String, Value>, AppError>
+where
+    F: FnMut(&str, &str, Map<String, Value>) -> Result<EventEnvelope, AppError>,
+{
+    let mut plan: MultiRechunkExecutionPlan =
+        serde_json::from_value(Value::Object(payload.clone())).map_err(|error| {
+            AppError::new(ErrorKind::InvalidRequest, error.to_string()).at_stage("native")
+        })?;
+    let target = PathBuf::from(&plan.target);
+    if target.exists() {
+        return Err(AppError::new(
+            ErrorKind::PublicationFailed,
+            format!(
+                "native task refuses an existing target: {}",
+                target.display()
+            ),
+        )
+        .at_stage("native"));
+    }
+    let staging = native_multi_staging_path(&target);
+    plan.target = staging.to_string_lossy().into_owned();
+    plan.cancellation_file = Some(cancellation_file.to_string_lossy().into_owned());
+    plan.progress_file = progress_file.map(|path| path.to_string_lossy().into_owned());
+    let progress_path = progress_file.map(Path::to_path_buf);
+    let join = thread::spawn(move || rechunk_multi_array(&plan));
+    let mut last_progress = None;
+    while !join.is_finished() {
+        if let Some(progress) = read_progress(progress_path.as_deref()) {
+            if last_progress != Some(progress) {
+                last_progress = Some(progress);
+                let mut payload = Map::new();
+                payload.insert("completed".to_string(), Value::from(progress.0));
+                payload.insert("total".to_string(), Value::from(progress.1));
+                let _ = emit("progress", "native", payload);
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let result = join
+        .join()
+        .map_err(|_| AppError::new(ErrorKind::Unknown, "native task thread panicked"))?;
+    if cancellation_file.is_file() || result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    if cancellation_file.is_file() {
+        return Err(AppError::new(ErrorKind::Cancelled, "任务已取消").at_stage("native"));
+    }
+    let mut metrics = result
+        .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()).at_stage("native"))?;
+    if target.exists() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(AppError::new(
+            ErrorKind::PublicationFailed,
+            format!(
+                "native target appeared during publish: {}",
+                target.display()
+            ),
+        )
+        .at_stage("native"));
+    }
+    fs::rename(&staging, &target).map_err(|error| {
+        let _ = fs::remove_dir_all(&staging);
+        AppError::new(ErrorKind::PublicationFailed, error.to_string()).at_stage("native")
+    })?;
+    metrics.output = target.to_string_lossy().into_owned();
+    for variable in &mut metrics.variables {
+        variable.output = metrics.output.clone();
+    }
+    if let Some(progress) = read_progress(progress_path.as_deref()) {
+        if last_progress != Some(progress) {
+            let mut payload = Map::new();
+            payload.insert("completed".to_string(), Value::from(progress.0));
+            payload.insert("total".to_string(), Value::from(progress.1));
+            let _ = emit("progress", "native", payload);
+        }
+    }
+    let mut output = Map::new();
+    output.insert(
+        "operation".to_string(),
+        Value::String("zarr.rechunk_multi".to_string()),
+    );
+    output.insert(
+        "metrics".to_string(),
+        serde_json::to_value(metrics)
+            .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
+    );
+    Ok(output)
+}
 
 fn required_string(payload: &Map<String, Value>, key: &str) -> Result<String, AppError> {
     payload
@@ -372,7 +488,9 @@ fn read_progress(path: Option<&Path>) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{native_inspect, native_rechunk, native_write_f64, validate_operation};
+    use super::{
+        native_inspect, native_rechunk, native_rechunk_multi, native_write_f64, validate_operation,
+    };
     use crate::protocol::EventEnvelope;
     use fast_nc_zarr_zarr::write_f32_array;
     use serde_json::{json, Map, Value};
@@ -481,6 +599,60 @@ mod tests {
         );
         assert!(target.is_dir());
         assert!(events.iter().any(|event| event == "progress"));
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(target);
+        let _ = fs::remove_file(progress);
+        let _ = fs::remove_file(cancellation);
+    }
+
+    #[test]
+    fn native_multi_rechunk_publishes_after_staging() {
+        let source = store("multi-source.zarr");
+        let target = store("multi-target.zarr");
+        let progress = store("multi-progress.json");
+        let cancellation = store("multi-cancel");
+        write_f32_array(&source, "/value", &[2, 2, 2], &[1, 2, 2], &[0.0; 8])
+            .expect("write source");
+        let payload: Map<String, Value> = serde_json::from_value(json!({
+            "source": source,
+            "target": target,
+            "variables": [{
+                "array_path": "/value",
+                "expected_dtype": "float32",
+                "target_chunks": [2, 1, 2]
+            }],
+            "requested_workers": 1,
+            "worker_ceiling": 1,
+            "memory_budget_bytes": 1048576,
+            "codec_concurrent_target": 1,
+            "codec": "none",
+            "codec_shuffle": "auto"
+        }))
+        .expect("payload");
+        let result = native_rechunk_multi(
+            &payload,
+            &cancellation,
+            Some(&progress),
+            &mut |_event, _stage, _payload| {
+                Ok(EventEnvelope {
+                    protocol_version: 1,
+                    request_id: "request".to_string(),
+                    task_id: Some("task".to_string()),
+                    sequence: 0,
+                    event: "progress".to_string(),
+                    stage: Some("native".to_string()),
+                    payload: Map::new(),
+                })
+            },
+        )
+        .expect("native multi rechunk result");
+        assert_eq!(result["operation"], "zarr.rechunk_multi");
+        assert_eq!(
+            result["metrics"]["output"],
+            target.to_string_lossy().as_ref()
+        );
+        assert!(target.is_dir());
+        assert!(!target.parent().unwrap().join(".multi-target.zarr").exists());
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(target);
         let _ = fs::remove_file(progress);
