@@ -94,17 +94,32 @@ jobs:
           TAURI_BUNDLES: deb,rpm
         run: bash scripts/build_desktop.sh --target x86_64-unknown-linux-gnu --ci --no-sign
       - name: Verify Linux packages
+        id: verify-linux-packages
+        continue-on-error: true
         shell: bash
         run: |
+          exec > >(tee /tmp/linux-package-verify.log) 2>&1
+          set -euxo pipefail
           shopt -s nullglob
           debs=(target/release/bundle/deb/*.deb)
           rpms=(target/release/bundle/rpm/*.rpm)
+          printf 'deb_count=%s rpm_count=%s\\n' "${#debs[@]}" "${#rpms[@]}"
           test "${#debs[@]}" -eq 1
           test "${#rpms[@]}" -eq 1
           dpkg-deb --info "${debs[0]}"
           dpkg-deb --contents "${debs[0]}" | grep -F 'usr/bin/fast-nc-zarr-worker'
           rpm -qpi "${rpms[0]}"
           rpm -qpl "${rpms[0]}" | grep -F '/usr/bin/fast-nc-zarr-worker'
+      - name: Upload Linux package verification log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-nc-zarr-linux-package-verify-log
+          if-no-files-found: ignore
+          path: /tmp/linux-package-verify.log
+      - name: Enforce Linux package verification
+        if: steps.verify-linux-packages.outcome == 'failure'
+        run: exit 1
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:
