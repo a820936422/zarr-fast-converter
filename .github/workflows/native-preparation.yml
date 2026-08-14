@@ -97,9 +97,9 @@ jobs:
         id: package_count
         shell: bash
         run: |
-          shopt -s nullglob
-          debs=(target/release/bundle/deb/*.deb)
-          rpms=(target/release/bundle/rpm/*.rpm)
+          bundle_root=target/x86_64-unknown-linux-gnu/release/bundle
+          debs=("$bundle_root/deb"/*.deb)
+          rpms=("$bundle_root/rpm"/*.rpm)
           printf 'deb_count=%s rpm_count=%s\\n' "${#debs[@]}" "${#rpms[@]}"
           test "${#debs[@]}" -eq 1
           test "${#rpms[@]}" -eq 1
@@ -107,32 +107,32 @@ jobs:
         id: deb_metadata
         shell: bash
         run: |
-          shopt -s nullglob
-          debs=(target/release/bundle/deb/*.deb)
+          bundle_root=target/x86_64-unknown-linux-gnu/release/bundle
+          debs=("$bundle_root/deb"/*.deb)
           test "${#debs[@]}" -eq 1
           dpkg-deb --info "${debs[0]}"
       - name: Verify deb worker path
         id: deb_worker
         shell: bash
         run: |
-          shopt -s nullglob
-          debs=(target/release/bundle/deb/*.deb)
+          bundle_root=target/x86_64-unknown-linux-gnu/release/bundle
+          debs=("$bundle_root/deb"/*.deb)
           test "${#debs[@]}" -eq 1
           dpkg-deb --contents "${debs[0]}" | grep -F 'usr/bin/fast-nc-zarr-worker'
       - name: Verify rpm metadata
         id: rpm_metadata
         shell: bash
         run: |
-          shopt -s nullglob
-          rpms=(target/release/bundle/rpm/*.rpm)
+          bundle_root=target/x86_64-unknown-linux-gnu/release/bundle
+          rpms=("$bundle_root/rpm"/*.rpm)
           test "${#rpms[@]}" -eq 1
           rpm -qpi "${rpms[0]}"
       - name: Verify rpm worker path
         id: rpm_worker
         shell: bash
         run: |
-          shopt -s nullglob
-          rpms=(target/release/bundle/rpm/*.rpm)
+          bundle_root=target/x86_64-unknown-linux-gnu/release/bundle
+          rpms=("$bundle_root/rpm"/*.rpm)
           test "${#rpms[@]}" -eq 1
           rpm -qpl "${rpms[0]}" | grep -F '/usr/bin/fast-nc-zarr-worker'
       - name: Upload Linux packages
@@ -141,5 +141,5 @@ jobs:
           name: fast-nc-zarr-linux-packages
           if-no-files-found: error
           path: |
-            target/release/bundle/deb/*.deb
-            target/release/bundle/rpm/*.rpm
+            target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
