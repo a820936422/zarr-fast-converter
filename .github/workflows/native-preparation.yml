@@ -93,57 +93,60 @@ jobs:
         env:
           TAURI_BUNDLES: deb,rpm
         run: bash scripts/build_desktop.sh --target x86_64-unknown-linux-gnu --ci --no-sign
-      - name: Verify Linux packages
-        id: verify-linux-packages
+      - name: Verify Linux package counts
+        id: package_count
         continue-on-error: true
         shell: bash
         run: |
-          exec > >(tee /tmp/linux-package-verify.log) 2>&1
-          set -uo pipefail
           shopt -s nullglob
-          failed=0
           debs=(target/release/bundle/deb/*.deb)
           rpms=(target/release/bundle/rpm/*.rpm)
           printf 'deb_count=%s rpm_count=%s\\n' "${#debs[@]}" "${#rpms[@]}"
-          if (( ${#debs[@]} != 1 || ${#rpms[@]} != 1 )); then
-            echo "::error title=Linux package verification::expected one deb and one rpm; got deb=${#debs[@]} rpm=${#rpms[@]}"
-            failed=1
-          else
-            if dpkg-deb --info "${debs[0]}"; then
-              echo 'deb metadata: ok'
-            else
-              echo '::error title=Linux package verification::dpkg-deb --info failed'
-              failed=1
-            fi
-            if dpkg-deb --contents "${debs[0]}" | grep -F 'usr/bin/fast-nc-zarr-worker'; then
-              echo 'deb worker path: ok'
-            else
-              echo '::error title=Linux package verification::deb worker path missing'
-              failed=1
-            fi
-            if rpm -qpi "${rpms[0]}"; then
-              echo 'rpm metadata: ok'
-            else
-              echo '::error title=Linux package verification::rpm -qpi failed'
-              failed=1
-            fi
-            if rpm -qpl "${rpms[0]}" | grep -F '/usr/bin/fast-nc-zarr-worker'; then
-              echo 'rpm worker path: ok'
-            else
-              echo '::error title=Linux package verification::rpm worker path missing'
-              failed=1
-            fi
-          fi
-          if (( failed != 0 )); then exit 1; fi
-      - name: Upload Linux package verification log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fast-nc-zarr-linux-package-verify-log
-          if-no-files-found: ignore
-          path: /tmp/linux-package-verify.log
+          test "${#debs[@]}" -eq 1
+          test "${#rpms[@]}" -eq 1
+      - name: Verify deb metadata
+        id: deb_metadata
+        continue-on-error: true
+        shell: bash
+        run: |
+          shopt -s nullglob
+          debs=(target/release/bundle/deb/*.deb)
+          test "${#debs[@]}" -eq 1
+          dpkg-deb --info "${debs[0]}"
+      - name: Verify deb worker path
+        id: deb_worker
+        continue-on-error: true
+        shell: bash
+        run: |
+          shopt -s nullglob
+          debs=(target/release/bundle/deb/*.deb)
+          test "${#debs[@]}" -eq 1
+          dpkg-deb --contents "${debs[0]}" | grep -F 'usr/bin/fast-nc-zarr-worker'
+      - name: Verify rpm metadata
+        id: rpm_metadata
+        continue-on-error: true
+        shell: bash
+        run: |
+          shopt -s nullglob
+          rpms=(target/release/bundle/rpm/*.rpm)
+          test "${#rpms[@]}" -eq 1
+          rpm -qpi "${rpms[0]}"
+      - name: Verify rpm worker path
+        id: rpm_worker
+        continue-on-error: true
+        shell: bash
+        run: |
+          shopt -s nullglob
+          rpms=(target/release/bundle/rpm/*.rpm)
+          test "${#rpms[@]}" -eq 1
+          rpm -qpl "${rpms[0]}" | grep -F '/usr/bin/fast-nc-zarr-worker'
       - name: Enforce Linux package verification
-        if: steps.verify-linux-packages.outcome == 'failure'
+        if: |
+          steps.package_count.outcome == 'failure' ||
+          steps.deb_metadata.outcome == 'failure' ||
+          steps.deb_worker.outcome == 'failure' ||
+          steps.rpm_metadata.outcome == 'failure' ||
+          steps.rpm_worker.outcome == 'failure'
         run: exit 1
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
