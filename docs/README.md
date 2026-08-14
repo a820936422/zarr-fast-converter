@@ -1,6 +1,6 @@
 # 模块文档
 
-本文档目录按可执行模块组织，描述当前 v1.7.2 的功能、使用方式和边界。项目总览、环境安装和快速示例见根目录 [README](../README.md)。
+本文档目录按可执行模块组织，描述当前 v1.7.2 功能、使用方式和边界，以及 v1.7.3 的正式开发方案。项目总览、环境安装和快速示例见根目录 [README](../README.md)。
 
 | 模块 | 作用 | 入口 |
 |---|---|---|
@@ -26,6 +26,5 @@
 
 ## 当前架构
 
-- [v1.7.2 Native-first 当前开发状态](v1.7.2-development-plan.md)
-- [目录清理与保留清单](cleanup-plan.md)
+- [v1.7.3 开发方案](v1.7.3-development-plan.md)
 - [IPC contracts](../contracts/README.md)

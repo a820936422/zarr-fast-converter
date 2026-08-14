@@ -8,7 +8,13 @@ export function useTaskEvents() {
 
   useEffect(() => {
     let active = true;
-    void listTasks().then((result) => { if (active) setTasks(result); }).catch(() => undefined);
+    const refreshTasks = () => {
+      void listTasks().then((result) => {
+        if (active) setTasks(result);
+      }).catch(() => undefined);
+    };
+    refreshTasks();
+    window.addEventListener("focus", refreshTasks);
     let unlisten: (() => void) | undefined;
     void listen<TaskEvent>("task-event", (event) => {
       if (!active) return;
@@ -20,7 +26,11 @@ export function useTaskEvents() {
         }).catch(() => undefined);
       }
     }).then((dispose) => { unlisten = dispose; }).catch(() => undefined);
-    return () => { active = false; unlisten?.(); };
+    return () => {
+      active = false;
+      window.removeEventListener("focus", refreshTasks);
+      unlisten?.();
+    };
   }, []);
 
   return { events, tasks, cancel: cancelTask };

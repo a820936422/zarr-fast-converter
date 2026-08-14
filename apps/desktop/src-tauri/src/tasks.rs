@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,8 @@ use crate::error::{AppError, ErrorKind};
 use crate::protocol::{EventEnvelope, RequestEnvelope};
 use crate::resource::ResourceSnapshot;
 use crate::worker::{SharedWorker, WorkerProcess};
+
+const TASK_STORE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -34,32 +36,74 @@ pub type TaskRequest = NativeTaskRequest;
 
 pub type TaskEvent = EventEnvelope;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSummary {
     pub task_id: String,
     pub request_id: String,
     pub command: String,
     pub status: TaskStatus,
+    #[serde(default)]
     pub manifest: Option<String>,
+    #[serde(default)]
     pub error: Option<Value>,
+    #[serde(default)]
     pub cancellation_file: Option<String>,
     pub started_at: u64,
+    #[serde(default)]
     pub resource: Option<ResourceSnapshot>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Serialize, Deserialize)]
+struct TaskStore {
+    schema_version: u32,
+    tasks: Vec<TaskSummary>,
+}
+
+#[derive(Clone)]
 pub struct TaskRegistry {
     tasks: Arc<Mutex<HashMap<String, TaskSummary>>>,
+    state_path: Arc<PathBuf>,
+}
+
+impl Default for TaskRegistry {
+    fn default() -> Self {
+        Self::with_state_path(task_state_path())
+    }
 }
 
 impl TaskRegistry {
-    pub fn insert(&self, task: TaskSummary) -> Result<(), AppError> {
-        self.tasks
+    fn with_state_path(path: PathBuf) -> Self {
+        let (tasks, normalized) = load_tasks(&path);
+        if normalized {
+            let _ = persist_tasks(&path, &tasks);
+        }
+        Self {
+            tasks: Arc::new(Mutex::new(tasks)),
+            state_path: Arc::new(path),
+        }
+    }
+
+    fn update<F>(&self, update: F) -> Result<(), AppError>
+    where
+        F: FnOnce(&mut HashMap<String, TaskSummary>) -> Result<(), AppError>,
+    {
+        let mut tasks = self
+            .tasks
             .lock()
-            .map_err(|_| AppError::new(ErrorKind::Unknown, "task registry lock poisoned"))?
-            .insert(task.task_id.clone(), task);
+            .map_err(|_| AppError::new(ErrorKind::Unknown, "task registry lock poisoned"))?;
+        let mut next = tasks.clone();
+        update(&mut next)?;
+        persist_tasks(self.state_path.as_ref(), &next)?;
+        *tasks = next;
         Ok(())
+    }
+
+    pub fn insert(&self, task: TaskSummary) -> Result<(), AppError> {
+        self.update(|tasks| {
+            tasks.insert(task.task_id.clone(), task);
+            Ok(())
+        })
     }
 
     pub fn get(&self, task_id: &str) -> Result<Option<TaskSummary>, AppError> {
@@ -72,13 +116,20 @@ impl TaskRegistry {
     }
 
     pub fn list(&self) -> Result<Vec<TaskSummary>, AppError> {
-        Ok(self
+        let mut tasks: Vec<_> = self
             .tasks
             .lock()
             .map_err(|_| AppError::new(ErrorKind::Unknown, "task registry lock poisoned"))?
             .values()
             .cloned()
-            .collect())
+            .collect();
+        tasks.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| left.task_id.cmp(&right.task_id))
+        });
+        Ok(tasks)
     }
 
     pub fn cancellation_file(&self, task_id: &str) -> Result<Option<PathBuf>, AppError> {
@@ -92,17 +143,15 @@ impl TaskRegistry {
     }
 
     pub fn mark_cancelling(&self, task_id: &str) -> Result<(), AppError> {
-        let mut tasks = self
-            .tasks
-            .lock()
-            .map_err(|_| AppError::new(ErrorKind::Unknown, "task registry lock poisoned"))?;
-        let task = tasks.get_mut(task_id).ok_or_else(|| {
-            AppError::new(ErrorKind::PathNotFound, format!("unknown task: {task_id}"))
-        })?;
-        if task.status == TaskStatus::Running {
-            task.status = TaskStatus::Cancelling;
-        }
-        Ok(())
+        self.update(|tasks| {
+            let task = tasks.get_mut(task_id).ok_or_else(|| {
+                AppError::new(ErrorKind::PathNotFound, format!("unknown task: {task_id}"))
+            })?;
+            if task.status == TaskStatus::Running {
+                task.status = TaskStatus::Cancelling;
+            }
+            Ok(())
+        })
     }
 
     pub fn update_resource(
@@ -110,28 +159,25 @@ impl TaskRegistry {
         task_id: &str,
         resource: ResourceSnapshot,
     ) -> Result<(), AppError> {
-        let mut tasks = self
-            .tasks
-            .lock()
-            .map_err(|_| AppError::new(ErrorKind::Unknown, "task registry lock poisoned"))?;
-        if let Some(task) = tasks.get_mut(task_id) {
-            task.resource = Some(resource);
-        }
-        Ok(())
+        self.update(|tasks| {
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.resource = Some(resource);
+            }
+            Ok(())
+        })
     }
+
     pub fn update_failure(&self, task_id: &str, error: AppError) -> Result<(), AppError> {
-        let mut tasks = self
-            .tasks
-            .lock()
-            .map_err(|_| AppError::new(ErrorKind::Unknown, "task registry lock poisoned"))?;
-        if let Some(task) = tasks.get_mut(task_id) {
-            task.status = TaskStatus::Failed;
-            task.error = Some(
-                serde_json::to_value(error)
-                    .unwrap_or_else(|_| Value::String("worker failed".to_string())),
-            );
-        }
-        Ok(())
+        let error = serde_json::to_value(error)
+            .unwrap_or_else(|_| Value::String("worker failed".to_string()));
+        self.update(|tasks| {
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.status = TaskStatus::Failed;
+                task.error = Some(error);
+                task.cancellation_file = None;
+            }
+            Ok(())
+        })
     }
 
     pub fn update_terminal(
@@ -139,38 +185,179 @@ impl TaskRegistry {
         task_id: &str,
         event: Option<&TaskEvent>,
     ) -> Result<(), AppError> {
-        let mut tasks = self
-            .tasks
-            .lock()
-            .map_err(|_| AppError::new(ErrorKind::Unknown, "task registry lock poisoned"))?;
-        let Some(task) = tasks.get_mut(task_id) else {
-            return Ok(());
-        };
-        match event {
-            None => {
-                task.status = TaskStatus::Failed;
-                task.error = Some(Value::String(
-                    "worker returned no terminal event".to_string(),
-                ));
-            }
-            Some(event) => match event.event.as_str() {
-                "finished" => {
-                    task.status = TaskStatus::Finished;
-                    task.manifest = find_manifest(&Value::Object(event.payload.clone()));
-                }
-                "cancelled" => task.status = TaskStatus::Cancelled,
-                "failed" => {
+        let cancellation_file = self
+            .get(task_id)?
+            .and_then(|task| task.cancellation_file.clone());
+        self.update(|tasks| {
+            let Some(task) = tasks.get_mut(task_id) else {
+                return Ok(());
+            };
+            match event {
+                None => {
                     task.status = TaskStatus::Failed;
-                    task.error = event.payload.get("error").cloned();
+                    task.error = Some(Value::String(
+                        "worker returned no terminal event".to_string(),
+                    ));
                 }
-                _ => task.status = TaskStatus::Failed,
-            },
-        }
-        if let Some(path) = &task.cancellation_file {
+                Some(event) => match event.event.as_str() {
+                    "finished" => {
+                        task.status = TaskStatus::Finished;
+                        task.manifest = find_manifest(&Value::Object(event.payload.clone()));
+                    }
+                    "cancelled" => task.status = TaskStatus::Cancelled,
+                    "failed" => {
+                        task.status = TaskStatus::Failed;
+                        task.error = event.payload.get("error").cloned();
+                    }
+                    _ => task.status = TaskStatus::Failed,
+                },
+            }
+            task.cancellation_file = None;
+            Ok(())
+        })?;
+        if let Some(path) = cancellation_file {
             let _ = fs::remove_file(path);
         }
         Ok(())
     }
+}
+
+fn load_tasks(path: &Path) -> (HashMap<String, TaskSummary>, bool) {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return (HashMap::new(), false);
+    };
+    let Ok(store) = serde_json::from_str::<TaskStore>(&contents) else {
+        return (HashMap::new(), false);
+    };
+    if store.schema_version != TASK_STORE_SCHEMA_VERSION {
+        return (HashMap::new(), false);
+    }
+    let mut normalized = false;
+    let mut tasks = HashMap::new();
+    for mut task in store.tasks {
+        if matches!(task.status, TaskStatus::Running | TaskStatus::Cancelling) {
+            if let Some(path) = task.cancellation_file.take() {
+                let _ = fs::remove_file(path);
+            }
+            task.status = TaskStatus::Failed;
+            task.error = Some(application_restarted_error());
+            normalized = true;
+        }
+        tasks.insert(task.task_id.clone(), task);
+    }
+    (tasks, normalized)
+}
+
+fn application_restarted_error() -> Value {
+    let mut error = Map::new();
+    error.insert(
+        "kind".to_string(),
+        Value::String("application_restarted".to_string()),
+    );
+    error.insert(
+        "message".to_string(),
+        Value::String(
+            "桌面应用在任务完成前退出；请从 checkpoint recovery 检查并恢复。".to_string(),
+        ),
+    );
+    error.insert("retryable".to_string(), Value::Bool(true));
+    error.insert("stage".to_string(), Value::String("runtime".to_string()));
+    Value::Object(error)
+}
+
+fn persist_tasks(path: &Path, tasks: &HashMap<String, TaskSummary>) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut values: Vec<_> = tasks.values().cloned().collect();
+    values.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    let contents = serde_json::to_vec_pretty(&TaskStore {
+        schema_version: TASK_STORE_SCHEMA_VERSION,
+        tasks: values,
+    })
+    .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tasks.json");
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&temporary, contents)?;
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(_) if path.exists() => {
+            fs::remove_file(path)?;
+            fs::rename(&temporary, path)?;
+            Ok(())
+        }
+        Err(rename_error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(rename_error.into())
+        }
+    }
+}
+
+fn explicit_state_path() -> Option<PathBuf> {
+    std::env::var_os("FAST_NC_ZARR_TASK_STATE").map(PathBuf::from)
+}
+
+#[cfg(target_os = "windows")]
+fn task_state_path() -> PathBuf {
+    if let Some(path) = explicit_state_path() {
+        return path;
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(|home| PathBuf::from(home).join("AppData").join("Local"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("fast-nc-zarr")
+        .join("tasks.json")
+}
+
+#[cfg(target_os = "macos")]
+fn task_state_path() -> PathBuf {
+    if let Some(path) = explicit_state_path() {
+        return path;
+    }
+    std::env::var_os("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("fast-nc-zarr")
+        .join("tasks.json")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn task_state_path() -> PathBuf {
+    if let Some(path) = explicit_state_path() {
+        return path;
+    }
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("fast-nc-zarr")
+        .join("tasks.json")
+}
+
+#[cfg(not(any(unix, target_os = "windows", target_os = "macos")))]
+fn task_state_path() -> PathBuf {
+    explicit_state_path()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("fast-nc-zarr")
+        .join("tasks.json")
 }
 
 fn find_manifest(value: &Value) -> Option<String> {
@@ -336,6 +523,15 @@ mod tests {
     use crate::resource::ResourceSnapshot;
     use serde_json::json;
     use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fast-nc-zarr-task-{label}-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
 
     fn task(path: &str) -> TaskSummary {
         TaskSummary {
@@ -356,16 +552,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn terminal_transition_cleans_cancellation_and_manifest() {
-        let path =
-            std::env::temp_dir().join(format!("fast-nc-zarr-task-test-{}", std::process::id()));
-        fs::write(&path, b"cancel").expect("create cancellation file");
-        let registry = TaskRegistry::default();
-        registry
-            .insert(task(path.to_str().expect("utf8 path")))
-            .expect("insert task");
-        let event = TaskEvent {
+    fn finished_event() -> TaskEvent {
+        TaskEvent {
             protocol_version: 1,
             request_id: "request-1".to_string(),
             task_id: Some("task-1".to_string()),
@@ -374,9 +562,20 @@ mod tests {
             stage: Some("native".to_string()),
             payload: serde_json::from_value(json!({"manifest": "/tmp/manifest.json"}))
                 .expect("payload object"),
-        };
+        }
+    }
+
+    #[test]
+    fn terminal_transition_cleans_cancellation_and_manifest() {
+        let state = temp_path("terminal");
+        let path = temp_path("cancel");
+        fs::write(&path, b"cancel").expect("create cancellation file");
+        let registry = TaskRegistry::with_state_path(state.clone());
         registry
-            .update_terminal("task-1", Some(&event))
+            .insert(task(path.to_str().expect("utf8 path")))
+            .expect("insert task");
+        registry
+            .update_terminal("task-1", Some(&finished_event()))
             .expect("terminal update");
         let current = registry
             .get("task-1")
@@ -384,12 +583,79 @@ mod tests {
             .expect("task exists");
         assert_eq!(current.status, TaskStatus::Finished);
         assert_eq!(current.manifest.as_deref(), Some("/tmp/manifest.json"));
+        assert!(current.cancellation_file.is_none());
         assert!(!path.exists());
         assert!(registry
             .cancellation_file("task-1")
             .expect("cancel handle")
             .is_none());
+        let _ = fs::remove_file(state);
     }
+
+    #[test]
+    fn terminal_state_survives_registry_restart() {
+        let state = temp_path("restart-finished");
+        let path = temp_path("restart-cancel");
+        fs::write(&path, b"cancel").expect("create cancellation file");
+        {
+            let registry = TaskRegistry::with_state_path(state.clone());
+            registry
+                .insert(task(path.to_str().expect("utf8 path")))
+                .expect("insert task");
+            registry
+                .update_terminal("task-1", Some(&finished_event()))
+                .expect("terminal update");
+        }
+        let restored = TaskRegistry::with_state_path(state.clone());
+        let current = restored
+            .get("task-1")
+            .expect("get restored task")
+            .expect("restored task exists");
+        assert_eq!(current.status, TaskStatus::Finished);
+        assert_eq!(current.manifest.as_deref(), Some("/tmp/manifest.json"));
+        let stored: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state).expect("read task store"))
+                .expect("decode task store");
+        assert_eq!(stored["schema_version"], 1);
+        assert_eq!(stored["tasks"][0]["taskId"], "task-1");
+        let _ = fs::remove_file(state);
+    }
+
+    #[test]
+    fn restart_normalizes_active_task_and_removes_cancel_handle() {
+        let state = temp_path("restart-active");
+        let path = temp_path("active-cancel");
+        fs::write(&path, b"cancel").expect("create cancellation file");
+        {
+            let registry = TaskRegistry::with_state_path(state.clone());
+            registry
+                .insert(task(path.to_str().expect("utf8 path")))
+                .expect("insert task");
+        }
+        let restored = TaskRegistry::with_state_path(state.clone());
+        let current = restored
+            .get("task-1")
+            .expect("get restored task")
+            .expect("restored task exists");
+        assert_eq!(current.status, TaskStatus::Failed);
+        assert_eq!(
+            current.error.as_ref().expect("restart error")["kind"],
+            "application_restarted"
+        );
+        assert!(current.cancellation_file.is_none());
+        assert!(!path.exists());
+        let _ = fs::remove_file(state);
+    }
+
+    #[test]
+    fn corrupt_task_store_does_not_block_startup() {
+        let state = temp_path("corrupt");
+        fs::write(&state, b"not json").expect("write corrupt task store");
+        let registry = TaskRegistry::with_state_path(state.clone());
+        assert!(registry.list().expect("list tasks").is_empty());
+        let _ = fs::remove_file(state);
+    }
+
     #[test]
     fn failed_event_preserves_sequence_and_wire_error() {
         let request = RequestEnvelope {
