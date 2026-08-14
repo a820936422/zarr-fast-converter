@@ -156,3 +156,191 @@ pub fn inspect_netcdf(path: &Path) -> Result<NetcdfSummary, String> {
         limitations,
     })
 }
+
+#[derive(Debug, Serialize)]
+pub struct NetcdfConversionSummary {
+    pub input: String,
+    pub output: String,
+    pub variables: Vec<String>,
+    pub logical_bytes: u64,
+}
+
+fn store_f32_array(
+    store: std::sync::Arc<zarrs_filesystem::FilesystemStore>,
+    name: &str,
+    shape: &[u64],
+    dimensions: &[String],
+    values: &[f32],
+    attrs: &Map<String, Value>,
+) -> Result<u64, String> {
+    let chunks = shape
+        .iter()
+        .map(|value| (*value).min(64).max(1))
+        .collect::<Vec<_>>();
+    let mut builder = zarrs::array::ArrayBuilder::new(
+        shape.to_vec(),
+        chunks,
+        zarrs::array::data_type::float32(),
+        f32::NAN,
+    );
+    builder.dimension_names(Some(dimensions.to_vec()));
+    let mut array = builder
+        .build(store, &format!("/{name}"))
+        .map_err(|error| error.to_string())?;
+    for (key, value) in attrs {
+        array.attributes_mut().insert(key.clone(), value.clone());
+    }
+    array.store_metadata().map_err(|error| error.to_string())?;
+    let grid = array
+        .chunk_grid_shape()
+        .iter()
+        .map(|value| *value as usize)
+        .collect::<Vec<_>>();
+    let mut index = vec![0_usize; grid.len()];
+    loop {
+        let index_u64 = index.iter().map(|value| *value as u64).collect::<Vec<_>>();
+        let chunk_shape = array
+            .chunk_shape_usize(&index_u64)
+            .map_err(|error| error.to_string())?;
+        let chunk = super::chunk_values(values, shape, &chunk_shape, &index_u64)
+            .map_err(|error| error.to_string())?;
+        array
+            .store_chunk(&index_u64, chunk.as_slice())
+            .map_err(|error| error.to_string())?;
+        if !super::increment_index(&mut index, &grid) {
+            break;
+        }
+    }
+    Ok((values.len() * std::mem::size_of::<f32>()) as u64)
+}
+
+fn store_f64_array(
+    store: std::sync::Arc<zarrs_filesystem::FilesystemStore>,
+    name: &str,
+    shape: &[u64],
+    dimensions: &[String],
+    values: &[f64],
+    attrs: &Map<String, Value>,
+) -> Result<u64, String> {
+    let chunks = shape
+        .iter()
+        .map(|value| (*value).min(64).max(1))
+        .collect::<Vec<_>>();
+    let mut builder = zarrs::array::ArrayBuilder::new(
+        shape.to_vec(),
+        chunks,
+        zarrs::array::data_type::float64(),
+        f64::NAN,
+    );
+    builder.dimension_names(Some(dimensions.to_vec()));
+    let mut array = builder
+        .build(store, &format!("/{name}"))
+        .map_err(|error| error.to_string())?;
+    for (key, value) in attrs {
+        array.attributes_mut().insert(key.clone(), value.clone());
+    }
+    array.store_metadata().map_err(|error| error.to_string())?;
+    let grid = array
+        .chunk_grid_shape()
+        .iter()
+        .map(|value| *value as usize)
+        .collect::<Vec<_>>();
+    let mut index = vec![0_usize; grid.len()];
+    loop {
+        let index_u64 = index.iter().map(|value| *value as u64).collect::<Vec<_>>();
+        let chunk_shape = array
+            .chunk_shape_usize(&index_u64)
+            .map_err(|error| error.to_string())?;
+        let chunk = super::chunk_values_f64(values, shape, &chunk_shape, &index_u64)
+            .map_err(|error| error.to_string())?;
+        array
+            .store_chunk(&index_u64, chunk.as_slice())
+            .map_err(|error| error.to_string())?;
+        if !super::increment_index(&mut index, &grid) {
+            break;
+        }
+    }
+    Ok((values.len() * std::mem::size_of::<f64>()) as u64)
+}
+
+pub fn convert_netcdf_to_zarr(
+    input: &Path,
+    output: &Path,
+) -> Result<NetcdfConversionSummary, String> {
+    if output.exists() {
+        return Err(format!(
+            "refusing to overwrite existing output: {}",
+            output.display()
+        ));
+    }
+    let file = netcdf::open(input).map_err(|error| error.to_string())?;
+    let summary = inspect_netcdf(input)?;
+    if !summary.supported_subset {
+        return Err(format!(
+            "input is outside supported NetCDF subset: {:?}",
+            summary.limitations
+        ));
+    }
+    if summary
+        .variables
+        .iter()
+        .any(|item| !matches!(item.dtype.as_str(), "float32" | "float64"))
+    {
+        return Err(
+            "native conversion currently supports float32 and float64 variables only".into(),
+        );
+    }
+    std::fs::create_dir_all(output).map_err(|error| error.to_string())?;
+    let store = std::sync::Arc::new(
+        zarrs_filesystem::FilesystemStore::new(output).map_err(|error| error.to_string())?,
+    );
+    zarrs::group::GroupBuilder::new()
+        .build(store.clone(), "/")
+        .map_err(|error| error.to_string())?
+        .store_metadata()
+        .map_err(|error| error.to_string())?;
+    let mut names = Vec::new();
+    let mut logical_bytes = 0_u64;
+    for variable_summary in &summary.variables {
+        let variable = file
+            .variable(&variable_summary.name)
+            .ok_or_else(|| format!("missing variable {}", variable_summary.name))?;
+        let shape = variable_summary
+            .shape
+            .iter()
+            .map(|value| *value as u64)
+            .collect::<Vec<_>>();
+        let attrs = variable_summary.attributes.clone();
+        let bytes = match variable_summary.dtype.as_str() {
+            "float32" => store_f32_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<f32, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+            )?,
+            "float64" => store_f64_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable
+                    .get_values::<f64, _>(..)
+                    .map_err(|error| error.to_string())?,
+                &attrs,
+            )?,
+            _ => unreachable!(),
+        };
+        logical_bytes = logical_bytes.saturating_add(bytes);
+        names.push(variable_summary.name.clone());
+    }
+    Ok(NetcdfConversionSummary {
+        input: input.to_string_lossy().into_owned(),
+        output: output.to_string_lossy().into_owned(),
+        variables: names,
+        logical_bytes,
+    })
+}

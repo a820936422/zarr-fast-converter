@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use fast_nc_zarr_model::{MultiRechunkExecutionPlan, RechunkExecutionPlan};
 use fast_nc_zarr_zarr::{
-    inspect_array, inspect_netcdf, rechunk_f32_array, rechunk_multi_array, write_f64_array,
+    convert_netcdf_to_zarr, inspect_array, inspect_netcdf, rechunk_f32_array, rechunk_multi_array,
+    write_f64_array,
 };
 use serde_json::{Map, Value};
 use tauri::{AppHandle, State};
@@ -20,6 +21,7 @@ use crate::tasks::{
 const NATIVE_OPERATIONS: &[&str] = &[
     "zarr.inspect",
     "raw.netcdf.inspect",
+    "raw.netcdf.convert",
     "zarr.rechunk_f32",
     "zarr.rechunk_multi",
     "zarr.write_f64",
@@ -149,10 +151,10 @@ fn run_native_task(
         .ok()
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    let _ = emit("resource", "resources", resource_payload);
     let result = match operation.as_str() {
         "zarr.inspect" => native_inspect(&request.payload),
         "raw.netcdf.inspect" => native_netcdf_inspect(&request.payload),
+        "raw.netcdf.convert" => native_netcdf_convert(&request.payload),
         "zarr.write_f64" => native_write_f64(&request.payload),
         "zarr.rechunk_f32" => native_rechunk(
             &request.payload,
@@ -238,6 +240,29 @@ fn native_netcdf_inspect(payload: &Map<String, Value>) -> Result<Map<String, Val
             .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
     );
     Ok(output)
+}
+
+fn native_netcdf_convert(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+    let input = required_string(payload, "input")?;
+    let output = required_string(payload, "output")?;
+    if !Path::new(&input).is_file() {
+        return Err(AppError::new(ErrorKind::PathNotFound, input).at_stage("conversion"));
+    }
+    let summary =
+        convert_netcdf_to_zarr(Path::new(&input), Path::new(&output)).map_err(|error| {
+            AppError::new(ErrorKind::PublicationFailed, error).at_stage("conversion")
+        })?;
+    let mut result = Map::new();
+    result.insert(
+        "operation".to_string(),
+        Value::String("raw.netcdf.convert".to_string()),
+    );
+    result.insert(
+        "summary".to_string(),
+        serde_json::to_value(summary)
+            .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
+    );
+    Ok(result)
 }
 fn native_write_f64(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
     let root = required_string(payload, "path")?;
@@ -534,7 +559,7 @@ mod tests {
     fn native_operation_gate_is_explicit() {
         assert!(validate_operation("zarr.inspect").is_ok());
         assert!(validate_operation("raw.netcdf.inspect").is_ok());
-        assert!(validate_operation("raw.netcdf.convert").is_err());
+        assert!(validate_operation("raw.netcdf.convert").is_ok());
     }
 
     #[test]

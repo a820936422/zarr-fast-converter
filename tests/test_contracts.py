@@ -35,11 +35,11 @@ class ProtocolContractTests(unittest.TestCase):
             set(payload["operations"]),
             {item["operation"] for item in payload["capabilities"] if item["supported"]},
         )
-        unavailable = next(
+        convert = next(
             item for item in payload["capabilities"] if item["operation"] == "raw.netcdf.convert"
         )
-        self.assertFalse(unavailable["supported"])
-        self.assertTrue(unavailable["reason"])
+        self.assertTrue(convert["supported"])
+        self.assertIsNone(convert["reason"])
 
         inspect = next(
             item for item in payload["capabilities"] if item["operation"] == "raw.netcdf.inspect"

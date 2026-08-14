@@ -2,7 +2,7 @@ use fast_nc_zarr_model::{
     BackendCapability, MultiRechunkExecutionPlan, RechunkExecutionPlan, BACKEND_PROTOCOL_VERSION,
 };
 use fast_nc_zarr_zarr::{
-    inspect_array, inspect_netcdf, read_chunk_f32 as read_zarr_chunk_f32,
+    convert_netcdf_to_zarr, inspect_array, inspect_netcdf, read_chunk_f32 as read_zarr_chunk_f32,
     read_chunk_f64 as read_zarr_chunk_f64, read_region_f32 as read_zarr_region_f32,
     read_region_f64 as read_zarr_region_f64, rechunk_f32_array, rechunk_f64_array,
     rechunk_multi_array, write_f32_array as write_zarr_f32_array,
@@ -115,8 +115,19 @@ fn inspect_netcdf_json(path: &str) -> PyResult<String> {
     serde_json::to_string(&summary).map_err(runtime_error)
 }
 
+#[pyfunction]
+fn convert_netcdf_json(py: Python<'_>, input: &str, output: &str) -> PyResult<String> {
+    let summary = py
+        .detach(|| {
+            convert_netcdf_to_zarr(std::path::Path::new(input), std::path::Path::new(output))
+        })
+        .map_err(runtime_error)?;
+    serde_json::to_string(&summary).map_err(runtime_error)
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(convert_netcdf_json, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_netcdf_json, module)?)?;
     module.add_function(wrap_pyfunction!(capability_json, module)?)?;
     module.add_function(wrap_pyfunction!(protocol_version, module)?)?;

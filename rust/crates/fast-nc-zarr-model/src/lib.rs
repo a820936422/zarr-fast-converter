@@ -171,6 +171,14 @@ impl BackendCapability {
                     "numeric variables",
                 ][..],
             ),
+            (
+                "raw.netcdf.convert",
+                &[
+                    "NetCDF-4/classic",
+                    "float32/float64 variables",
+                    "Zarr v3 output",
+                ][..],
+            ),
         ];
         let operations = supported
             .iter()
@@ -181,11 +189,6 @@ impl BackendCapability {
             .map(|(operation, limitations)| OperationCapability::supported(operation, limitations))
             .collect::<Vec<_>>();
         capabilities.extend([
-            OperationCapability::unsupported(
-                "raw.netcdf.convert",
-                "native conversion is not implemented in this phase",
-                &["use Python fallback"],
-            ),
             OperationCapability::unsupported(
                 "resample.nearest",
                 "native resampling is not implemented in this phase",
@@ -226,7 +229,7 @@ mod tests {
     fn smoke_capability_has_stable_protocol_and_matrix() {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
-        assert_eq!(capability.operations.len(), 15);
+        assert_eq!(capability.operations.len(), 16);
         assert_eq!(capability.capabilities.len(), 19);
         let supported = capability
             .capabilities
@@ -236,7 +239,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(supported, capability.operations);
         assert!(
-            !capability
+            capability
                 .operation("raw.netcdf.convert")
                 .unwrap()
                 .supported

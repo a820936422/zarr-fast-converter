@@ -58,8 +58,8 @@ class NativePreparationTests(unittest.TestCase):
         if capability.supported:
             detail = capability.operation("raw.netcdf.convert")
             self.assertIsNotNone(detail)
-            self.assertFalse(detail.supported)
-            self.assertTrue(detail.reason)
+            self.assertTrue(detail.supported)
+            self.assertIsNone(detail.reason)
             f64 = capability.operation("zarr.write_f64")
             self.assertIsNotNone(f64)
             self.assertTrue(f64.supported)
@@ -86,7 +86,8 @@ class NativePreparationTests(unittest.TestCase):
     def test_standard_raw_and_resample_operations_remain_explainable_fallbacks(self) -> None:
         expected = "rust" if _RUST_NETCDF_READY else "python"
         self.assertEqual(resolve_backend("auto", "raw.netcdf.inspect"), expected)
-        for operation in ("raw.netcdf.convert", "resample.nearest", "resample.bilinear"):
+        self.assertEqual(resolve_backend("auto", "raw.netcdf.convert"), expected)
+        for operation in ("resample.nearest", "resample.bilinear"):
             self.assertEqual(resolve_backend("auto", operation), "python")
             with self.assertRaises(BackendUnavailableError):
                 resolve_backend("rust", operation)
@@ -118,6 +119,26 @@ class RustNetcdfInspectTests(unittest.TestCase):
             variable = next(item for item in summary["variables"] if item["name"] == "value")
             self.assertEqual(variable["dtype"], "float32")
             self.assertEqual(variable["shape"], [2, 2, 3])
+
+    def test_convert_standard_netcdf4_to_zarr(self) -> None:
+        import netCDF4
+
+        with tempfile.TemporaryDirectory(prefix="fast-nc-zarr-convert-") as directory:
+            path = Path(directory) / "sample.nc"
+            target = Path(directory) / "sample.zarr"
+            values = np.arange(12, dtype="float32").reshape(2, 2, 3)
+            with netCDF4.Dataset(path, "w", format="NETCDF4_CLASSIC") as dataset:
+                for name, size in (("time", 2), ("lat", 2), ("lon", 3)):
+                    dataset.createDimension(name, size)
+                dataset.createVariable("time", "f8", ("time",))[:] = [0, 1]
+                dataset.createVariable("lat", "f4", ("lat",))[:] = [10, 20]
+                dataset.createVariable("lon", "f4", ("lon",))[:] = [100, 110, 120]
+                dataset.createVariable("value", "f4", ("time", "lat", "lon"))[:] = values
+            native = importlib.import_module("fast_nc_zarr._native")
+            metrics = json.loads(native.convert_netcdf_json(str(path), str(target)))
+            self.assertEqual(metrics["variables"], ["time", "lat", "lon", "value"])
+            with xr.open_zarr(target, consolidated=False, chunks=None) as result:
+                np.testing.assert_array_equal(result["value"].values, values)
 
 @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
 class RustZarrCrossBackendTests(unittest.TestCase):

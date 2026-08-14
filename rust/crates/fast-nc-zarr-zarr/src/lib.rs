@@ -1,7 +1,8 @@
 mod netcdf_native;
 
 pub use netcdf_native::{
-    inspect_netcdf, NetcdfDimensionSummary, NetcdfSummary, NetcdfVariableSummary,
+    convert_netcdf_to_zarr, inspect_netcdf, NetcdfConversionSummary, NetcdfDimensionSummary,
+    NetcdfSummary, NetcdfVariableSummary,
 };
 
 use fast_nc_zarr_model::{
