@@ -42,7 +42,14 @@ jobs:
         run: pixi run cross-backend-test
 
       - name: Run existing Python suite
-        run: pixi run test
+        run: pixi run test 2>&1 | tee /tmp/fast-nc-zarr-python-suite.log
+      - name: Upload Python suite failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-nc-zarr-python-suite-log
+          if-no-files-found: ignore
+          path: /tmp/fast-nc-zarr-python-suite.log
 
 
   desktop-release:
