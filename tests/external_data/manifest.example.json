@@ -1,0 +1,62 @@
+{
+  "datasets": [
+    {
+      "name": "modis_mcd12c1",
+      "source_root": "/path/to/MODIS/MCD12C1/hdf",
+      "files": [
+        "MCD12C1.A2001001.061.2022154134516.hdf",
+        "MCD12C1.A2002001.061.2022149015010.hdf"
+      ],
+      "mode": "filename",
+      "engine": "netcdf4",
+      "template": "doy",
+      "field_values": ["2001", "001"],
+      "variables": ["Majority_Land_Cover_Type_1"],
+      "delete_after_test": true
+    },
+    {
+      "name": "mswx_tmean",
+      "source_root": "/path/to/MSWX/RAW_nc/Tmean",
+      "files": ["2001001.nc"],
+      "mode": "complete",
+      "engine": "netcdf4",
+      "variables": ["air_temperature"],
+      "delete_after_test": true
+    },
+    {
+      "name": "gosif_gpp",
+      "source_root": "/path/to/GOSIF/GOSIF-GPP/原始TIF-坐标矫正",
+      "files": [
+        "GOSIF_GPP_2001001_Mean.tif",
+        "GOSIF_GPP_2001009_Mean.tif"
+      ],
+      "mode": "filename",
+      "engine": "rasterio",
+      "template": "doy",
+      "variables": ["band_data"],
+      "delete_after_test": true
+    },
+    {
+      "name": "csif",
+      "source_root": "/path/to/CSIF/nc/CSIF_0.05°",
+      "files": [
+        "OCO2.SIF.clear.inst.2001001.v2.nc",
+        "OCO2.SIF.clear.inst.2001009.v2.nc"
+      ],
+      "mode": "filename",
+      "engine": "netcdf4",
+      "template": "doy",
+      "variables": ["clear_inst_SIF"],
+      "delete_after_test": true
+    },
+    {
+      "name": "fluxsatv2",
+      "source_root": "/path/to/FLUXSATv2/RAW_nc",
+      "files": ["GPP_FluxSat_daily_v2_200101.nc4"],
+      "mode": "complete",
+      "engine": "netcdf4",
+      "variables": ["GPP"],
+      "delete_after_test": true
+    }
+  ]
+}

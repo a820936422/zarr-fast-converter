@@ -44,3 +44,10 @@ release/*.zip
 release/*.dmg
 release/*.msi
 release/*.whl
+
+# External dataset validation is local-only; inputs are read-only links.
+tests/external_data/inputs/
+tests/external_data/results/
+tests/external_data/work/
+tests/external_data/logs/
+tests/external_data/manifest.local.json

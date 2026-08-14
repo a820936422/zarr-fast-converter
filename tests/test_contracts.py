@@ -35,11 +35,17 @@ class ProtocolContractTests(unittest.TestCase):
             set(payload["operations"]),
             {item["operation"] for item in payload["capabilities"] if item["supported"]},
         )
-        unavailable = next(
+        convert = next(
             item for item in payload["capabilities"] if item["operation"] == "raw.netcdf.convert"
         )
-        self.assertFalse(unavailable["supported"])
-        self.assertTrue(unavailable["reason"])
+        self.assertTrue(convert["supported"])
+        self.assertIsNone(convert["reason"])
+
+        inspect = next(
+            item for item in payload["capabilities"] if item["operation"] == "raw.netcdf.inspect"
+        )
+        self.assertTrue(inspect["supported"])
+        self.assertIsNone(inspect["reason"])
 
     def test_request_and_event_schemas_keep_protocol_version_one(self) -> None:
         for name in ("request-v1.schema.json", "event-v1.schema.json"):

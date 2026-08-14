@@ -12,17 +12,21 @@ Rust desktop runtime
         └── 复杂输入或未通过正确性门的操作：兼容处理服务
 ```
 
-前端只通过 Tauri commands 访问文件选择、数据检查、处理计划、任务事件和恢复功能。Rust 负责任务注册、取消、资源快照、事件转发和 native capability；兼容服务负责当前尚未完成 native parity 的 NetCDF/HDF/TIFF、CF 元数据、复杂重采样和科学结果校验。
+前端只通过 Tauri commands 访问文件选择、数据检查、处理计划、任务事件和恢复功能。Rust 负责任务注册、取消、资源快照、事件转发和 native capability；兼容服务负责当前尚未完成 native parity 的复杂 HDF/TIFF、整数 NetCDF 转换、非标准 calendar、复杂重采样和科学结果校验。
 
 当前 native 能力包括：
 
 - Zarr v3 结构检查；
 - Float32/Float64 chunk、region 和数组写入；
-- 单变量和多变量 Float32/Float64 重分块；
+- 单变量和多变量 Float32/Float64/标准整数重分块；
+- fill_value、scale_factor、add_offset 和 CF attrs 保持；
+- zstd、Blosc 系列和 gzip 显式无损 codec；
+- 标准 NetCDF-4/classic 的 `time/lat/lon` 数值变量 metadata inspect 和 float32/float64 → Zarr v3 conversion；
+- float32 规则经纬度网格的 native nearest/bilinear，支持 latitude 方向和越界 NaN；
 - 有界并行、取消、进度、staging 校验和原子发布；
 - capability matrix、manifest 和事件证据。
 
-整数 dtype、fill/scale/CF 属性、复杂 codec、标准 NetCDF native conversion、复杂输入和规则网格 native resampling 仍由兼容路径负责，并在 capability 中明确记录。多变量 native 当前保留源 codec，不执行新的压缩配置。
+复杂 HDF、整数 NetCDF conversion、非标准 calendar、复杂 xESMF 方法和非规则网格仍由兼容路径负责，并在 capability 中明确记录。多变量 native 不执行自动压缩候选调优。
 
 ## 安装环境
 

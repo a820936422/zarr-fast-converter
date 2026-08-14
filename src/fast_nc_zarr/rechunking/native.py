@@ -19,6 +19,24 @@ from ..publication import (
 
 BackendName = Literal["auto", "python", "rust"]
 
+_MULTI_NATIVE_DTYPES = frozenset(
+    {
+        "float32",
+        "float64",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+    }
+)
+_MULTI_NATIVE_CODECS = frozenset(
+    {"", "none", "zstd", "blosc-zstd", "blosc-lz4", "blosc-lz4hc", "blosc-zlib", "gzip"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RustRechunkPlan:
@@ -74,7 +92,8 @@ class RustMultiRechunkVariablePlan:
     array_path: str
     target_chunks: tuple[int, ...]
     expected_dtype: str
-
+    is_coordinate: bool = False
+    dimension_names: tuple[str, ...] | None = None
 
 @dataclass(frozen=True, slots=True)
 class RustMultiRechunkPlan:
@@ -103,6 +122,12 @@ class RustMultiRechunkPlan:
                         "array_path": item.array_path,
                         "target_chunks": [int(value) for value in item.target_chunks],
                         "expected_dtype": item.expected_dtype,
+                        "is_coordinate": bool(item.is_coordinate),
+                        "dimension_names": (
+                            None
+                            if item.dimension_names is None
+                            else list(item.dimension_names)
+                        ),
                     }
                     for item in self.variables
                 ],
@@ -174,6 +199,9 @@ def _validate_multi_staged_output(
     variables: tuple[RustMultiRechunkVariablePlan, ...],
     *,
     validate: bool,
+    requested_codec: str,
+    requested_codec_level: int | None,
+    requested_codec_shuffle: str,
 ) -> None:
     from .inspection import inspect_store
 
@@ -194,11 +222,19 @@ def _validate_multi_staged_output(
     expected_chunks = {
         item.array_path.strip("/").split("/")[-1]: item.target_chunks for item in variables
     }
+    expected_dimensions = {
+        item.array_path.strip("/").split("/")[-1]: item.dimension_names
+        for item in variables
+        if item.dimension_names is not None
+    }
     if not requested_names.issubset(source_vars):
         missing = sorted(requested_names - source_vars.keys())
         raise ValueError("Rust多变量计划缺少输入变量：" + ", ".join(missing))
     for name, source_variable in source_vars.items():
         output_variable = output_vars[name]
+        expected = expected_dimensions.get(name)
+        if expected is not None and tuple(source_variable.dims) != tuple(expected):
+            raise ValueError(f"Rust多变量计划的维度与输入变量 {name} 不一致")
         if (
             source_variable.dims != output_variable.dims
             or source_variable.shape != output_variable.shape
@@ -215,7 +251,17 @@ def _validate_multi_staged_output(
             output_variable.attrs
         ):
             raise ValueError(f"Rust输出变量 {name} 的属性发生变化")
-        if tuple(map(repr, source_variable.compressors)) != tuple(
+        if name in requested_names and requested_codec not in {"", "none"}:
+            if not _codec_matches_request(
+                output_variable.compressors,
+                requested_codec,
+                requested_codec_level,
+                requested_codec_shuffle,
+            ):
+                raise ValueError(
+                    f"Rust输出变量 {name} 未使用请求的 codec {requested_codec}"
+                )
+        elif tuple(map(repr, source_variable.compressors)) != tuple(
             map(repr, output_variable.compressors)
         ):
             raise ValueError(f"Rust输出变量 {name} 的 codec 发生变化")
@@ -240,12 +286,14 @@ def run_rust_multi_rechunk(
         raise ValueError("输入和输出 Zarr 不能相互嵌套")
     if not source.is_dir():
         raise ValueError(f"输入 Zarr 目录不存在: {source}")
+    if any(item.is_coordinate for item in plan.variables):
+        raise BackendUnavailableError("Rust 多变量重分块不能选择 coordinate 变量")
     if not plan.variables:
         raise BackendUnavailableError("Rust 多变量重分块至少需要一个数据变量")
-    if any(item.expected_dtype not in {"float32", "float64"} for item in plan.variables):
-        raise BackendUnavailableError("Rust 多变量重分块当前只支持 float32/float64")
-    if plan.codec not in {"", "none"}:
-        raise BackendUnavailableError("Rust 多变量重分块保留源 codec，不执行新的压缩配置")
+    if any(item.expected_dtype not in _MULTI_NATIVE_DTYPES for item in plan.variables):
+        raise BackendUnavailableError("Rust 多变量重分块当前不支持请求的 dtype")
+    if plan.codec not in _MULTI_NATIVE_CODECS:
+        raise BackendUnavailableError(f"Rust 多变量重分块不支持 codec {plan.codec}")
     resolved = resolve_backend(requested_backend, "zarr.rechunk_multi")
     if resolved != "rust":
         raise BackendUnavailableError(
@@ -331,6 +379,9 @@ def run_rust_multi_rechunk(
                 staging,
                 plan.variables,
                 validate=validate,
+                requested_codec=plan.codec,
+                requested_codec_level=plan.codec_level,
+                requested_codec_shuffle=plan.codec_shuffle,
             )
         if cancel_event is not None and cancel_event.is_set():
             from .engine import RechunkExecutionError
@@ -360,10 +411,10 @@ def run_rust_multi_rechunk(
                 "worker_tuning": {},
                 "tuning_objective": "balanced",
                 "selected_compression": {
-                    "profile": "none",
-                    "codec": "none",
-                    "level": None,
-                    "shuffle": "auto",
+                    "profile": "custom" if plan.codec not in {"", "none"} else "none",
+                    "codec": plan.codec,
+                    "level": plan.codec_level,
+                    "shuffle": plan.codec_shuffle,
                 },
             }
         )
@@ -612,8 +663,8 @@ def run_rust_multi_rechunk_for_config(
         raise BackendUnavailableError("Rust 多变量重分块要求所有数据变量都是三维数组")
     if any(tuple(variable.dims) != ("time", "lat", "lon") for variable in variables):
         raise BackendUnavailableError("Rust 多变量重分块要求数据维度为 (time, lat, lon)")
-    if any(str(variable.dtype) not in {"float32", "float64"} for variable in variables):
-        raise BackendUnavailableError("Rust 多变量重分块当前只支持 float32/float64")
+    if any(str(variable.dtype) not in _MULTI_NATIVE_DTYPES for variable in variables):
+        raise BackendUnavailableError("Rust 多变量重分块当前不支持请求的 dtype")
     if plan is None:
         reference = variables[0]
         base_chunks = tuple(int(value) for value in reference.chunks)
@@ -647,8 +698,11 @@ def run_rust_multi_rechunk_for_config(
         )
     if getattr(compression, "profile", None) == "auto":
         raise BackendUnavailableError("Rust 多变量后端不执行自动压缩候选调优")
-    if bool(getattr(compression, "enabled", False)):
-        raise BackendUnavailableError("Rust 多变量重分块保留源 codec，不执行新的压缩配置")
+    codec = str(getattr(compression, "codec", "none")) if compression.enabled else "none"
+    codec_level = getattr(compression, "level", None) if compression.enabled else None
+    codec_shuffle = str(getattr(compression, "shuffle", "auto")) if compression.enabled else "auto"
+    if codec not in _MULTI_NATIVE_CODECS:
+        raise BackendUnavailableError(f"Rust 多变量重分块不支持 codec {codec}")
     budget = getattr(config, "resource_budget", None)
     if budget is None:
         from ..system import effective_resource_budget
@@ -673,6 +727,8 @@ def run_rust_multi_rechunk_for_config(
                     array_path=f"/{variable.name}",
                     target_chunks=target_chunks[variable.name],
                     expected_dtype=str(variable.dtype),
+                    is_coordinate=bool(variable.is_coord),
+                    dimension_names=tuple(str(dim) for dim in variable.dims),
                 )
                 for variable in variables
             ),
@@ -680,6 +736,9 @@ def run_rust_multi_rechunk_for_config(
             worker_ceiling=int(budget.worker_ceiling),
             memory_budget_bytes=int(budget.memory_budget_bytes),
             codec_concurrent_target=codec_workers,
+            codec=codec,
+            codec_level=codec_level,
+            codec_shuffle=codec_shuffle,
         ),
         requested_backend="rust",
         source_info=info,

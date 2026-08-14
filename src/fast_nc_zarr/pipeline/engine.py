@@ -77,6 +77,28 @@ def _write_event(path: Path, event: str, payload: dict[str, object] | None = Non
         # Telemetry must not turn a valid data product into a failed task.
         return
 
+def _stage_event_payload(
+    manifest: dict[str, object],
+    stage: str,
+    payload: dict[str, object] | None = None,
+    *,
+    checkpoint: str | None = None,
+    terminal_status: str | None = None,
+) -> dict[str, object]:
+    backend = manifest.get("backend") if isinstance(manifest.get("backend"), dict) else {}
+    evidence: dict[str, object] = {
+        "stage": stage,
+        "requested_backend": backend.get("requested"),
+        "resolved_backend": backend.get("resolved"),
+        "fallback": backend.get("fallback"),
+        "fallback_reason": backend.get("fallback_reason"),
+        "stage_checkpoint": checkpoint,
+        "manifest": manifest.get("manifest"),
+        "terminal_status": terminal_status,
+    }
+    evidence.update(payload or {})
+    return evidence
+
 def _apply_runtime_compression(
     manifest: dict,
     metrics: dict,
@@ -611,11 +633,15 @@ def _run_zarr_pipeline(
         Path(config.general.output).expanduser().resolve().parent,
     )
     paths.root.mkdir(parents=True, exist_ok=False)
-    _write_event(paths.events, "started", {"job_id": paths.root.name})
+    _write_event(
+        paths.events,
+        "started",
+        {"job_id": paths.root.name, "stage": "preparation", "requested_backend": getattr(config, "backend", "python"), "resolved_backend": "pending", "fallback": None, "fallback_reason": None, "stage_checkpoint": None, "manifest": str(paths.manifest), "terminal_status": "running"},
+    )
     output = Path(config.general.output).expanduser().resolve()
     resources = _pipeline_resource_snapshot(inspection, config, paths)
     resource_budget = effective_resource_budget(resources)
-    _write_event(paths.events, "resource", {"resource_budget": resource_budget.to_dict()})
+    _write_event(paths.events, "resource", {"stage": "preparation", "resource_budget": resource_budget.to_dict(), "manifest": str(paths.manifest), "terminal_status": "running"})
     if progress:
         _print_resource_snapshot(resources)
     requested_operations = {
@@ -642,6 +668,7 @@ def _run_zarr_pipeline(
         "input_kind": getattr(inspection, "kind", "zarr"),
         "output": str(output),
         "temporary_root": str(paths.root),
+        "manifest": str(paths.manifest),
         "events": str(paths.events),
         "backend": {
             "requested": requested_backend,
@@ -766,7 +793,7 @@ def _run_zarr_pipeline(
             manifest["candidate_trials"]["resampling"] = resample_metrics.get("tuning", {})
             manifest["selection"]["resampling"] = resample_metrics.get("tuning", {}).get("selection_reason")
             manifest["resolved_plans"]["resampling"] = resample_metrics.get("resolved_plan", {})
-            _write_event(paths.events, "tuning", {"stage": "resampling", "selection": manifest["selection"]["resampling"]})
+            _write_event(paths.events, "tuning", _stage_event_payload(manifest, "resampling", {"selection": manifest["selection"]["resampling"]}, checkpoint="resampled.zarr" if plan.finalization_required else "output", terminal_status="running"))
             _write_manifest(paths.manifest, manifest)
             if resuming:
                 if plan.resample_plan is None:
@@ -867,7 +894,7 @@ def _run_zarr_pipeline(
                 "resource_budget": finalization_metrics.get("resource_budget"),
                 "selected_compression": finalization_metrics.get("selected_compression"),
             }
-            _write_event(paths.events, "tuning", {"stage": "finalization", "selection": manifest["selection"]["finalization"]})
+            _write_event(paths.events, "tuning", _stage_event_payload(manifest, "finalization", {"selection": manifest["selection"]["finalization"]}, checkpoint="output", terminal_status="running"))
         semantic_validation = _semantic_validation(output, config, progress=progress)
         manifest["semantic_validation"] = semantic_validation
         final_output_bytes = int(
@@ -912,7 +939,7 @@ def _run_zarr_pipeline(
         manifest["logical_io"] = logical_io
         manifest["status"] = "succeeded"
         manifest["elapsed"] = time.perf_counter() - started
-        _write_event(paths.events, "finished", {"status": "succeeded", "elapsed": manifest["elapsed"]})
+        _write_event(paths.events, "finished", _stage_event_payload(manifest, "terminal", {"status": "succeeded", "elapsed": manifest["elapsed"]}, checkpoint="output", terminal_status="succeeded"))
         _write_manifest(paths.manifest, manifest)
         return {
             "output": str(output),
@@ -933,7 +960,7 @@ def _run_zarr_pipeline(
         manifest["status"] = "failed"
         manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started
-        _write_event(paths.events, "finished", {"status": "failed", "stage": current_stage, "error": str(exc)})
+        _write_event(paths.events, "finished", _stage_event_payload(manifest, current_stage, {"status": "failed", "error": str(exc)}, checkpoint=None, terminal_status="failed"))
         manifest["error"] = str(exc)
         _write_manifest(paths.manifest, manifest)
         if isinstance(exc, PipelineExecutionError):
@@ -972,8 +999,8 @@ def run_pipeline(
     paths.root.mkdir(parents=True, exist_ok=False)
     resources = _pipeline_resource_snapshot(inspection, config, paths)
     resource_budget = effective_resource_budget(resources)
-    _write_event(paths.events, "started", {"job_id": paths.root.name})
-    _write_event(paths.events, "resource", {"resource_budget": resource_budget.to_dict()})
+    _write_event(paths.events, "started", {"job_id": paths.root.name, "stage": "preparation", "requested_backend": getattr(config, "backend", "python"), "resolved_backend": "python", "fallback": getattr(config, "backend", "python") in {"auto", "rust"}, "fallback_reason": "raw pipeline conversion remains Python coordinator", "stage_checkpoint": None, "manifest": str(paths.manifest), "terminal_status": "running"})
+    _write_event(paths.events, "resource", {"stage": "preparation", "resource_budget": resource_budget.to_dict(), "manifest": str(paths.manifest), "terminal_status": "running"})
     if progress:
         _print_resource_snapshot(resources)
     requested_operations = {
@@ -1000,6 +1027,7 @@ def run_pipeline(
         "preflight": preflight,
         "output": str(Path(config.general.output).expanduser().resolve()),
         "temporary_root": str(paths.root),
+        "manifest": str(paths.manifest),
         "events": str(paths.events),
         "backend": {
             "requested": requested_backend,
@@ -1120,7 +1148,7 @@ def run_pipeline(
         manifest["candidate_trials"]["conversion"] = conversion_metrics.get("tuning", {})
         manifest["selection"]["conversion"] = conversion_metrics.get("tuning", {}).get("selection_reason")
         manifest["resolved_plans"]["conversion"] = asdict(conversion_plan)
-        _write_event(paths.events, "tuning", {"stage": "conversion", "selection": manifest["selection"]["conversion"]})
+        _write_event(paths.events, "tuning", _stage_event_payload(manifest, "conversion", {"selection": manifest["selection"]["conversion"]}, checkpoint="source-crop.zarr" if not conversion_is_final else "output", terminal_status="running"))
         if not conversion_is_final:
             manifest["resume"]["checkpoints"]["conversion"] = {
                 "path": "source-crop.zarr",
@@ -1239,7 +1267,7 @@ def run_pipeline(
             manifest["candidate_trials"]["resampling"] = resample_metrics.get("tuning", {})
             manifest["selection"]["resampling"] = resample_metrics.get("tuning", {}).get("selection_reason")
             manifest["resolved_plans"]["resampling"] = resample_metrics.get("resolved_plan", {})
-            _write_event(paths.events, "tuning", {"stage": "resampling", "selection": manifest["selection"]["resampling"]})
+            _write_event(paths.events, "tuning", _stage_event_payload(manifest, "resampling", {"selection": manifest["selection"]["resampling"]}, checkpoint="resampled.zarr" if not resampling_is_final else "output", terminal_status="running"))
             _write_manifest(paths.manifest, manifest)
             current = final_target if resampling_is_final else resample_output
             if config.general.cleanup_intermediate:
@@ -1318,7 +1346,7 @@ def run_pipeline(
             "resource_budget": rechunk_metrics.get("resource_budget"),
             "selected_compression": rechunk_metrics.get("selected_compression"),
         }
-        _write_event(paths.events, "tuning", {"stage": "finalization", "selection": manifest["selection"]["finalization"]})
+        _write_event(paths.events, "tuning", _stage_event_payload(manifest, "finalization", {"selection": manifest["selection"]["finalization"]}, checkpoint="output", terminal_status="running"))
         semantic_validation = _semantic_validation(
             Path(config.general.output).expanduser().resolve(),
             config,
@@ -1357,7 +1385,7 @@ def run_pipeline(
         manifest["logical_io"] = logical_io
         manifest["status"] = "succeeded"
         manifest["elapsed"] = time.perf_counter() - started
-        _write_event(paths.events, "finished", {"status": "succeeded", "elapsed": manifest["elapsed"]})
+        _write_event(paths.events, "finished", _stage_event_payload(manifest, "terminal", {"status": "succeeded", "elapsed": manifest["elapsed"]}, checkpoint="output", terminal_status="succeeded"))
         _write_manifest(paths.manifest, manifest)
         if progress:
             print(f"一条龙处理完成：{config.general.output}")
@@ -1380,7 +1408,7 @@ def run_pipeline(
         manifest["status"] = "failed"
         manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started
-        _write_event(paths.events, "finished", {"status": "failed", "stage": current_stage, "error": str(exc)})
+        _write_event(paths.events, "finished", _stage_event_payload(manifest, current_stage, {"status": "failed", "error": str(exc)}, checkpoint=None, terminal_status="failed"))
         manifest["error"] = str(exc)
         _write_manifest(paths.manifest, manifest)
         if isinstance(exc, PipelineExecutionError):

@@ -9,7 +9,7 @@ from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo
 from ..resampling.models import ResamplePlan, TargetGrid
 
 
-MANIFEST_SCHEMA_VERSION = 6
+MANIFEST_SCHEMA_VERSION = 7
 
 @dataclass(frozen=True)
 class PipelineGeneralConfig:

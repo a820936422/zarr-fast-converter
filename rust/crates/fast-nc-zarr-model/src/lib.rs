@@ -71,6 +71,10 @@ pub struct RechunkVariablePlan {
     pub array_path: String,
     pub expected_dtype: String,
     pub target_chunks: Vec<u64>,
+    #[serde(default)]
+    pub is_coordinate: bool,
+    #[serde(default)]
+    pub dimension_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,10 +156,44 @@ impl BackendCapability {
             (
                 "zarr.rechunk_multi",
                 &[
-                    "float32 and float64 data variables",
-                    "source codecs preserved",
+                    "float32, float64 and standard integer data variables",
+                    "fill_value and CF attributes preserved",
+                    "source or requested lossless codecs",
                     "atomic staging",
                     "cooperative cancellation",
+                ][..],
+            ),
+            (
+                "raw.netcdf.inspect",
+                &[
+                    "NetCDF-4/classic",
+                    "time/lat/lon dimensions",
+                    "numeric variables",
+                ][..],
+            ),
+            (
+                "raw.netcdf.convert",
+                &[
+                    "NetCDF-4/classic",
+                    "float32/float64 time-lat-lon data variables",
+                    "numeric standard coordinates",
+                    "Zarr v3 output",
+                ][..],
+            ),
+            (
+                "resample.nearest",
+                &[
+                    "float32",
+                    "regular latitude/longitude grids",
+                    "NaN outside source bounds",
+                ][..],
+            ),
+            (
+                "resample.bilinear",
+                &[
+                    "float32",
+                    "regular latitude/longitude grids",
+                    "NaN outside source bounds",
                 ][..],
             ),
         ];
@@ -167,33 +205,11 @@ impl BackendCapability {
             .iter()
             .map(|(operation, limitations)| OperationCapability::supported(operation, limitations))
             .collect::<Vec<_>>();
-        capabilities.extend([
-            OperationCapability::unsupported(
-                "raw.netcdf.inspect",
-                "native reader is not implemented in this phase",
-                &["use Python fallback"],
-            ),
-            OperationCapability::unsupported(
-                "raw.netcdf.convert",
-                "native reader is not implemented in this phase",
-                &["use Python fallback"],
-            ),
-            OperationCapability::unsupported(
-                "resample.nearest",
-                "native resampling is not implemented in this phase",
-                &["use Python fallback"],
-            ),
-            OperationCapability::unsupported(
-                "resample.bilinear",
-                "native resampling is not implemented in this phase",
-                &["use Python fallback"],
-            ),
-            OperationCapability::unsupported(
-                "pipeline.native",
-                "native pipeline runtime is not implemented in this phase",
-                &["use Python fallback"],
-            ),
-        ]);
+        capabilities.extend([OperationCapability::unsupported(
+            "pipeline.native",
+            "native pipeline runtime is not implemented in this phase",
+            &["use Python fallback"],
+        )]);
         Self {
             backend: "rust".to_owned(),
             protocol_version: BACKEND_PROTOCOL_VERSION,
@@ -218,7 +234,7 @@ mod tests {
     fn smoke_capability_has_stable_protocol_and_matrix() {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
-        assert_eq!(capability.operations.len(), 14);
+        assert_eq!(capability.operations.len(), 18);
         assert_eq!(capability.capabilities.len(), 19);
         let supported = capability
             .capabilities
@@ -228,7 +244,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(supported, capability.operations);
         assert!(
-            !capability
+            capability
                 .operation("raw.netcdf.convert")
                 .unwrap()
                 .supported

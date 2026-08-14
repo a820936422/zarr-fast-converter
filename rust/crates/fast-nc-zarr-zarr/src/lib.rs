@@ -1,3 +1,14 @@
+mod resample_native;
+
+pub use resample_native::{resample_f32, ResampleF32Request, ResampleF32Response};
+
+mod netcdf_native;
+
+pub use netcdf_native::{
+    convert_netcdf_to_zarr, inspect_netcdf, NetcdfConversionSummary, NetcdfDimensionSummary,
+    NetcdfSummary, NetcdfVariableSummary,
+};
+
 use fast_nc_zarr_model::{
     MultiRechunkExecutionPlan, MultiRechunkMetrics, RechunkExecutionPlan, RechunkMetrics,
 };
@@ -1063,6 +1074,74 @@ fn variable_rechunk_plan(
     }
 }
 
+fn native_dtype_item_size(dtype: &str) -> Option<u64> {
+    match dtype {
+        "int8" | "uint8" => Some(1),
+        "int16" | "uint16" => Some(2),
+        "int32" | "uint32" | "float32" => Some(4),
+        "int64" | "uint64" | "float64" => Some(8),
+        _ => None,
+    }
+}
+
+fn configure_rechunk_codecs(builder: &mut ArrayBuilder, plan: &RechunkExecutionPlan) -> Result<()> {
+    if matches!(plan.codec.as_str(), "" | "none") {
+        return Ok(());
+    }
+    if !matches!(
+        plan.codec.as_str(),
+        "zstd" | "blosc-zstd" | "blosc-lz4" | "blosc-lz4hc" | "blosc-zlib" | "gzip"
+    ) {
+        return Err(ZarrError::message(format!(
+            "unsupported Rust codec: {}",
+            plan.codec
+        )));
+    }
+    let level = plan.codec_level.unwrap_or(1);
+    let codecs: Vec<std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>> =
+        match plan.codec.as_str() {
+            "zstd" => vec![
+                std::sync::Arc::new(zarrs::array::codec::ZstdCodec::new(level, false))
+                    as std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>,
+            ],
+            "blosc-zstd" | "blosc-lz4" | "blosc-lz4hc" | "blosc-zlib" => {
+                let compressor = match plan.codec.as_str() {
+                    "blosc-lz4" => zarrs::array::codec::BloscCompressor::LZ4,
+                    "blosc-lz4hc" => zarrs::array::codec::BloscCompressor::LZ4HC,
+                    "blosc-zlib" => zarrs::array::codec::BloscCompressor::Zlib,
+                    _ => zarrs::array::codec::BloscCompressor::Zstd,
+                };
+                let shuffle = match plan.codec_shuffle.as_str() {
+                    "bitshuffle" => zarrs::array::codec::BloscShuffleMode::BitShuffle,
+                    "shuffle" | "auto" => zarrs::array::codec::BloscShuffleMode::Shuffle,
+                    _ => zarrs::array::codec::BloscShuffleMode::NoShuffle,
+                };
+                vec![std::sync::Arc::new(
+                    zarrs::array::codec::BloscCodec::new(
+                        compressor,
+                        u8::try_from(level)
+                            .map_err(|_| ZarrError::message("Blosc level must be 0-9"))?
+                            .try_into()
+                            .map_err(|_| ZarrError::message("Blosc level must be 0-9"))?,
+                        None,
+                        shuffle,
+                        Some(4),
+                    )
+                    .map_err(ZarrError::from_display)?,
+                )
+                    as std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>]
+            }
+            "gzip" => vec![std::sync::Arc::new(
+                zarrs::array::codec::GzipCodec::new(level.max(0) as u32)
+                    .map_err(ZarrError::from_display)?,
+            )
+                as std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>],
+            _ => unreachable!(),
+        };
+    builder.bytes_to_bytes_codecs(codecs);
+    Ok(())
+}
+
 fn rechunk_array_into(
     source_array: ArrayStore,
     target_store: Arc<Store>,
@@ -1070,12 +1149,12 @@ fn rechunk_array_into(
     progress_start: u64,
     progress_total: u64,
 ) -> Result<RechunkMetrics> {
-    if !matches!(plan.expected_dtype.as_str(), "float32" | "float64") {
-        return Err(ZarrError::message(format!(
-            "P1 multi-variable native rechunk supports float32/float64 only, got {}",
+    let item_size = native_dtype_item_size(&plan.expected_dtype).ok_or_else(|| {
+        ZarrError::message(format!(
+            "P1 multi-variable native rechunk does not support dtype {}",
             plan.expected_dtype
-        )));
-    }
+        ))
+    })?;
     if plan.target_chunks.is_empty() || plan.target_chunks.contains(&0) {
         return Err(ZarrError::message(
             "target_chunks must contain positive values",
@@ -1107,11 +1186,6 @@ fn rechunk_array_into(
             .ok_or_else(|| ZarrError::message("source chunk element count overflows u64"))
     })?;
     let target_chunk_elements = checked_product(&plan.target_chunks)? as u64;
-    let item_size = if plan.expected_dtype == "float64" {
-        8
-    } else {
-        4
-    };
     let peak_bytes_per_worker = source_chunk_elements
         .checked_add(target_chunk_elements)
         .and_then(|elements| elements.checked_mul(item_size))
@@ -1129,6 +1203,7 @@ fn rechunk_array_into(
     };
     let mut array_builder = ArrayBuilder::from_array(&source_array);
     array_builder.chunk_grid_metadata(plan.target_chunks.clone());
+    configure_rechunk_codecs(&mut array_builder, plan)?;
     let target_path = normalise_array_path(&plan.array_path);
     let target_array = array_builder
         .build(target_store, &target_path)
@@ -1136,6 +1211,19 @@ fn rechunk_array_into(
     target_array
         .store_metadata_opt(&ArrayMetadataOptions::default().with_include_zarrs_metadata(false))
         .map_err(ZarrError::from_display)?;
+    let target_metadata = serialised_metadata(&target_array)?;
+    if source_metadata.get("fill_value") != target_metadata.get("fill_value") {
+        return Err(ZarrError::message(format!(
+            "fill_value changed for {}",
+            plan.array_path
+        )));
+    }
+    if source_array.attributes() != target_array.attributes() {
+        return Err(ZarrError::message(format!(
+            "CF and array attributes changed for {}",
+            plan.array_path
+        )));
+    }
     let target_grid_shape = target_array.chunk_grid_shape().to_vec();
     let target_grid_count = target_grid_shape.iter().try_fold(1_u64, |total, value| {
         total
@@ -1167,59 +1255,48 @@ fn rechunk_array_into(
         .map_err(ZarrError::from_display)?;
     let progress_lock = std::sync::Mutex::new(());
     let completed = std::sync::atomic::AtomicU64::new(0);
-    if plan.expected_dtype == "float32" {
-        pool.install(|| {
-            target_indices
-                .into_par_iter()
-                .try_for_each(|chunk_indices| -> Result<()> {
-                    if cancellation_requested(plan) {
-                        return Err(ZarrError::message("任务已取消"));
-                    }
-                    let subset = target_array
-                        .chunk_subset_bounded(&chunk_indices)
-                        .map_err(ZarrError::from_display)?;
-                    let values: ArrayD<f32> = source_array
-                        .retrieve_array_subset_opt(&subset, &codec_options)
-                        .map_err(ZarrError::from_display)?;
-                    target_array
-                        .store_array_subset_opt(&subset, values, &codec_options)
-                        .map_err(ZarrError::from_display)?;
-                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    report_progress_with_total(
-                        plan,
-                        progress_start + done,
-                        progress_total,
-                        &progress_lock,
-                    )
-                })
-        })?;
-    } else {
-        pool.install(|| {
-            target_indices
-                .into_par_iter()
-                .try_for_each(|chunk_indices| -> Result<()> {
-                    if cancellation_requested(plan) {
-                        return Err(ZarrError::message("任务已取消"));
-                    }
-                    let subset = target_array
-                        .chunk_subset_bounded(&chunk_indices)
-                        .map_err(ZarrError::from_display)?;
-                    let values: ArrayD<f64> = source_array
-                        .retrieve_array_subset_opt(&subset, &codec_options)
-                        .map_err(ZarrError::from_display)?;
-                    target_array
-                        .store_array_subset_opt(&subset, values, &codec_options)
-                        .map_err(ZarrError::from_display)?;
-                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    report_progress_with_total(
-                        plan,
-                        progress_start + done,
-                        progress_total,
-                        &progress_lock,
-                    )
-                })
-        })?;
+    macro_rules! process_chunks {
+        ($element:ty) => {{
+            pool.install(|| {
+                target_indices
+                    .into_par_iter()
+                    .try_for_each(|chunk_indices| -> Result<()> {
+                        if cancellation_requested(plan) {
+                            return Err(ZarrError::message("任务已取消"));
+                        }
+                        let subset = target_array
+                            .chunk_subset_bounded(&chunk_indices)
+                            .map_err(ZarrError::from_display)?;
+                        let values: ArrayD<$element> = source_array
+                            .retrieve_array_subset_opt(&subset, &codec_options)
+                            .map_err(ZarrError::from_display)?;
+                        target_array
+                            .store_array_subset_opt(&subset, values, &codec_options)
+                            .map_err(ZarrError::from_display)?;
+                        let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        report_progress_with_total(
+                            plan,
+                            progress_start + done,
+                            progress_total,
+                            &progress_lock,
+                        )
+                    })
+            })
+        }};
     }
+    match plan.expected_dtype.as_str() {
+        "float32" => process_chunks!(f32),
+        "float64" => process_chunks!(f64),
+        "int8" => process_chunks!(i8),
+        "int16" => process_chunks!(i16),
+        "int32" => process_chunks!(i32),
+        "int64" => process_chunks!(i64),
+        "uint8" => process_chunks!(u8),
+        "uint16" => process_chunks!(u16),
+        "uint32" => process_chunks!(u32),
+        "uint64" => process_chunks!(u64),
+        _ => unreachable!("unsupported dtype validated before chunk processing"),
+    }?;
     if cancellation_requested(plan) {
         return Err(ZarrError::message("任务已取消"));
     }
@@ -1254,11 +1331,6 @@ pub fn rechunk_multi_array(plan: &MultiRechunkExecutionPlan) -> Result<MultiRech
             "multi-variable rechunk requires at least one variable",
         ));
     }
-    if !matches!(plan.codec.as_str(), "" | "none") {
-        return Err(ZarrError::message(
-            "P1 multi-variable native rechunk preserves source codecs and does not apply a new codec",
-        ));
-    }
     let source_root = Path::new(&plan.source);
     let target_root = Path::new(&plan.target);
     if !source_root.is_dir() {
@@ -1285,9 +1357,9 @@ pub fn rechunk_multi_array(plan: &MultiRechunkExecutionPlan) -> Result<MultiRech
     let mut source_arrays = Vec::with_capacity(plan.variables.len());
     let mut total_chunks = 0_u64;
     for variable in &plan.variables {
-        if !matches!(variable.expected_dtype.as_str(), "float32" | "float64") {
+        if native_dtype_item_size(&variable.expected_dtype).is_none() {
             return Err(ZarrError::message(format!(
-                "P1 multi-variable native rechunk supports float32/float64 only, got {}",
+                "P1 multi-variable native rechunk does not support dtype {}",
                 variable.expected_dtype
             )));
         }
@@ -1301,6 +1373,59 @@ pub fn rechunk_multi_array(plan: &MultiRechunkExecutionPlan) -> Result<MultiRech
         }
         let source_array = open_array(source_root, &variable.array_path)?;
         let shape = source_array.shape().to_vec();
+        if shape.len() < 2 {
+            return Err(ZarrError::message(format!(
+                "multi-variable plan cannot select coordinate array {}",
+                variable.array_path
+            )));
+        }
+        if variable.is_coordinate {
+            return Err(ZarrError::message(format!(
+                "multi-variable plan explicitly marks coordinate array {}",
+                variable.array_path
+            )));
+        }
+        let actual_dimension_names = source_array.dimension_names().as_ref().map(|names| {
+            names
+                .iter()
+                .map(|name| name.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        });
+        if let Some(expected) = &variable.dimension_names {
+            if actual_dimension_names.as_ref() != Some(expected) {
+                return Err(ZarrError::message(format!(
+                    "dimension names do not match expected metadata for {}",
+                    variable.array_path
+                )));
+            }
+        }
+        let leaf = normalised
+            .trim_start_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        let standard_name = source_array
+            .attributes()
+            .get("standard_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let axis = source_array
+            .attributes()
+            .get("axis")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if shape.len() == 1
+            || matches!(leaf, "time" | "lat" | "lon")
+            || matches!(standard_name.as_str(), "time" | "latitude" | "longitude")
+            || matches!(axis.as_str(), "T" | "X" | "Y")
+        {
+            return Err(ZarrError::message(format!(
+                "multi-variable plan cannot select coordinate array {}",
+                variable.array_path
+            )));
+        }
         let metadata = serialised_metadata(&source_array)?;
         if metadata.get("data_type") != Some(&Value::String(variable.expected_dtype.clone())) {
             return Err(ZarrError::message(format!(

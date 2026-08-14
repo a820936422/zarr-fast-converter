@@ -179,7 +179,7 @@ function App() {
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) {
-      setBackend({ app: "fast-nc-zarr", version: "1.7.2", runtime: "browser-preview" });
+      setBackend({ app: "fast-nc-zarr", version: "1.7.3", runtime: "browser-preview" });
       return;
     }
     void getBackendInfo().then(setBackend).catch((reason: unknown) => setBackendError(reasonText(reason)));

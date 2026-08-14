@@ -4,7 +4,10 @@ use std::thread;
 use std::time::Duration;
 
 use fast_nc_zarr_model::{MultiRechunkExecutionPlan, RechunkExecutionPlan};
-use fast_nc_zarr_zarr::{inspect_array, rechunk_f32_array, rechunk_multi_array, write_f64_array};
+use fast_nc_zarr_zarr::{
+    convert_netcdf_to_zarr, inspect_array, inspect_netcdf, rechunk_f32_array, rechunk_multi_array,
+    resample_f32, write_f64_array, ResampleF32Request,
+};
 use serde_json::{Map, Value};
 use tauri::{AppHandle, State};
 
@@ -15,9 +18,12 @@ use crate::tasks::{
     cancellation_path, emit_task_event, new_request, now_seconds, progress_path, TaskRegistry,
     TaskRequest, TaskStatus, TaskSummary,
 };
-
 const NATIVE_OPERATIONS: &[&str] = &[
     "zarr.inspect",
+    "raw.netcdf.inspect",
+    "raw.netcdf.convert",
+    "resample.nearest",
+    "resample.bilinear",
     "zarr.rechunk_f32",
     "zarr.rechunk_multi",
     "zarr.write_f64",
@@ -150,6 +156,9 @@ fn run_native_task(
     let _ = emit("resource", "resources", resource_payload);
     let result = match operation.as_str() {
         "zarr.inspect" => native_inspect(&request.payload),
+        "raw.netcdf.inspect" => native_netcdf_inspect(&request.payload),
+        "raw.netcdf.convert" => native_netcdf_convert(&request.payload),
+        "resample.nearest" | "resample.bilinear" => native_resample(&request.payload),
         "zarr.write_f64" => native_write_f64(&request.payload),
         "zarr.rechunk_f32" => native_rechunk(
             &request.payload,
@@ -212,6 +221,69 @@ fn native_inspect(payload: &Map<String, Value>) -> Result<Map<String, Value>, Ap
     output.insert(
         "summary".to_string(),
         serde_json::to_value(summary)
+            .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
+    );
+    Ok(output)
+}
+
+fn native_netcdf_inspect(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+    let path = required_string(payload, "path")?;
+    if !Path::new(&path).is_file() {
+        return Err(AppError::new(ErrorKind::PathNotFound, path).at_stage("inspection"));
+    }
+    let summary = inspect_netcdf(Path::new(&path))
+        .map_err(|error| AppError::new(ErrorKind::InputInvalid, error).at_stage("inspection"))?;
+    let mut output = Map::new();
+    output.insert(
+        "operation".to_string(),
+        Value::String("raw.netcdf.inspect".to_string()),
+    );
+    output.insert(
+        "summary".to_string(),
+        serde_json::to_value(summary)
+            .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
+    );
+    Ok(output)
+}
+
+fn native_netcdf_convert(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+    let input = required_string(payload, "input")?;
+    let output = required_string(payload, "output")?;
+    if !Path::new(&input).is_file() {
+        return Err(AppError::new(ErrorKind::PathNotFound, input).at_stage("conversion"));
+    }
+    let summary =
+        convert_netcdf_to_zarr(Path::new(&input), Path::new(&output)).map_err(|error| {
+            AppError::new(ErrorKind::PublicationFailed, error).at_stage("conversion")
+        })?;
+    let mut result = Map::new();
+    result.insert(
+        "operation".to_string(),
+        Value::String("raw.netcdf.convert".to_string()),
+    );
+    result.insert(
+        "summary".to_string(),
+        serde_json::to_value(summary)
+            .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
+    );
+    Ok(result)
+}
+
+fn native_resample(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+    let request: ResampleF32Request = serde_json::from_value(Value::Object(payload.clone()))
+        .map_err(|error| {
+            AppError::new(ErrorKind::InvalidRequest, error.to_string()).at_stage("resampling")
+        })?;
+    let result = resample_f32(&request)
+        .map_err(|error| AppError::new(ErrorKind::InputInvalid, error).at_stage("resampling"))?;
+    let mut output = Map::new();
+    output.insert(
+        "operation".to_string(),
+        Value::String(format!("resample.{}", result.method)),
+    );
+    output.insert(
+        "result".to_string(),
+        serde_json::to_value(result)
             .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?,
     );
     Ok(output)
@@ -489,7 +561,8 @@ fn read_progress(path: Option<&Path>) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_inspect, native_rechunk, native_rechunk_multi, native_write_f64, validate_operation,
+        native_inspect, native_netcdf_inspect, native_rechunk, native_rechunk_multi,
+        native_write_f64, validate_operation,
     };
     use crate::protocol::EventEnvelope;
     use fast_nc_zarr_zarr::write_f32_array;
@@ -509,7 +582,10 @@ mod tests {
     #[test]
     fn native_operation_gate_is_explicit() {
         assert!(validate_operation("zarr.inspect").is_ok());
-        assert!(validate_operation("raw.netcdf.convert").is_err());
+        assert!(validate_operation("raw.netcdf.inspect").is_ok());
+        assert!(validate_operation("raw.netcdf.convert").is_ok());
+        assert!(validate_operation("resample.nearest").is_ok());
+        assert!(validate_operation("resample.bilinear").is_ok());
     }
 
     #[test]
@@ -522,7 +598,7 @@ mod tests {
             "chunks": [1, 2, 2],
             "values": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
         }))
-        .expect("payload");
+        .expect("write payload");
         let result = native_write_f64(&payload).expect("native write");
         assert_eq!(result["operation"], "zarr.write_f64");
         let summary = native_inspect(

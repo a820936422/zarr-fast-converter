@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import replace
+from threading import Event
 from pathlib import Path
 import sys
 import unittest
@@ -249,6 +250,23 @@ class ResamplingTests(unittest.TestCase):
             self.assertEqual(dataset.sizes["lon"], 2)
             np.testing.assert_array_equal(dataset.time.values, np.arange(2))
             self.assertTrue(np.isfinite(dataset.value.values).any())
+
+    def test_native_regular_route_publishes_atomically_and_cancels(self) -> None:
+        source = ROOT / "input.zarr"
+        native_source = ROOT / "native-only.zarr"
+        native_output = ROOT / "native-output.zarr"
+        with xr.open_zarr(source, consolidated=False, chunks=None) as dataset:
+            dataset[["value"]].fillna(0).to_zarr(native_source, mode="w", consolidated=False, zarr_format=3, encoding={"value": {"compressors": []}})
+        config = ResampleConfig(native_source, native_output, resolution=2.0, method="bilinear")
+        metrics = run_resample(config, progress=False)
+        self.assertEqual(metrics["backend"], "rust")
+        self.assertTrue(native_output.is_dir())
+        cancelled = ROOT / "native-cancelled.zarr"
+        event = Event()
+        event.set()
+        with self.assertRaises(ResampleExecutionError):
+            run_resample(ResampleConfig(native_source, cancelled, resolution=2.0, method="nearest_s2d"), cancel_event=event, progress=False)
+        self.assertFalse(cancelled.exists())
 
     def test_before_and_after_literal_replacements_are_fused_into_tiles(self) -> None:
         output = ROOT / "replacement-literal.zarr"

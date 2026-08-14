@@ -11,6 +11,7 @@ import xarray as xr
 import zarr
 
 from fast_nc_zarr._backend import BackendUnavailableError, resolve_backend, rust_capability
+from fast_nc_zarr.inspection import inspect_netcdf_native
 from fast_nc_zarr.rechunking.native import (
     RustMultiRechunkPlan,
     RustMultiRechunkVariablePlan,
@@ -21,6 +22,9 @@ from fast_nc_zarr.rechunking.native import (
 
 
 _CAPABILITY = rust_capability()
+_RUST_NETCDF_READY = _CAPABILITY.supported and "raw.netcdf.inspect" in _CAPABILITY.operations
+_RUST_RESAMPLE_READY = _CAPABILITY.supported and {"resample.nearest", "resample.bilinear"}.issubset(_CAPABILITY.operations)
+
 _RUST_ZARR_READY = _CAPABILITY.supported and {
     "zarr.inspect",
     "zarr.read_chunk_f32",
@@ -54,8 +58,8 @@ class NativePreparationTests(unittest.TestCase):
         if capability.supported:
             detail = capability.operation("raw.netcdf.convert")
             self.assertIsNotNone(detail)
-            self.assertFalse(detail.supported)
-            self.assertTrue(detail.reason)
+            self.assertTrue(detail.supported)
+            self.assertIsNone(detail.reason)
             f64 = capability.operation("zarr.write_f64")
             self.assertIsNotNone(f64)
             self.assertTrue(f64.supported)
@@ -78,21 +82,83 @@ class NativePreparationTests(unittest.TestCase):
     def test_auto_backend_resolves_native_rechunk_capability(self) -> None:
         expected = "rust" if _RUST_ZARR_READY else "python"
         self.assertEqual(resolve_backend("auto", "zarr.rechunk_f32"), expected)
-    def test_auto_backend_resolves_native_float64_rechunk_capability(self) -> None:
-        expected = "rust" if _CAPABILITY.supported and "zarr.rechunk_f64" in _CAPABILITY.operations else "python"
-        self.assertEqual(resolve_backend("auto", "rechunk_f64"), expected)
-    def test_standard_raw_and_resample_operations_remain_explainable_fallbacks(self) -> None:
-        for operation in ("raw.netcdf.inspect", "raw.netcdf.convert", "resample.nearest", "resample.bilinear"):
-            self.assertEqual(resolve_backend("auto", operation), "python")
-            with self.assertRaises(BackendUnavailableError):
-                resolve_backend("rust", operation)
 
+    def test_standard_raw_and_resample_operations_resolve_native_capabilities(self) -> None:
+        netcdf_expected = "rust" if _RUST_NETCDF_READY else "python"
+        resample_expected = "rust" if _RUST_RESAMPLE_READY else "python"
+        self.assertEqual(resolve_backend("auto", "raw.netcdf.inspect"), netcdf_expected)
+        self.assertEqual(resolve_backend("auto", "raw.netcdf.convert"), netcdf_expected)
+        self.assertEqual(resolve_backend("auto", "resample.nearest"), resample_expected)
+        self.assertEqual(resolve_backend("auto", "resample.bilinear"), resample_expected)
+
+
+
+@unittest.skipUnless(_RUST_NETCDF_READY, "Rust NetCDF native extension is not built")
+class RustNetcdfInspectTests(unittest.TestCase):
+    def test_inspect_standard_netcdf4_subset(self) -> None:
+        import netCDF4
+
+        with tempfile.TemporaryDirectory(prefix="fast-nc-zarr-netcdf-") as directory:
+            path = Path(directory) / "sample.nc"
+            with netCDF4.Dataset(path, "w", format="NETCDF4_CLASSIC") as dataset:
+                dataset.createDimension("time", 2)
+                dataset.createDimension("lat", 2)
+                dataset.createDimension("lon", 3)
+                dataset.title = "native smoke"
+                time = dataset.createVariable("time", "f8", ("time",))
+                time.units = "days since 2000-01-01"
+                dataset.createVariable("lat", "f4", ("lat",))[:] = [10, 20]
+                dataset.createVariable("lon", "f4", ("lon",))[:] = [100, 110, 120]
+                value = dataset.createVariable("value", "f4", ("time", "lat", "lon"))
+                value.units = "K"
+                value[:] = np.zeros((2, 2, 3), dtype="float32")
+            summary = inspect_netcdf_native(path)
+            self.assertTrue(summary["supported_subset"])
+            self.assertEqual(summary["dimensions"][0]["name"], "time")
+            variable = next(item for item in summary["variables"] if item["name"] == "value")
+            self.assertEqual(variable["dtype"], "float32")
+            self.assertEqual(variable["shape"], [2, 2, 3])
+
+    def test_convert_standard_netcdf4_to_zarr(self) -> None:
+        import netCDF4
+
+        with tempfile.TemporaryDirectory(prefix="fast-nc-zarr-convert-") as directory:
+            path = Path(directory) / "sample.nc"
+            target = Path(directory) / "sample.zarr"
+            values = np.arange(12, dtype="float32").reshape(2, 2, 3)
+            with netCDF4.Dataset(path, "w", format="NETCDF4_CLASSIC") as dataset:
+                for name, size in (("time", 2), ("lat", 2), ("lon", 3)):
+                    dataset.createDimension(name, size)
+                time = dataset.createVariable("time", "i2", ("time",))
+                time.units = "hours since 2000-01-01"
+                time[:] = [0, 1]
+                dataset.createVariable("lat", "i4", ("lat",))[:] = [10, 20]
+                dataset.createVariable("lon", "i4", ("lon",))[:] = [100, 110, 120]
+                value = dataset.createVariable(
+                    "value", "f4", ("time", "lat", "lon"), fill_value=np.nan
+                )
+                value.long_name = "relative humidity"
+                value[:] = values
+            native = importlib.import_module("fast_nc_zarr._native")
+            metrics = json.loads(native.convert_netcdf_json(str(path), str(target)))
+            self.assertEqual(metrics["variables"], ["time", "lat", "lon", "value"])
+            with xr.open_zarr(
+                target, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+            ) as result:
+                np.testing.assert_array_equal(result["time"].values, [0, 1])
+                np.testing.assert_array_equal(result["lat"].values, [10, 20])
+                np.testing.assert_array_equal(result["lon"].values, [100, 110, 120])
+                self.assertEqual(result["time"].dtype, np.dtype("int16"))
+                self.assertEqual(result["lat"].dtype, np.dtype("int32"))
+                self.assertEqual(result["lon"].dtype, np.dtype("int32"))
+                self.assertEqual(result["value"].attrs["long_name"], "relative humidity")
 
 @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
 class RustZarrCrossBackendTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.native = importlib.import_module("fast_nc_zarr._native")
+
         cls.tempdir = tempfile.TemporaryDirectory(prefix="fast-nc-zarr-rust-zarr-")
 
     @classmethod
@@ -266,6 +332,101 @@ class RustZarrCrossBackendTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertFalse(any(target.parent.glob(f".{target.name}.native-multi-*.tmp")))
 
+    def test_rust_multi_integer_fill_cf_and_explicit_codec(self) -> None:
+        source = Path(self.tempdir.name) / "multi-integer-source.zarr"
+        target = Path(self.tempdir.name) / "multi-integer-target.zarr"
+        values = np.array([[[1, -9999], [3, 4]], [[5, 6], [-9999, 8]]], dtype="int16")
+        quality = np.array([[[0, 1], [2, 3]], [[4, 5], [6, 7]]], dtype="uint32")
+        xr.Dataset(
+            {
+                "value": (
+                    ("time", "lat", "lon"),
+                    values,
+                    {
+                        "units": "K",
+                        "scale_factor": 0.1,
+                        "add_offset": 273.15,
+                        "standard_name": "air_temperature",
+                    },
+                ),
+                "quality": (
+                    ("time", "lat", "lon"),
+                    quality,
+                    {"long_name": "quality flag", "units": "1"},
+                ),
+            },
+            coords={"time": np.arange(2), "lat": np.arange(2), "lon": np.arange(2)},
+        ).to_zarr(
+            source,
+            mode="w",
+            consolidated=False,
+            zarr_format=3,
+            encoding={
+                "value": {"chunks": (1, 2, 2), "_FillValue": -9999},
+                "quality": {"chunks": (2, 1, 2), "_FillValue": 0},
+            },
+        )
+        metrics = run_rust_multi_rechunk(
+            RustMultiRechunkPlan(
+                source=source,
+                target=target,
+                variables=(
+                    RustMultiRechunkVariablePlan(
+                        "/value", (2, 1, 2), "int16", dimension_names=("time", "lat", "lon")
+                    ),
+                    RustMultiRechunkVariablePlan(
+                        "/quality", (1, 2, 2), "uint32", dimension_names=("time", "lat", "lon")
+                    ),
+                ),
+                requested_workers=2,
+                worker_ceiling=2,
+                memory_budget_bytes=1024 * 1024,
+                codec="zstd",
+                codec_level=1,
+            )
+        )
+        self.assertEqual(metrics["backend"], "rust")
+        self.assertEqual(metrics["selected_compression"]["codec"], "zstd")
+        with (
+            xr.open_zarr(
+                source, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+            ) as source_dataset,
+            xr.open_zarr(
+                target, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+            ) as dataset,
+        ):
+            self.assertEqual(dataset["value"].dtype, np.dtype("int16"))
+            self.assertEqual(dataset["quality"].dtype, np.dtype("uint32"))
+            np.testing.assert_array_equal(dataset["value"].values, values)
+            np.testing.assert_array_equal(dataset["quality"].values, quality)
+            for name in ("units", "scale_factor", "add_offset", "standard_name"):
+                self.assertEqual(dataset["value"].attrs[name], source_dataset["value"].attrs[name])
+        source_summary = json.loads(self.native.inspect_array_json(str(source), "/value"))
+        target_summary = json.loads(self.native.inspect_array_json(str(target), "/value"))
+        self.assertEqual(source_summary["fill_value"], target_summary["fill_value"])
+        self.assertEqual(source_summary["attributes"], target_summary["attributes"])
+
+    def test_rust_multi_rechunk_rejects_coordinate_array_plan(self) -> None:
+        source = Path(self.tempdir.name) / "multi-coordinate-source.zarr"
+        target = Path(self.tempdir.name) / "multi-coordinate-target.zarr"
+        xr.Dataset(
+            {"value": (("time", "lat", "lon"), np.zeros((2, 2, 2), dtype="float32"))},
+            coords={"time": np.arange(2), "lat": np.arange(2), "lon": np.arange(2)},
+        ).to_zarr(source, mode="w", consolidated=False, zarr_format=3)
+        with self.assertRaises(Exception):
+            run_rust_multi_rechunk(
+                RustMultiRechunkPlan(
+                    source=source,
+                    target=target,
+                    variables=(
+                        RustMultiRechunkVariablePlan(
+                            "/lat", (2,), "int64", is_coordinate=True, dimension_names=("lat",)
+                        ),
+                    ),
+                )
+            )
+        self.assertFalse(target.exists())
+
     def test_rust_rechunk_uses_bounded_parallel_workers(self) -> None:
         source = f"{self.tempdir.name}/parallel-source.zarr"
         target = f"{self.tempdir.name}/parallel-target.zarr"
@@ -428,6 +589,26 @@ class RustZarrCrossBackendTests(unittest.TestCase):
                     target_chunks=(1, 2, 2),
                 )
             )
+
+@unittest.skipUnless(_RUST_RESAMPLE_READY, "Rust resampling extension is not built")
+class RustResamplingTests(unittest.TestCase):
+    def test_nearest_and_bilinear_regular_grid(self) -> None:
+        native = importlib.import_module("fast_nc_zarr._native")
+        request = {
+            "values": [0.0, 1.0, 2.0, 3.0],
+            "shape": [1, 2, 2],
+            "source_lat": [0.0, 1.0],
+            "source_lon": [0.0, 1.0],
+            "target_lat": [0.5],
+            "target_lon": [0.5],
+            "method": "bilinear",
+        }
+        bilinear = json.loads(native.resample_f32_json(json.dumps(request)))
+        self.assertEqual(bilinear["shape"], [1, 1, 1])
+        self.assertAlmostEqual(bilinear["values"][0], 1.5)
+        request["method"] = "nearest"
+        nearest = json.loads(native.resample_f32_json(json.dumps(request)))
+        self.assertEqual(nearest["values"], [0.0])
 
 if __name__ == "__main__":
     unittest.main()
