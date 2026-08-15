@@ -189,7 +189,7 @@ button:disabled { cursor: not-allowed !important; opacity: .48; }
 .field-action { align-self: stretch; border-radius: 7px; padding: 0 12px; color: #3678db; background: #eaf2ff; font-size: 10px; cursor: pointer; }
 .field-action:hover { background: #dceaff; }
 .secondary-input { margin-top: 9px; }
-.inline-options { display: flex; align-items: center; gap: 23px; margin-top: 18px; color: #718196; font-size: 11px; }
+.inline-options { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 23px; margin-top: 18px; color: #718196; font-size: 11px; }
 .check-control, .variable-list label { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
 .check-control input, .variable-list input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .fake-check { display: inline-block; width: 14px; height: 14px; border: 1px solid #cbd6e3; border-radius: 4px; background: #fff; }

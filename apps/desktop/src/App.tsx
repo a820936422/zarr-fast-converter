@@ -350,6 +350,7 @@ function App() {
   const [timeRuleModalOpen, setTimeRuleModalOpen] = useState(false);
   const [timeRuleDraft, setTimeRuleDraft] = useState<TimeRule | null>(null);
   const [timeRuleMode, setTimeRuleMode] = useState<TimeRuleMode>("full");
+  const [fullStructureValidation, setFullStructureValidation] = useState(false);
   const [timeRuleError, setTimeRuleError] = useState<string | null>(null);
   const [inspection, setInspection] = useState<InspectionResult | null>(null);
   const [stage, setStage] = useState<InspectionStage>("input");
@@ -622,7 +623,6 @@ function App() {
     });
     setTimeRuleError(null);
   };
-
   const confirmTimeRule = () => {
     const validation = validateTimeRule(timeRuleMode, timeRuleDraft);
     if (validation) {
@@ -642,7 +642,7 @@ function App() {
     }
     await startInspectionTask(
       "inspect_source",
-      { input_dir: inputPath, mode: "auto", recursive, engine, time_rule: timeRule, validation_mode: "fast" },
+      { input_dir: inputPath, mode: "auto", recursive, engine, time_rule: timeRule, validation_mode: fullStructureValidation ? "full" : "fast" },
       "读取数据结构",
     );
   };
@@ -877,7 +877,7 @@ function App() {
                   <div className="source-tabs" role="group" aria-label="输入类型"><button className={inputKind === "source" ? "selected" : ""} type="button" onClick={() => setInputKind("source")}><Icon name="archive" size={17} /><span><strong>原始数据目录</strong><small>NetCDF · HDF · TIFF</small></span></button><button className={inputKind === "zarr" ? "selected" : ""} type="button" onClick={() => setInputKind("zarr")}><Icon name="database" size={17} /><span><strong>现有 Zarr</strong><small>直接检查数组结构</small></span></button></div>
                   <label className="field-label" htmlFor="input-path">数据路径</label><div className="input-with-action"><Icon name="folder" size={17} /><input id="input-path" value={inputPath} onChange={(event) => setInputPath(event.target.value)} placeholder={inputKind === "source" ? "选择 NetCDF / HDF / TIFF 目录" : "选择 Zarr v3 目录"} /><button className="field-action" type="button" onClick={() => void chooseInput()}>浏览</button></div>
                   {inputKind === "zarr" && <div className="input-with-action secondary-input"><Icon name="layers" size={17} /><input aria-label="Zarr array path" value={arrayPath} onChange={(event) => setArrayPath(event.target.value)} placeholder="array path，例如 /value" /><button className="field-action" type="button" disabled={!inputPath || busy} onClick={() => void inspectNativeZarr()}>原生检查</button></div>}
-                  {inputKind === "source" && <div className="inline-options"><label className="check-control"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /><span className="fake-check" />递归扫描</label><label className="select-control">读取引擎<select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="auto">自动选择</option><option value="h5netcdf">h5netcdf</option><option value="netcdf4">netcdf4</option><option value="rasterio">rasterio</option></select></label></div>}
+                  {inputKind === "source" && <div className="inline-options"><label className="check-control"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /><span className="fake-check" />递归扫描</label><label className="select-control">读取引擎<select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="auto">自动选择</option><option value="h5netcdf">h5netcdf</option><option value="netcdf4">netcdf4</option><option value="rasterio">rasterio</option></select></label><label className="check-control"><input type="checkbox" checked={fullStructureValidation} onChange={(event) => setFullStructureValidation(event.target.checked)} /><span className="fake-check" />全量结构校验（慢）</label></div>}
                   {inspectionProgress && <InspectionProgressCard progress={inspectionProgress} nowMs={progressNowMs} onCancel={inspectionTaskId ? cancelInspection : undefined} />}
                   {timeInspection && (
                     <div className="inline-result time-inspection-result">
