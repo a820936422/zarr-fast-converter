@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from .application.services import SourceInspectionConfig, inspect_source
+from .application.services import ConversionConfig, SourceInspectionConfig, inspect_source, run_conversion
 from .filename_mode import convert_filename, normalize_filename_dataset
 from .models import Selection
 from .time_mapping import TimeFieldRef, TimeRule, inspect_time_metadata
@@ -59,18 +59,52 @@ def _sample_source_values(inventory, sample_files: int) -> list[dict[str, Any]]:
     )
     for file_index in file_indices:
         record = inventory.files[file_index]
-        dataset, engine = normalize_filename_dataset(record.path, inventory.source_engine)
+        if inventory.source_mode == "filename":
+            dataset, engine = normalize_filename_dataset(record.path, inventory.source_engine)
+            close_dataset = True
+            actual_time = None
+            actual_lat = "lat"
+            actual_lon = "lon"
+        else:
+            import xarray as xr
+
+            dataset = xr.open_dataset(
+                record.path,
+                engine=inventory.source_engine,
+                chunks=None,
+                decode_times=False,
+                mask_and_scale=False,
+            )
+            close_dataset = True
+            actual_time, actual_lat, actual_lon = inventory.source_dimensions
+            engine = inventory.source_engine
         try:
-            lat_indices = _sample_indices(int(dataset.sizes["lat"]), 3)
-            lon_indices = _sample_indices(int(dataset.sizes["lon"]), 3)
+            lat_indices = _sample_indices(int(dataset.sizes[actual_lat]), 3)
+            lon_indices = _sample_indices(int(dataset.sizes[actual_lon]), 3)
             variables = []
             for name in variable_names:
-                if name not in dataset or set(dataset[name].dims) != {"lat", "lon"}:
+                if name not in dataset:
                     continue
-                values = np.asarray(
-                    dataset[name].isel(lat=list(lat_indices), lon=list(lon_indices)).values
-                )
-                finite = values[np.isfinite(values)] if values.dtype.kind in "fc" else values
+                variable = dataset[name]
+                if inventory.source_mode == "filename":
+                    if set(variable.dims) != {"lat", "lon"}:
+                        continue
+                    values = np.asarray(
+                        variable.isel(lat=list(lat_indices), lon=list(lon_indices)).values
+                    )
+                else:
+                    if actual_time not in variable.dims or actual_lat not in variable.dims or actual_lon not in variable.dims:
+                        continue
+                    values = np.asarray(
+                        variable.isel(
+                            {
+                                actual_time: [0],
+                                actual_lat: list(lat_indices),
+                                actual_lon: list(lon_indices),
+                            }
+                        ).values
+                    )
+                finite = values[np.isfinite(values)] if values.dtype.kind in "fc" else values.reshape(-1)
                 variables.append(
                     {
                         "name": name,
@@ -82,7 +116,7 @@ def _sample_source_values(inventory, sample_files: int) -> list[dict[str, Any]]:
                     }
                 )
             if not variables:
-                raise ValueError(f"{record.path.name} 没有可抽样的数值型 lat/lon 变量。")
+                raise ValueError(f"{record.path.name} 没有可抽样的数值型时空变量。")
             results.append(
                 {
                     "file_index": file_index,
@@ -92,13 +126,14 @@ def _sample_source_values(inventory, sample_files: int) -> list[dict[str, Any]]:
                 }
             )
         finally:
-            dataset.close()
+            if close_dataset:
+                dataset.close()
             del dataset
             gc.collect()
     return results
 
 
-def _smoke_convert(inventory, output: Path) -> dict[str, Any]:
+def _smoke_convert(inventory, output: Path, inspection=None) -> dict[str, Any]:
     variables = tuple(
         name
         for name, spec in inventory.variables.items()
@@ -106,35 +141,64 @@ def _smoke_convert(inventory, output: Path) -> dict[str, Any]:
     )
     if not variables:
         raise ValueError("没有可用于转换冒烟测试的三维数值变量。")
+    started = time.perf_counter()
+    if inventory.source_mode == "filename":
+        ny = int(inventory.lat_values.size)
+        nx = int(inventory.lon_values.size)
+        lat_start = max(0, ny // 2 - 16)
+        lon_start = max(0, nx // 2 - 16)
+        selection = Selection(
+            variables=(variables[0],),
+            time_start=0,
+            time_stop=min(2, int(inventory.times.size)),
+            lat_start=lat_start,
+            lat_stop=min(ny, lat_start + 32),
+            lon_start=lon_start,
+            lon_stop=min(nx, lon_start + 32),
+        )
+        plan, metrics = convert_filename(
+            inventory,
+            selection,
+            output,
+            auto_tune=False,
+            max_workers=2,
+            overwrite=True,
+            validate=True,
+            progress=False,
+        )
+        return {
+            "output": str(output),
+            "selection": asdict(selection),
+            "plan": asdict(plan),
+            "metrics": metrics,
+            "mode": "safe_smoke",
+            "worker_policy": "fixed two-worker validation smoke; not production tuning",
+            "elapsed": time.perf_counter() - started,
+        }
+    if inspection is None:
+        raise ValueError("完整源数据 smoke conversion 缺少 inspection")
+    time_value = str(inventory.times[0].astype("datetime64[D]"))
     ny = int(inventory.lat_values.size)
     nx = int(inventory.lon_values.size)
-    lat_start = max(0, ny // 2 - 16)
-    lon_start = max(0, nx // 2 - 16)
-    selection = Selection(
+    lat_values = inventory.lat_values[max(0, ny // 2 - 16) : min(ny, ny // 2 + 16)]
+    lon_values = inventory.lon_values[max(0, nx // 2 - 16) : min(nx, nx // 2 + 16)]
+    config = ConversionConfig(
+        output=output,
+        time_start=time_value,
+        time_end=time_value,
+        lat_min=float(np.min(lat_values)),
+        lat_max=float(np.max(lat_values)),
+        lon_min=float(np.min(lon_values)),
+        lon_max=float(np.max(lon_values)),
         variables=(variables[0],),
-        time_start=0,
-        time_stop=min(2, int(inventory.times.size)),
-        lat_start=lat_start,
-        lat_stop=min(ny, lat_start + 32),
-        lon_start=lon_start,
-        lon_stop=min(nx, lon_start + 32),
-    )
-    started = time.perf_counter()
-    plan, metrics = convert_filename(
-        inventory,
-        selection,
-        output,
-        # Raw validation intentionally uses a bounded smoke workload rather
-        # than production auto-tuning; production conversion remains auto.
         auto_tune=False,
         max_workers=2,
         overwrite=True,
         validate=True,
-        progress=False,
     )
+    plan, metrics = run_conversion(inspection, config)
     return {
         "output": str(output),
-        "selection": asdict(selection),
         "plan": asdict(plan),
         "metrics": metrics,
         "mode": "safe_smoke",
@@ -184,7 +248,7 @@ def validate_raw_tree(
             time_rule = TimeRule(
                 full=TimeFieldRef(source="filename", component="full", index=field_index)
             )
-        if time_rule is None:
+        elif time_rule is None and not time_inspection.time_dimension.exists:
             raise ValueError(
                 f"数据集 {source.name} 的时间字段存在歧义；"
                 f"请传入 --time-field {source.name}=字段索引。"
@@ -223,12 +287,12 @@ def validate_raw_tree(
                 for spec in inventory.variables.values()
             ],
             "source_samples": _sample_source_values(inventory, sample_files),
-            "inspection_elapsed": time.perf_counter() - started,
         }
         if smoke_output_root is not None:
             dataset_report["conversion_smoke"] = _smoke_convert(
                 inventory,
                 smoke_output_root / f"{source.name}.zarr",
+                result,
             )
         report["datasets"].append(dataset_report)
     report["status"] = "passed"

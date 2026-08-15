@@ -323,7 +323,11 @@ def _final_layout(
             continue
         dtype = np.dtype(spec.dtype)
         transform = config.conversion.variable_transforms.get(name)
-        if transform is not None and transform.scale_factor is not None and dtype.kind not in "fc":
+        if (
+            transform is not None
+            and (transform.scale_factor is not None or transform.add_offset is not None)
+            and dtype.kind not in "fc"
+        ):
             dtype = np.dtype("float32" if dtype.itemsize <= 4 else "float64")
         if needs_resample:
             if not np.issubdtype(dtype, np.floating):
@@ -412,7 +416,7 @@ def _converted_dtype(inventory, name: str, config: PipelineConfig) -> np.dtype:
     transform = config.conversion.variable_transforms.get(name)
     if (
         transform is not None
-        and transform.scale_factor is not None
+        and (transform.scale_factor is not None or transform.add_offset is not None)
         and dtype.kind not in "fc"
     ):
         return np.dtype("float32" if dtype.itemsize <= 4 else "float64")

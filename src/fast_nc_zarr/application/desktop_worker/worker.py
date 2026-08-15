@@ -303,13 +303,14 @@ def _monitor_cancellation(path: Path | None, cancel_event: ThreadEvent, stop: Th
 
 def _dispatch(request: Request, output: TextIO, cancel_event: ThreadEvent) -> None:
     sink = _EventSink(output, request)
+    with redirect_stdout(_OutputStream(sink, stream_name="stdout")), redirect_stderr(_OutputStream(sink, stream_name="stderr")):
+        _dispatch_impl(request, sink, cancel_event)
+
+
+def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent) -> None:
     sink.emit("accepted", stage="transport")
     if request.command == "shutdown":
         sink.emit("finished", {"shutdown": True}, stage="worker")
-        return
-    if request.command == "cancel_task":
-        cancel_event.set()
-        sink.emit("cancelled", {"reason": "cancel requested"}, stage="worker")
         return
     sink.emit("started", stage=request.command)
     resource_snapshot = request.payload.get("resource_snapshot")
@@ -400,6 +401,8 @@ def run_worker(input_stream: TextIO = sys.stdin, output_stream: TextIO = sys.std
         request_id = "unknown"
         task_id = None
         try:
+            if len(line.encode("utf-8")) > 1_048_576:
+                raise ProtocolError("JSONL request exceeds protocol byte limit")
             raw = json.loads(line)
             if isinstance(raw, dict):
                 request_id = str(raw.get("request_id", request_id))

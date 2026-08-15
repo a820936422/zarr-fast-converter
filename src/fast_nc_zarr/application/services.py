@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import blake2b
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Literal
 
 import numpy as np
@@ -676,6 +678,18 @@ def preview_conversion(
     return ConversionPreview(inventory, selection, plan, logical)
 
 
+def _assert_source_inventory_stable(inventory: Inventory) -> None:
+    for record in inventory.files:
+        try:
+            stat = record.path.stat()
+        except OSError as exc:
+            raise ValueError(f"源文件在转换期间不可读取：{record.path}") from exc
+        if stat.st_size != record.size_bytes or (
+            record.mtime_ns is not None and stat.st_mtime_ns != record.mtime_ns
+        ):
+            raise ValueError(f"源文件在转换期间发生变化：{record.path}")
+
+
 def run_conversion(
     inspection: InspectionResult,
     config: ConversionConfig,
@@ -683,9 +697,10 @@ def run_conversion(
     cancel_event=None,
 ) -> tuple[Any, dict[str, Any]]:
     preview = preview_conversion(inspection, config)
+    _assert_source_inventory_stable(preview.inventory)
     output = Path(config.output).expanduser().resolve()
     if preview.inventory.source_mode == "filename":
-        return core_convert_filename(
+        result = core_convert_filename(
             preview.inventory,
             preview.selection,
             output,
@@ -705,25 +720,28 @@ def run_conversion(
             progress=True,
             cancel_event=cancel_event,
         )
-    return core_convert(
-        preview.inventory,
-        preview.selection,
-        output,
-        auto_tune=config.auto_tune,
-        tune_budget=config.tune_budget,
-        tuning_objective=config.tuning_objective,
-        resource_budget=config.resource_budget,
-        max_workers=config.max_workers,
-        reserve_gib=config.reserve_memory_gib,
-        overwrite=config.overwrite,
-        validate=config.validate,
-        progress=True,
-        variable_transforms=config.variable_transforms,
-        variable_names=config.variable_names,
-        chunks=config.chunks,
-        output_layout=config.output_layout,
-        cancel_event=cancel_event,
-    )
+    else:
+        result = core_convert(
+            preview.inventory,
+            preview.selection,
+            output,
+            auto_tune=config.auto_tune,
+            tune_budget=config.tune_budget,
+            tuning_objective=config.tuning_objective,
+            resource_budget=config.resource_budget,
+            max_workers=config.max_workers,
+            reserve_gib=config.reserve_memory_gib,
+            overwrite=config.overwrite,
+            validate=config.validate,
+            progress=True,
+            variable_transforms=config.variable_transforms,
+            variable_names=config.variable_names,
+            chunks=config.chunks,
+            output_layout=config.output_layout,
+            cancel_event=cancel_event,
+        )
+    _assert_source_inventory_stable(preview.inventory)
+    return result
 
 
 def preview_rechunk(config: RechunkConfig, info: DatasetInfo | None = None) -> RechunkPreview:
@@ -900,16 +918,29 @@ def run_pipeline(
 def format_resample_preview(preview: ResamplePreview) -> str:
     return format_resample_plan(preview.plan)
 
-
 def save_inspection_snapshot(result: InspectionResult, destination: Path) -> Path:
     destination = Path(destination).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(destination.name + ".tmp")
-    temporary.write_text(
-        json.dumps(result.snapshot(), ensure_ascii=False, indent=2, default=_json_safe),
-        encoding="utf-8",
+    payload = json.dumps(
+        result.snapshot(), ensure_ascii=False, indent=2, default=_json_safe
+    ).encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
     )
-    temporary.replace(destination)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
     return destination
 
 

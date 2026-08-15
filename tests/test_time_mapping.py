@@ -12,7 +12,7 @@ import xarray as xr
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 
-from fast_nc_zarr.inspection import inspect_dataset  # noqa: E402
+from fast_nc_zarr.inspection import _normalize_daily_times, inspect_dataset  # noqa: E402
 from fast_nc_zarr.application.services import (  # noqa: E402
     ConversionConfig,
     SourceInspectionConfig,
@@ -160,5 +160,16 @@ class TimeMappingTests(unittest.TestCase):
             )
 
 
+    def test_nonstandard_calendar_is_rejected_explicitly(self) -> None:
+        class NonStandardDate:
+            calendar = "360_day"
+
+            def __str__(self) -> str:
+                return "2001-01-01"
+
+        with self.assertRaisesRegex(ValueError, "不支持 calendar"):
+            _normalize_daily_times((NonStandardDate(),), ROOT / "calendar.nc")
+
 if __name__ == "__main__":
+
     unittest.main()

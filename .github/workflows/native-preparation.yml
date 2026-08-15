@@ -75,6 +75,8 @@ jobs:
         with:
           pixi-version: v0.76.1
           cache: true
+      - name: Run desktop Rust tests
+        run: pixi run rust-desktop-test
       - name: Build Linux sidecar
         run: pixi run desktop-sidecar
       - name: Set up Node
@@ -85,6 +87,8 @@ jobs:
           cache-dependency-path: apps/desktop/package-lock.json
       - name: Install desktop dependencies
         run: npm --prefix apps/desktop ci
+      - name: Check desktop TypeScript
+        run: pixi run desktop-typecheck
       - name: Check desktop frontend
         run: npm --prefix apps/desktop run build
       - name: Check Tauri configuration

@@ -1865,6 +1865,14 @@ def _validate_output(
                         f"变量 {item.name} 的 dtype 不符合计划："
                         f"期望 {expected_dtype}，实际 {actual.dtype}"
                     )
+                for marker in ("missing_value", "scale_factor", "add_offset"):
+                    expected_marker = source[item.name].attrs.get(marker)
+                    if expected_marker is not None:
+                        actual_marker = actual.attrs.get(marker)
+                        np.testing.assert_equal(actual_marker, expected_marker)
+                expected_fill = source[item.name].encoding.get("_FillValue")
+                if expected_fill is not None:
+                    np.testing.assert_equal(actual.encoding.get("_FillValue"), expected_fill)
         np.testing.assert_allclose(target.lat.values, plan.target.lat, rtol=0, atol=1e-10)
         np.testing.assert_allclose(target.lon.values, plan.target.lon, rtol=0, atol=1e-10)
         if "time" in source.coords and "time" in target.coords:
@@ -2014,8 +2022,20 @@ def _run_native_regular_resample(config: ResampleConfig, plan: ResamplePlan, *, 
                 "method": "nearest" if plan.method.startswith("nearest") else "bilinear",
             }
             result = json.loads(native.resample_f32_json(json.dumps(request)))
-            variables[item.name] = (("time", "lat", "lon"), np.asarray(result["values"], dtype="float32").reshape(result["shape"]), dict(source[item.name].attrs))
-        output = xr.Dataset(variables, coords={"time": source["time"].values, "lat": plan.target.lat, "lon": plan.target.lon}, attrs=dict(source.attrs))
+            output_variable = xr.DataArray(
+                np.asarray(result["values"], dtype="float32").reshape(result["shape"]),
+                dims=("time", "lat", "lon"),
+                attrs=dict(source[item.name].attrs),
+            )
+            source_fill = source[item.name].encoding.get("_FillValue")
+            if source_fill is not None:
+                output_variable.encoding["_FillValue"] = source_fill
+            variables[item.name] = output_variable
+        output = xr.Dataset(
+            variables,
+            coords={"time": source["time"].values, "lat": plan.target.lat, "lon": plan.target.lon},
+            attrs=dict(source.attrs),
+        )
         for name, chunks in plan.output_chunks.items():
             if name in output:
                 output[name].encoding["chunks"] = tuple(int(value) for value in chunks)

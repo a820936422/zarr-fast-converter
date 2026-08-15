@@ -1,9 +1,10 @@
 use crate::error::{AppError, ErrorKind};
 use crate::protocol::{decode_event, EventEnvelope, RequestEnvelope};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -11,8 +12,17 @@ pub struct WorkerProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
     sequences: HashMap<String, u64>,
     terminal_tasks: HashMap<String, bool>,
+}
+const MAX_WORKER_LINE_BYTES: usize = 1_048_576;
+
+fn trusted_worker(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && !metadata.file_type().is_symlink()
 }
 
 impl WorkerProcess {
@@ -22,8 +32,10 @@ impl WorkerProcess {
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
         let target = option_env!("TAURI_ENV_TARGET_TRIPLE").unwrap_or("");
         let mut candidates = Vec::new();
-        if let Some(explicit) = env::var_os("FAST_NC_ZARR_WORKER") {
-            candidates.push(PathBuf::from(explicit));
+        if cfg!(debug_assertions) {
+            if let Some(explicit) = env::var_os("FAST_NC_ZARR_WORKER") {
+                candidates.push(PathBuf::from(explicit));
+            }
         }
         if let Ok(executable) = env::current_exe() {
             if let Some(directory) = executable.parent() {
@@ -33,14 +45,26 @@ impl WorkerProcess {
                 }
             }
         }
-        candidates.push(project_root.join("apps/desktop/src-tauri/binaries/fast-nc-zarr-worker"));
-        if !target.is_empty() {
-            candidates.push(project_root.join(format!(
-                "apps/desktop/src-tauri/binaries/fast-nc-zarr-worker-{target}"
-            )));
+        if cfg!(debug_assertions) {
+            candidates
+                .push(project_root.join("apps/desktop/src-tauri/binaries/fast-nc-zarr-worker"));
+            if !target.is_empty() {
+                candidates.push(project_root.join(format!(
+                    "apps/desktop/src-tauri/binaries/fast-nc-zarr-worker-{target}"
+                )));
+            }
         }
-        let sidecar = candidates.into_iter().find(|candidate| candidate.is_file());
+        let sidecar = candidates
+            .into_iter()
+            .find(|candidate| trusted_worker(candidate));
         let use_sidecar = sidecar.is_some();
+        if !use_sidecar && !cfg!(debug_assertions) {
+            return Err(AppError::new(
+                ErrorKind::WorkerStartFailed,
+                "release worker sidecar is missing or not trusted",
+            )
+            .at_stage("worker_start"));
+        }
         let mut command = sidecar.map(Command::new).unwrap_or_else(|| {
             Command::new(env::var_os("PYTHON").unwrap_or_else(|| "python".into()))
         });
@@ -57,7 +81,7 @@ impl WorkerProcess {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|error| {
             AppError::new(ErrorKind::WorkerStartFailed, error.to_string()).at_stage("worker_start")
         })?;
@@ -67,10 +91,28 @@ impl WorkerProcess {
         let stdout = child.stdout.take().ok_or_else(|| {
             AppError::new(ErrorKind::WorkerStartFailed, "worker stdout unavailable")
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            AppError::new(ErrorKind::WorkerStartFailed, "worker stderr unavailable")
+        })?;
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(32)));
+        let stderr_tail_writer = stderr_tail.clone();
+        let _ = std::thread::Builder::new()
+            .name("worker-stderr".to_string())
+            .spawn(move || {
+                for line in BufReader::new(stderr).lines().flatten() {
+                    if let Ok(mut tail) = stderr_tail_writer.lock() {
+                        tail.push_back(line);
+                        while tail.len() > 32 {
+                            tail.pop_front();
+                        }
+                    }
+                }
+            });
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            stderr_tail,
             sequences: HashMap::new(),
             terminal_tasks: HashMap::new(),
         })
@@ -111,13 +153,25 @@ impl WorkerProcess {
                 let status = self.child.try_wait().map_err(|error| {
                     AppError::new(ErrorKind::WorkerProtocolError, error.to_string())
                 })?;
+                let diagnostics = self.stderr_diagnostics();
                 return Err(AppError::new(
                     ErrorKind::WorkerProtocolError,
-                    format!("worker exited before terminal event: {status:?}"),
+                    format!("worker exited before terminal event: {status:?}{diagnostics}"),
+                ));
+            }
+            if line.len() > MAX_WORKER_LINE_BYTES {
+                return Err(AppError::new(
+                    ErrorKind::WorkerProtocolError,
+                    "worker event exceeds protocol byte limit",
                 ));
             }
             let event = decode_event(line.trim()).map_err(|error| {
-                AppError::new(ErrorKind::WorkerProtocolError, error).at_stage("worker_event")
+                let diagnostics = self.stderr_diagnostics();
+                AppError::new(
+                    ErrorKind::WorkerProtocolError,
+                    format!("{error}{diagnostics}"),
+                )
+                .at_stage("worker_event")
             })?;
             if event.request_id != request.request_id {
                 return Err(AppError::new(
@@ -132,6 +186,18 @@ impl WorkerProcess {
                 return Ok(event);
             }
         }
+    }
+    fn stderr_diagnostics(&self) -> String {
+        let Ok(tail) = self.stderr_tail.lock() else {
+            return String::new();
+        };
+        if tail.is_empty() {
+            return String::new();
+        }
+        format!(
+            "; stderr: {}",
+            tail.iter().cloned().collect::<Vec<_>>().join(" | ")
+        )
     }
     fn check_sequence(&mut self, event: &EventEnvelope) -> Result<(), AppError> {
         if self
@@ -214,7 +280,7 @@ mod tests {
         let _guard = env_lock();
         let path = test_path("permission");
         fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write worker fixture");
-        let result = with_worker_path(&path, || {
+        with_worker_path(&path, || {
             let error = match WorkerProcess::spawn() {
                 Ok(_) => panic!("non-executable worker must fail"),
                 Err(error) => error,
@@ -223,7 +289,6 @@ mod tests {
             Ok(())
         });
         let _ = fs::remove_file(path);
-        result;
     }
 
     #[test]
@@ -233,7 +298,7 @@ mod tests {
         fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write worker fixture");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
             .expect("chmod worker fixture");
-        let result = with_worker_path(&path, || {
+        with_worker_path(&path, || {
             let mut worker = WorkerProcess::spawn().expect("executable worker should spawn");
             let request = RequestEnvelope {
                 protocol_version: 1,
@@ -249,6 +314,5 @@ mod tests {
             Ok(())
         });
         let _ = fs::remove_file(path);
-        result;
     }
 }

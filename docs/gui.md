@@ -125,9 +125,9 @@ Tauri Rust runtime：
 cargo test -p fast-nc-zarr-desktop
 ```
 
-## v1.7.3 Linux 发布范围
+## v1.7.4 Linux 发布范围
 
-v1.7.3 当前只把 Linux `x86_64-unknown-linux-gnu` 作为阻塞发布平台。必须分别验证 X11、Wayland、sidecar 和安装包启动；Windows/macOS 构建与运行时验证延期，不影响本轮 Linux release gate。
+v1.7.4 当前只把 Linux `x86_64-unknown-linux-gnu` 作为阻塞发布平台。必须分别验证 X11、Wayland、sidecar 和安装包启动；Windows/macOS 构建与运行时验证延期，不影响本轮 Linux release gate。
 
 Linux 发布前至少执行：
 

@@ -73,7 +73,25 @@ pub fn resample_f32(request: &ResampleF32Request) -> Result<ResampleF32Response,
     for time in 0..request.shape[0] {
         for &lat in &request.target_lat {
             for &lon in &request.target_lon {
-                let value = if request.method == "nearest" {
+                let in_bounds = |axis: &[f32], value: f32| {
+                    axis.first()
+                        .zip(axis.last())
+                        .map(|(first, last)| {
+                            let (minimum, maximum) = if first <= last {
+                                (*first, *last)
+                            } else {
+                                (*last, *first)
+                            };
+                            value >= minimum && value <= maximum
+                        })
+                        .unwrap_or(false)
+                };
+                let nearest_in_bounds =
+                    in_bounds(&request.source_lat, lat) && in_bounds(&request.source_lon, lon);
+
+                let value = if request.method == "nearest" && !nearest_in_bounds {
+                    f32::NAN
+                } else if request.method == "nearest" {
                     let lat_index = request
                         .source_lat
                         .iter()
@@ -163,5 +181,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(response.values, vec![1.5]);
+    }
+
+    #[test]
+    fn nearest_returns_nan_outside_source_bounds() {
+        let response = resample_f32(&ResampleF32Request {
+            values: vec![1.0, 2.0, 3.0, 4.0],
+            shape: [1, 2, 2],
+            source_lat: vec![0.0, 1.0],
+            source_lon: vec![0.0, 1.0],
+            target_lat: vec![2.0],
+            target_lon: vec![2.0],
+            method: "nearest".into(),
+        })
+        .unwrap();
+        assert!(response.values[0].is_nan());
     }
 }

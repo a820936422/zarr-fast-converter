@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any, TextIO
 
 PROTOCOL_VERSION = 1
+MAX_MESSAGE_BYTES = 1_048_576
+MAX_JSON_DEPTH = 32
+MAX_COLLECTION_ITEMS = 100_000
 COMMANDS = frozenset(
     {
         "get_capabilities",
@@ -16,8 +19,6 @@ COMMANDS = frozenset(
         "preview_pipeline",
         "run_pipeline",
         "resume_pipeline",
-        "native_task",
-        "cancel_task",
         "shutdown",
     }
 )
@@ -74,16 +75,40 @@ class Event:
     payload: dict[str, Any]
     task_id: str | None = None
     stage: str | None = None
-
-
 def _object(value: Any, *, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ProtocolError(f"{name} must be an object")
     return value
 
 
+def _validate_limits(value: Any, *, depth: int = 0) -> None:
+    if depth > MAX_JSON_DEPTH:
+        raise ProtocolError("JSON nesting depth exceeds protocol limit")
+    if isinstance(value, dict):
+        if len(value) > MAX_COLLECTION_ITEMS:
+            raise ProtocolError("JSON object has too many fields")
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ProtocolError("JSON object keys must be strings")
+            _validate_limits(item, depth=depth + 1)
+    elif isinstance(value, list):
+        if len(value) > MAX_COLLECTION_ITEMS:
+            raise ProtocolError("JSON array has too many items")
+        for item in value:
+            _validate_limits(item, depth=depth + 1)
+
+
+def _decode_json(value: str | bytes) -> Any:
+    if len(value) > MAX_MESSAGE_BYTES:
+        raise ProtocolError("JSON message exceeds protocol byte limit")
+    parsed = json.loads(value)
+    _validate_limits(parsed)
+    return parsed
+
+
 def decode_request(value: str | bytes | dict[str, Any]) -> Request:
-    raw = _object(json.loads(value) if isinstance(value, (str, bytes)) else value, name="request")
+    raw = _object(_decode_json(value) if isinstance(value, (str, bytes)) else value, name="request")
+    _validate_limits(raw)
     if raw.get("protocol_version") != PROTOCOL_VERSION:
         raise ProtocolError("unsupported request protocol version")
     request_id = raw.get("request_id")

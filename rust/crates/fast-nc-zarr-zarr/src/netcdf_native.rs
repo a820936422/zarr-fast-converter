@@ -3,6 +3,7 @@ use netcdf::{Attribute, AttributeValue};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Serialize)]
 pub struct NetcdfDimensionSummary {
@@ -75,6 +76,15 @@ fn attributes<'a>(
     Ok(result)
 }
 
+fn numeric_attribute(attributes: &Map<String, Value>, name: &str) -> Option<f64> {
+    attributes.get(name).and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|item| item as f64))
+            .or_else(|| value.as_u64().map(|item| item as f64))
+    })
+}
+
 fn dtype(value: &NcVariableType) -> (String, bool) {
     match value {
         NcVariableType::Float(FloatType::F32) => ("float32".into(), true),
@@ -124,14 +134,17 @@ pub fn inspect_netcdf(path: &Path) -> Result<NetcdfSummary, String> {
             .iter()
             .map(|dimension| dimension.name())
             .collect::<Vec<_>>();
-        let is_standard_coordinate = matches!(name.as_str(), "time" | "lat" | "lon")
-            && variable_dimensions == [name.clone()];
-        if !is_standard_coordinate
-            && (variable_dimensions != vec!["time".to_owned(), "lat".to_owned(), "lon".to_owned()]
-                || !numeric)
+        let is_coordinate_name = matches!(name.as_str(), "time" | "lat" | "lon");
+        let is_standard_coordinate =
+            is_coordinate_name && variable_dimensions == [name.clone()] && numeric;
+        if (is_coordinate_name && !is_standard_coordinate)
+            || (!is_coordinate_name
+                && (variable_dimensions
+                    != vec!["time".to_owned(), "lat".to_owned(), "lon".to_owned()]
+                    || !matches!(dtype.as_str(), "float32" | "float64")))
         {
             limitations.push(format!(
-                "variable {name} is not a numeric three-dimensional time/lat/lon variable"
+                "variable {name} is outside the native numeric time/lat/lon float subset"
             ));
         }
         variables.push(NetcdfVariableSummary {
@@ -151,12 +164,12 @@ pub fn inspect_netcdf(path: &Path) -> Result<NetcdfSummary, String> {
         limitations.push("requires dimensions named time, lat and lon".into());
     }
     let supported_subset = standard_coordinates
-        && variables
-            .iter()
-            .any(|item| item.dimensions.len() == 3 && item.numeric)
+        && variables.iter().any(|item| {
+            item.dimensions.len() == 3 && matches!(item.dtype.as_str(), "float32" | "float64")
+        })
         && limitations.is_empty();
     if !supported_subset && limitations.is_empty() {
-        limitations.push("requires at least one numeric three-dimensional variable".into());
+        limitations.push("requires at least one float32/float64 three-dimensional variable".into());
     }
     Ok(NetcdfSummary {
         path: path.to_string_lossy().into_owned(),
@@ -177,6 +190,38 @@ pub struct NetcdfConversionSummary {
     pub logical_bytes: u64,
 }
 
+fn native_values_budget_bytes() -> u64 {
+    std::env::var("FAST_NC_ZARR_NATIVE_MEMORY_BUDGET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(512 * 1024 * 1024)
+}
+
+fn ensure_native_values_budget(shape: &[u64], dtype: &str) -> Result<(), String> {
+    let itemsize = match dtype {
+        "float32" | "int32" | "uint32" => 4,
+        "float64" | "int64" | "uint64" => 8,
+        "int8" | "uint8" => 1,
+        "int16" | "uint16" => 2,
+        _ => return Err(format!("unsupported NetCDF dtype for budget: {dtype}")),
+    };
+    let elements = shape.iter().try_fold(1_u64, |total, value| {
+        total
+            .checked_mul(*value)
+            .ok_or("array element count overflows u64")
+    })?;
+    let bytes = elements
+        .checked_mul(itemsize)
+        .ok_or("native NetCDF working set overflows u64")?;
+    if bytes > native_values_budget_bytes() {
+        return Err(format!(
+            "resource_budget_exceeded: variable requires {bytes} bytes"
+        ));
+    }
+    Ok(())
+}
+
 fn store_f32_array(
     store: std::sync::Arc<zarrs_filesystem::FilesystemStore>,
     name: &str,
@@ -189,11 +234,14 @@ fn store_f32_array(
         .iter()
         .map(|value| (*value).clamp(1, 64))
         .collect::<Vec<_>>();
+    let fill_value = numeric_attribute(attrs, "_FillValue")
+        .map(|value| value as f32)
+        .unwrap_or(f32::NAN);
     let mut builder = zarrs::array::ArrayBuilder::new(
         shape.to_vec(),
         chunks,
         zarrs::array::data_type::float32(),
-        f32::NAN,
+        fill_value,
     );
     builder.dimension_names(Some(dimensions.to_vec()));
     let mut array = builder
@@ -242,11 +290,12 @@ fn store_f64_array(
         .iter()
         .map(|value| (*value).clamp(1, 64))
         .collect::<Vec<_>>();
+    let fill_value = numeric_attribute(attrs, "_FillValue").unwrap_or(f64::NAN);
     let mut builder = zarrs::array::ArrayBuilder::new(
         shape.to_vec(),
         chunks,
         zarrs::array::data_type::float64(),
-        f64::NAN,
+        fill_value,
     );
     builder.dimension_names(Some(dimensions.to_vec()));
     let mut array = builder
@@ -393,16 +442,82 @@ fn store_integer_array<
     Ok(std::mem::size_of_val(values) as u64)
 }
 
+fn path_entry_exists(path: &Path) -> bool {
+    path.exists() || std::fs::symlink_metadata(path).is_ok()
+}
+
+fn source_identity(path: &Path) -> Result<(u64, u128), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    let modified = metadata
+        .modified()
+        .map_err(|error| error.to_string())?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    Ok((metadata.len(), modified))
+}
+
 pub fn convert_netcdf_to_zarr(
     input: &Path,
     output: &Path,
 ) -> Result<NetcdfConversionSummary, String> {
-    if output.exists() {
+    if path_entry_exists(output) {
         return Err(format!(
             "refusing to overwrite existing output: {}",
             output.display()
         ));
     }
+    let parent = output
+        .parent()
+        .ok_or_else(|| format!("output has no parent directory: {}", output.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let staging = parent.join(format!(
+        ".{name}.native-netcdf-{}-{timestamp}.tmp",
+        std::process::id()
+    ));
+    std::fs::create_dir(&staging).map_err(|error| error.to_string())?;
+
+    let result = convert_netcdf_to_zarr_inner(input, &staging);
+    match result {
+        Ok(mut summary) => {
+            if path_entry_exists(output) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(format!(
+                    "output appeared during native conversion: {}",
+                    output.display()
+                ));
+            }
+            if !staging.join("zarr.json").is_file() {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err("native conversion did not produce a Zarr v3 group".into());
+            }
+            if let Err(error) = std::fs::rename(&staging, output) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(error.to_string());
+            }
+            summary.output = output.to_string_lossy().into_owned();
+            Ok(summary)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
+}
+
+fn convert_netcdf_to_zarr_inner(
+    input: &Path,
+    output: &Path,
+) -> Result<NetcdfConversionSummary, String> {
+    let source_before = source_identity(input)?;
     let file = netcdf::open(input).map_err(|error| error.to_string())?;
     let summary = inspect_netcdf(input)?;
     if !summary.supported_subset {
@@ -441,6 +556,7 @@ pub fn convert_netcdf_to_zarr(
             .map(|value| *value as u64)
             .collect::<Vec<_>>();
         let attrs = variable_summary.attributes.clone();
+        ensure_native_values_budget(&shape, &variable_summary.dtype)?;
         let bytes = match variable_summary.dtype.as_str() {
             "float32" => store_f32_array(
                 store.clone(),
@@ -550,10 +666,18 @@ pub fn convert_netcdf_to_zarr(
                 &attrs,
                 (zarrs::array::data_type::uint64().into(), 0_u64),
             )?,
-            _ => unreachable!(),
+            _ => {
+                return Err(format!(
+                    "unsupported NetCDF dtype {} for variable {}",
+                    variable_summary.dtype, variable_summary.name
+                ));
+            }
         };
         logical_bytes = logical_bytes.saturating_add(bytes);
         names.push(variable_summary.name.clone());
+    }
+    if source_identity(input)? != source_before {
+        return Err("source NetCDF changed during native conversion".into());
     }
     Ok(NetcdfConversionSummary {
         input: input.to_string_lossy().into_owned(),
@@ -561,4 +685,25 @@ pub fn convert_netcdf_to_zarr(
         variables: names,
         logical_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_budget_rejects_oversized_float64_variable() {
+        let result = ensure_native_values_budget(&[512 * 1024 * 1024], "float64");
+        assert!(result
+            .expect_err("default native budget must reject a 4 GiB variable")
+            .contains("resource_budget_exceeded"));
+    }
+
+    #[test]
+    fn native_budget_detects_element_count_overflow() {
+        let result = ensure_native_values_budget(&[u64::MAX, 2], "float32");
+        assert!(result
+            .expect_err("element multiplication must be checked")
+            .contains("overflows u64"));
+    }
 }

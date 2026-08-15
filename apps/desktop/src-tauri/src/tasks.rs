@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +15,7 @@ use crate::resource::ResourceSnapshot;
 use crate::worker::{SharedWorker, WorkerProcess};
 
 const TASK_STORE_SCHEMA_VERSION: u32 = 1;
+const MAX_ACTIVE_TASKS: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -101,6 +103,20 @@ impl TaskRegistry {
 
     pub fn insert(&self, task: TaskSummary) -> Result<(), AppError> {
         self.update(|tasks| {
+            let active = tasks
+                .values()
+                .filter(|item| matches!(item.status, TaskStatus::Running | TaskStatus::Cancelling))
+                .count();
+            if active >= MAX_ACTIVE_TASKS
+                && !tasks.contains_key(&task.task_id)
+                && matches!(task.status, TaskStatus::Running | TaskStatus::Cancelling)
+            {
+                return Err(AppError::new(
+                    ErrorKind::ResourceBudgetExceeded,
+                    format!("最多同时运行 {MAX_ACTIVE_TASKS} 个桌面任务"),
+                )
+                .at_stage("resources"));
+            }
             tasks.insert(task.task_id.clone(), task);
             Ok(())
         })
@@ -133,9 +149,12 @@ impl TaskRegistry {
     }
 
     pub fn cancellation_file(&self, task_id: &str) -> Result<Option<PathBuf>, AppError> {
+        if !valid_task_id(task_id) {
+            return Ok(None);
+        }
         Ok(self.get(task_id)?.and_then(|task| {
             if matches!(task.status, TaskStatus::Running | TaskStatus::Cancelling) {
-                task.cancellation_file.map(PathBuf::from)
+                Some(cancellation_path(task_id))
             } else {
                 None
             }
@@ -187,7 +206,8 @@ impl TaskRegistry {
     ) -> Result<(), AppError> {
         let cancellation_file = self
             .get(task_id)?
-            .and_then(|task| task.cancellation_file.clone());
+            .filter(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Cancelling))
+            .map(|_| cancellation_path(task_id));
         self.update(|tasks| {
             let Some(task) = tasks.get_mut(task_id) else {
                 return Ok(());
@@ -236,9 +256,9 @@ fn load_tasks(path: &Path) -> (HashMap<String, TaskSummary>, bool) {
     let mut tasks = HashMap::new();
     for mut task in store.tasks {
         if matches!(task.status, TaskStatus::Running | TaskStatus::Cancelling) {
-            if let Some(path) = task.cancellation_file.take() {
-                let _ = fs::remove_file(path);
-            }
+            let path = cancellation_path(&task.task_id);
+            let _ = fs::remove_file(path);
+            task.cancellation_file = None;
             task.status = TaskStatus::Failed;
             task.error = Some(application_restarted_error());
             normalized = true;
@@ -411,10 +431,21 @@ pub(crate) fn send_request(
     request: &RequestEnvelope,
 ) -> Result<Vec<TaskEvent>, AppError> {
     let mut worker = ensure_worker(shared)?;
-    worker
+    let process = worker
         .as_mut()
-        .ok_or_else(|| AppError::new(ErrorKind::WorkerStartFailed, "worker was not initialized"))?
-        .send(request)
+        .ok_or_else(|| AppError::new(ErrorKind::WorkerStartFailed, "worker was not initialized"))?;
+    match process.send(request) {
+        Ok(events) => Ok(events),
+        Err(error) => {
+            if matches!(
+                error.kind,
+                ErrorKind::WorkerProtocolError | ErrorKind::WorkerStartFailed
+            ) {
+                *worker = None;
+            }
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn send_dedicated_streaming<F>(
@@ -434,16 +465,67 @@ fn terminal_event(events: &[TaskEvent]) -> Result<&TaskEvent, AppError> {
         .ok_or_else(|| AppError::new(ErrorKind::WorkerProtocolError, "worker returned no events"))
 }
 
+fn wire_error_kind(value: Option<&str>) -> ErrorKind {
+    match value {
+        Some("invalid_request") => ErrorKind::InvalidRequest,
+        Some("path_not_found") => ErrorKind::PathNotFound,
+        Some("permission_denied") => ErrorKind::PermissionDenied,
+        Some("input_invalid") => ErrorKind::InputInvalid,
+        Some("backend_unavailable") => ErrorKind::BackendUnavailable,
+        Some("worker_start_failed") => ErrorKind::WorkerStartFailed,
+        Some("worker_protocol_error") => ErrorKind::WorkerProtocolError,
+        Some("cancelled") => ErrorKind::Cancelled,
+        Some("resource_budget_exceeded") => ErrorKind::ResourceBudgetExceeded,
+        Some("validation_failed") => ErrorKind::ValidationFailed,
+        Some("publication_failed") => ErrorKind::PublicationFailed,
+        _ => ErrorKind::Unknown,
+    }
+}
+
+fn wire_error(event: &TaskEvent) -> AppError {
+    let wire = event.payload.get("error").and_then(Value::as_object);
+    AppError {
+        kind: wire_error_kind(
+            wire.and_then(|value| value.get("kind"))
+                .and_then(Value::as_str),
+        ),
+        message: wire
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("worker task failed")
+            .to_owned(),
+        retryable: wire
+            .and_then(|value| value.get("retryable"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        stage: wire
+            .and_then(|value| value.get("stage"))
+            .and_then(Value::as_str)
+            .or(event.stage.as_deref())
+            .map(str::to_owned),
+    }
+}
+
 pub(crate) fn payload_or_error(events: Vec<TaskEvent>) -> Result<Value, AppError> {
     let terminal = terminal_event(&events)?;
-    if terminal.event == "failed" {
-        return Err(AppError::new(
-            ErrorKind::Unknown,
-            serde_json::to_string(&terminal.payload)
-                .unwrap_or_else(|_| "worker failed".to_string()),
-        ));
+    match terminal.event.as_str() {
+        "failed" => Err(wire_error(terminal)),
+        "cancelled" => Err(AppError::new(
+            ErrorKind::Cancelled,
+            terminal
+                .payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("worker task cancelled"),
+        )
+        .at_stage(
+            terminal
+                .stage
+                .clone()
+                .unwrap_or_else(|| "worker".to_string()),
+        )),
+        _ => Ok(Value::Object(terminal.payload.clone())),
     }
-    Ok(Value::Object(terminal.payload.clone()))
 }
 
 pub(crate) fn failed_event(
@@ -499,10 +581,18 @@ pub fn cancel_task(
     let path = registry.cancellation_file(&task_id)?.ok_or_else(|| {
         AppError::new(ErrorKind::InvalidRequest, "task has no cancellation handle")
     })?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, b"cancel")?;
+    let mut marker = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(fs::OpenOptions::new().write(true).open(&path)?)
+            } else {
+                Err(error)
+            }
+        })?;
+    marker.write_all(b"cancel")?;
     registry.mark_cancelling(&task_id)?;
     app.emit("task-cancel-requested", &task_id)
         .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?;
@@ -515,9 +605,18 @@ pub(crate) fn cancellation_path(task_id: &str) -> PathBuf {
         .join(format!("{task_id}.cancel"))
 }
 
+fn valid_task_id(task_id: &str) -> bool {
+    !task_id.is_empty()
+        && task_id
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || value == b'-' || value == b'_')
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{failed_event, TaskEvent, TaskRegistry, TaskStatus, TaskSummary};
+    use super::{
+        cancellation_path, failed_event, TaskEvent, TaskRegistry, TaskStatus, TaskSummary,
+    };
     use crate::error::{AppError, ErrorKind};
     use crate::protocol::RequestEnvelope;
     use crate::resource::ResourceSnapshot;
@@ -533,10 +632,10 @@ mod tests {
         ))
     }
 
-    fn task(path: &str) -> TaskSummary {
+    fn task(task_id: &str, path: &str) -> TaskSummary {
         TaskSummary {
-            task_id: "task-1".to_string(),
-            request_id: "request-1".to_string(),
+            task_id: task_id.to_string(),
+            request_id: format!("request-{task_id}"),
             command: "native_task".to_string(),
             status: TaskStatus::Running,
             manifest: None,
@@ -552,11 +651,11 @@ mod tests {
         }
     }
 
-    fn finished_event() -> TaskEvent {
+    fn finished_event(task_id: &str) -> TaskEvent {
         TaskEvent {
             protocol_version: 1,
-            request_id: "request-1".to_string(),
-            task_id: Some("task-1".to_string()),
+            request_id: format!("request-{task_id}"),
+            task_id: Some(task_id.to_string()),
             sequence: 3,
             event: "finished".to_string(),
             stage: Some("native".to_string()),
@@ -567,18 +666,20 @@ mod tests {
 
     #[test]
     fn terminal_transition_cleans_cancellation_and_manifest() {
+        let task_id = "terminal-task";
         let state = temp_path("terminal");
-        let path = temp_path("cancel");
+        let path = cancellation_path(task_id);
+        fs::create_dir_all(path.parent().expect("cancellation parent")).expect("create parent");
         fs::write(&path, b"cancel").expect("create cancellation file");
         let registry = TaskRegistry::with_state_path(state.clone());
         registry
-            .insert(task(path.to_str().expect("utf8 path")))
+            .insert(task(task_id, path.to_str().expect("utf8 path")))
             .expect("insert task");
         registry
-            .update_terminal("task-1", Some(&finished_event()))
+            .update_terminal(task_id, Some(&finished_event(task_id)))
             .expect("terminal update");
         let current = registry
-            .get("task-1")
+            .get(task_id)
             .expect("get task")
             .expect("task exists");
         assert_eq!(current.status, TaskStatus::Finished);
@@ -586,7 +687,7 @@ mod tests {
         assert!(current.cancellation_file.is_none());
         assert!(!path.exists());
         assert!(registry
-            .cancellation_file("task-1")
+            .cancellation_file(task_id)
             .expect("cancel handle")
             .is_none());
         let _ = fs::remove_file(state);
@@ -594,21 +695,23 @@ mod tests {
 
     #[test]
     fn terminal_state_survives_registry_restart() {
+        let task_id = "restart-finished-task";
         let state = temp_path("restart-finished");
-        let path = temp_path("restart-cancel");
+        let path = cancellation_path(task_id);
+        fs::create_dir_all(path.parent().expect("cancellation parent")).expect("create parent");
         fs::write(&path, b"cancel").expect("create cancellation file");
         {
             let registry = TaskRegistry::with_state_path(state.clone());
             registry
-                .insert(task(path.to_str().expect("utf8 path")))
+                .insert(task(task_id, path.to_str().expect("utf8 path")))
                 .expect("insert task");
             registry
-                .update_terminal("task-1", Some(&finished_event()))
+                .update_terminal(task_id, Some(&finished_event(task_id)))
                 .expect("terminal update");
         }
         let restored = TaskRegistry::with_state_path(state.clone());
         let current = restored
-            .get("task-1")
+            .get(task_id)
             .expect("get restored task")
             .expect("restored task exists");
         assert_eq!(current.status, TaskStatus::Finished);
@@ -617,24 +720,27 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&state).expect("read task store"))
                 .expect("decode task store");
         assert_eq!(stored["schema_version"], 1);
-        assert_eq!(stored["tasks"][0]["taskId"], "task-1");
+        assert_eq!(stored["tasks"][0]["taskId"], task_id);
+        assert!(!path.exists());
         let _ = fs::remove_file(state);
     }
 
     #[test]
     fn restart_normalizes_active_task_and_removes_cancel_handle() {
+        let task_id = "restart-active-task";
         let state = temp_path("restart-active");
-        let path = temp_path("active-cancel");
+        let path = cancellation_path(task_id);
+        fs::create_dir_all(path.parent().expect("cancellation parent")).expect("create parent");
         fs::write(&path, b"cancel").expect("create cancellation file");
         {
             let registry = TaskRegistry::with_state_path(state.clone());
             registry
-                .insert(task(path.to_str().expect("utf8 path")))
+                .insert(task(task_id, path.to_str().expect("utf8 path")))
                 .expect("insert task");
         }
         let restored = TaskRegistry::with_state_path(state.clone());
         let current = restored
-            .get("task-1")
+            .get(task_id)
             .expect("get restored task")
             .expect("restored task exists");
         assert_eq!(current.status, TaskStatus::Failed);
@@ -653,6 +759,23 @@ mod tests {
         fs::write(&state, b"not json").expect("write corrupt task store");
         let registry = TaskRegistry::with_state_path(state.clone());
         assert!(registry.list().expect("list tasks").is_empty());
+        let _ = fs::remove_file(state);
+    }
+
+    #[test]
+    fn active_task_quota_rejects_a_third_running_task() {
+        let state = temp_path("quota");
+        let registry = TaskRegistry::with_state_path(state.clone());
+        registry
+            .insert(task("quota-one", "/tmp/quota-one.cancel"))
+            .expect("first task");
+        registry
+            .insert(task("quota-two", "/tmp/quota-two.cancel"))
+            .expect("second task");
+        let error = registry
+            .insert(task("quota-three", "/tmp/quota-three.cancel"))
+            .expect_err("third active task must be rejected");
+        assert_eq!(error.kind, ErrorKind::ResourceBudgetExceeded);
         let _ = fs::remove_file(state);
     }
 

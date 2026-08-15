@@ -39,32 +39,35 @@ fn start_task(
         started_at: now_seconds(),
         resource: Some(resource),
     })?;
-    let registry = registry.clone();
+    let task_registry = registry.clone();
     let task_key = task_id.clone();
-    std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name(format!("{command}-{task_id}"))
         .spawn(move || {
             let mut last_sequence = 0;
             let mut saw_terminal = false;
             let result = send_dedicated_streaming(&request, |event| {
                 last_sequence = event.sequence.saturating_add(1);
-                saw_terminal = event.is_terminal();
-                if saw_terminal {
-                    registry.update_terminal(&task_key, Some(event))?;
+                if event.is_terminal() {
+                    task_registry.update_terminal(&task_key, Some(event))?;
+                    saw_terminal = true;
                 }
                 emit_task_event(&app, event)
             });
             if let Err(error) = result {
                 if !saw_terminal {
                     let event = failed_event(&request, &error, last_sequence);
-                    let _ = registry.update_terminal(&task_key, Some(&event));
+                    let _ = task_registry.update_terminal(&task_key, Some(&event));
                     let _ = emit_task_event(&app, &event);
-                } else {
-                    let _ = registry.update_failure(&task_key, error);
                 }
             }
-        })
-        .map_err(|error| AppError::new(ErrorKind::WorkerStartFailed, error.to_string()))?;
+        });
+    if let Err(error) = spawn_result {
+        let task_error = AppError::new(ErrorKind::WorkerStartFailed, error.to_string());
+        let _ = registry.update_failure(&task_id, task_error.clone());
+        let _ = std::fs::remove_file(cancellation_file);
+        return Err(task_error);
+    }
     Ok(task_id)
 }
 

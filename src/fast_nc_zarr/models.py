@@ -36,12 +36,14 @@ class VariableTransform:
     ``fill_values`` are compared against the unscaled source values.  An
     empty tuple means that no replacement was requested; ``None`` is used by
     callers that want to distinguish an omitted option while collecting
-    metadata.  ``scale_factor`` is applied only to values that are not marked
-    missing.  ``output_fill`` is the marker used for integer output arrays.
+    metadata.  ``scale_factor`` and ``add_offset`` are applied only to values
+    that are not marked missing.  ``output_fill`` is the marker used for
+    integer output arrays.
     """
 
     fill_values: tuple[float, ...] | None = None
     scale_factor: float | None = None
+    add_offset: float | None = None
     output_fill: float | int | None = None
 
 

@@ -715,6 +715,8 @@ def _rasterio_metadata(path: Path) -> tuple[np.ndarray, np.ndarray, tuple[Variab
             if dataset.count != 1:
                 raise _LowLevelUnsupported("多 band raster 需要 xarray 归一化。")
             transform = dataset.transform
+            crs_signature = dataset.crs.to_string() if dataset.crs is not None else None
+            transform_signature = tuple(round(float(value), 12) for value in transform)
             if not np.isclose(transform.b, 0.0) or not np.isclose(transform.d, 0.0):
                 raise _LowLevelUnsupported("旋转 raster 网格需要 xarray 归一化。")
             rows = np.arange(dataset.height, dtype=np.int64)
@@ -749,6 +751,8 @@ def _rasterio_metadata(path: Path) -> tuple[np.ndarray, np.ndarray, tuple[Variab
         ("lat", "lon"),
         shape,
         tuple(sorted((str(key), repr(value)) for key, value in attrs.items())),
+        crs_signature,
+        transform_signature,
     )
     spec = VariableSpec(
         name="band_data",

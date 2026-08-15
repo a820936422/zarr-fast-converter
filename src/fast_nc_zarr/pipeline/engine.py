@@ -613,9 +613,12 @@ def _semantic_validation(
     if not config.validate:
         return None
     result = validate_semantic_samples(output, config.semantic_constraints)
+    warnings = [str(item) for item in result.get("warnings", [])]
     if progress:
-        for warning in result.get("warnings", []):
+        for warning in warnings:
             print(f"语义检查提醒：{warning}", flush=True)
+    if warnings and config.semantic_constraints:
+        raise PipelineExecutionError("显式语义约束校验失败：" + "；".join(warnings))
     return result
 
 
@@ -726,20 +729,14 @@ def _run_zarr_pipeline(
         if plan.needs_resample:
             options = config.resampling
             direct_resample_target = not plan.finalization_required
-            if resuming and direct_resample_target:
+            if direct_resample_target:
                 validate_publish_target(
                     output,
                     overwrite=config.general.overwrite,
-                    operation="临时产物续跑重采样",
+                    operation="统一流程最终发布",
                     require_zarr_v3=True,
                 )
-            resample_output = (
-                paths.final_staging
-                if resuming and direct_resample_target
-                else paths.resampled
-                if plan.finalization_required
-                else output
-            )
+            resample_output = paths.final_staging if direct_resample_target else paths.resampled
             if progress:
                 print(f"统一流程阶段 1/{len(physical_stages)}：重采样现有 Zarr")
             current_stage = "resampling"
@@ -757,11 +754,7 @@ def _run_zarr_pipeline(
                     target_lon_bounds=(config.general.lon_min, config.general.lon_max),
                     target_lat_descending=True,
                     target_lon_descending=False,
-                    overwrite=(
-                        config.general.overwrite
-                        if direct_resample_target and not resuming
-                        else False
-                    ),
+                    overwrite=False,
                     validate=config.validate,
                     tile_size=options.tile_size,
                     time_block=options.time_block,
@@ -787,7 +780,7 @@ def _run_zarr_pipeline(
             manifest["stages"]["resampling"] = {
                 "status": "validating_math_samples" if resuming else "validated"
                 if plan.finalization_required
-                else "published_as_final",
+                else "validated_staging",
                 "metrics": resample_metrics,
             }
             manifest["candidate_trials"]["resampling"] = resample_metrics.get("tuning", {})
@@ -813,21 +806,15 @@ def _run_zarr_pipeline(
                 manifest["stages"]["resampling"]["mathematical_validation"] = validation_metrics
                 manifest["stages"]["resampling"]["status"] = "validated"
                 if direct_resample_target:
-                    publish_staging(
-                        paths.final_staging,
-                        output,
-                        "pipeline-resume",
-                        overwrite=config.general.overwrite,
-                        require_zarr_v3=True,
-                    )
-                    manifest["stages"]["resampling"]["status"] = "published_as_final"
-                    current = output
+                    manifest["stages"]["resampling"]["status"] = "validated_staging"
+                    current = resample_output
                 else:
                     manifest["resume"]["checkpoints"]["resampling"] = {
                         "path": "resampled.zarr",
                         "status": "validated",
                         "dimensions": dict(plan.resample_plan.target.dimensions),
                     }
+
                 _write_manifest(paths.manifest, manifest)
         if cancel_event is not None and cancel_event.is_set():
             raise PipelineExecutionError("任务已取消。")
@@ -895,7 +882,18 @@ def _run_zarr_pipeline(
                 "selected_compression": finalization_metrics.get("selected_compression"),
             }
             _write_event(paths.events, "tuning", _stage_event_payload(manifest, "finalization", {"selection": manifest["selection"]["finalization"]}, checkpoint="output", terminal_status="running"))
-        semantic_validation = _semantic_validation(output, config, progress=progress)
+        semantic_output = output if plan.finalization_required else current
+        semantic_validation = _semantic_validation(semantic_output, config, progress=progress)
+        if not plan.finalization_required and plan.needs_resample:
+            publish_staging(
+                current,
+                output,
+                "pipeline-resume" if resuming else "pipeline",
+                overwrite=config.general.overwrite,
+                require_zarr_v3=True,
+            )
+            current = output
+            manifest["stages"]["resampling"]["status"] = "published_as_final"
         manifest["semantic_validation"] = semantic_validation
         final_output_bytes = int(
             (finalization_metrics or resample_metrics or {}).get(
@@ -1078,18 +1076,14 @@ def run_pipeline(
         conversion_is_final = not plan.needs_resample and not plan.finalization_required
         resampling_is_final = plan.needs_resample and not plan.finalization_required
         final_target = Path(config.general.output).expanduser().resolve()
-        if resampling_is_final:
+        if conversion_is_final or resampling_is_final:
             validate_publish_target(
                 final_target,
                 overwrite=config.general.overwrite,
-                operation="一条龙重采样",
+                operation="一条龙最终发布",
                 require_zarr_v3=True,
             )
-        conversion_output = (
-            final_target
-            if conversion_is_final
-            else paths.converted
-        )
+        conversion_output = paths.final_staging if conversion_is_final else paths.converted
         conversion_budget = effective_resource_budget(
             resources,
             reserve_memory_bytes=int(
@@ -1120,7 +1114,7 @@ def run_pipeline(
             reserve_memory_gib=conversion.reserve_memory_gib,
             chunks=plan.conversion_chunks,
             output_layout=plan.output_layout if conversion_is_final else None,
-            overwrite=config.general.overwrite if conversion_is_final else False,
+            overwrite=False,
             validate=config.validate,
         )
         if progress:
@@ -1139,12 +1133,11 @@ def run_pipeline(
             cancel_event=cancel_event,
         )
         manifest["stages"]["conversion"] = {
-            "status": (
-                "published_as_final" if conversion_is_final else "validated"
-            ),
+            "status": "validated_staging" if conversion_is_final else "validated",
             "metrics": conversion_metrics,
             "plan": asdict(conversion_plan),
         }
+        current = conversion_output
         manifest["candidate_trials"]["conversion"] = conversion_metrics.get("tuning", {})
         manifest["selection"]["conversion"] = conversion_metrics.get("tuning", {}).get("selection_reason")
         manifest["resolved_plans"]["conversion"] = asdict(conversion_plan)
@@ -1256,20 +1249,13 @@ def run_pipeline(
                     "dimensions": dict(plan.target_grid.dimensions),
                 }
             if resampling_is_final:
-                publish_staging(
-                    paths.final_staging,
-                    final_target,
-                    "pipeline",
-                    overwrite=config.general.overwrite,
-                    require_zarr_v3=True,
-                )
-                manifest["stages"]["resampling"]["status"] = "published_as_final"
+                manifest["stages"]["resampling"]["status"] = "validated_staging"
             manifest["candidate_trials"]["resampling"] = resample_metrics.get("tuning", {})
             manifest["selection"]["resampling"] = resample_metrics.get("tuning", {}).get("selection_reason")
             manifest["resolved_plans"]["resampling"] = resample_metrics.get("resolved_plan", {})
             _write_event(paths.events, "tuning", _stage_event_payload(manifest, "resampling", {"selection": manifest["selection"]["resampling"]}, checkpoint="resampled.zarr" if not resampling_is_final else "output", terminal_status="running"))
             _write_manifest(paths.manifest, manifest)
-            current = final_target if resampling_is_final else resample_output
+            current = resample_output
             if config.general.cleanup_intermediate:
                 shutil.rmtree(paths.converted)
                 manifest["stages"]["conversion"]["status"] = "validated_and_cleaned"
@@ -1347,11 +1333,23 @@ def run_pipeline(
             "selected_compression": rechunk_metrics.get("selected_compression"),
         }
         _write_event(paths.events, "tuning", _stage_event_payload(manifest, "finalization", {"selection": manifest["selection"]["finalization"]}, checkpoint="output", terminal_status="running"))
+        semantic_output = final_target if plan.finalization_required else current
         semantic_validation = _semantic_validation(
-            Path(config.general.output).expanduser().resolve(),
+            semantic_output,
             config,
             progress=progress,
         )
+        if not plan.finalization_required and (conversion_is_final or resampling_is_final):
+            publish_staging(
+                current,
+                final_target,
+                "pipeline",
+                overwrite=config.general.overwrite,
+                require_zarr_v3=True,
+            )
+            current = final_target
+            stage_name = "resampling" if resampling_is_final else "conversion"
+            manifest["stages"][stage_name]["status"] = "published_as_final"
         manifest["semantic_validation"] = semantic_validation
         final_logical_bytes = _logical_output_bytes(plan)
         temporary_logical_writes = 0

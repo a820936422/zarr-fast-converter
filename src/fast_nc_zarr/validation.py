@@ -194,11 +194,15 @@ def validate_output(
                             pass
                         mask |= raw == value
                 out_dtype = raw.dtype
-                if transform.scale_factor is not None and raw.dtype.kind not in "fc":
+                if (
+                    transform.scale_factor is not None or transform.add_offset is not None
+                ) and raw.dtype.kind not in "fc":
                     out_dtype = np.dtype("float32" if raw.dtype.itemsize <= 4 else "float64")
                 expected = raw.astype(out_dtype, copy=True)
                 if transform.scale_factor is not None:
                     expected[~mask] *= transform.scale_factor
+                if transform.add_offset is not None:
+                    expected[~mask] += transform.add_offset
                 if mask.any():
                     if transform.output_fill is not None:
                         expected[mask] = transform.output_fill

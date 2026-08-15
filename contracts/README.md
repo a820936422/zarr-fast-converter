@@ -1,4 +1,4 @@
-# v1.7.2 IPC contract
+# v1.7.4 IPC contract
 
 Protocol version: `1`.
 
@@ -9,7 +9,7 @@ Transport boundaries:
 - Human-readable diagnostics go to stderr; stdout is JSONL only.
 - Large arrays and task products are addressed by filesystem paths, never embedded
   in an IPC response.
-- `manifest.json` remains pipeline schema 6 and is independent of this protocol.
+- `manifest.json` uses pipeline schema 7 and is independent of this protocol.
 
 ## Request envelope
 
@@ -23,7 +23,7 @@ Transport boundaries:
 }
 ```
 
-Supported commands:
+Tauri command set:
 
 - `get_capabilities`
 - `inspect_source`
@@ -34,8 +34,14 @@ Supported commands:
 - `run_pipeline`
 - `resume_pipeline`
 - `cancel_task`
-- `native_task`（由 Tauri Rust native runtime 执行，不转发给 Python worker）
+- `native_task`（仅由 Tauri Rust native runtime 执行）
 - `shutdown`
+
+The Python worker receives only `get_capabilities`, `inspect_source`,
+`inspect_zarr`, `inspect_time_metadata`, `save_inspection_snapshot`,
+`preview_pipeline`, `run_pipeline`, `resume_pipeline`, and `shutdown`.
+`native_task` and `cancel_task` are desktop-side commands and MUST NOT be
+forwarded to the Python worker.
 
 ## Event envelope
 
@@ -87,7 +93,7 @@ Error kinds are `invalid_request`, `path_not_found`, `permission_denied`,
 `validation_failed`, `publication_failed`, and `unknown`.
 ## Backend capability report
 
-The v1.7.2 native-first migration keeps protocol version `1` and adds a structured
+The v1.7.4 native-first migration keeps protocol version `1` and adds a structured
 capability report. Its canonical schema is
 [`capability-v1.schema.json`](capability-v1.schema.json).
 

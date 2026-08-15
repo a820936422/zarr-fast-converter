@@ -1,6 +1,6 @@
 [workspace]
 name = "fast-nc-zarr"
-version = "1.7.3"
+version = "1.7.4"
 description = "Reproducible development environment for the fast Zarr converter"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
@@ -45,9 +45,9 @@ native-check = "python scripts/check_native_environment.py"
 native-develop = "CFLAGS=-std=gnu17 maturin develop --release --skip-install"
 native-build = "CFLAGS=-std=gnu17 maturin build --release"
 rust-test = "CFLAGS=-std=gnu17 cargo test --workspace --exclude fast-nc-zarr-desktop"
+rust-desktop-test = "CFLAGS=-std=gnu17 cargo test -p fast-nc-zarr-desktop --lib"
 rust-fmt-check = "cargo fmt --all -- --check"
 rust-clippy = "CFLAGS=-std=gnu17 cargo clippy --workspace --exclude fast-nc-zarr-desktop --all-targets -- -D warnings"
-cross-backend-test = "CFLAGS=-std=gnu17 maturin develop --release --skip-install && python -m pytest -q tests/test_native_smoke.py"
 desktop-install = "npm --prefix apps/desktop ci"
 desktop-typecheck = "npm --prefix apps/desktop run typecheck"
 desktop-build = "npm --prefix apps/desktop run build"

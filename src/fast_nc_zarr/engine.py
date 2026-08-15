@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .metadata import sanitize_cf_references
 from .benchmark import COMPRESSION_SAFETY, tune
 from .models import ConversionPlan, Inventory, OutputLayout, Selection, VariableTransform
 from .planner import (
@@ -123,10 +124,13 @@ def _dask_write(
                 mask = variable.isin(finite_values) if finite_values else xr.zeros_like(variable, dtype=bool)
                 if has_nan:
                     mask = mask | variable.isnull()
-            if transform.scale_factor is not None:
+            if transform.scale_factor is not None or transform.add_offset is not None:
                 if variable.dtype.kind not in "fc":
                     variable = variable.astype("float32" if variable.dtype.itemsize <= 4 else "float64")
-                variable = variable * transform.scale_factor
+                if transform.scale_factor is not None:
+                    variable = variable * transform.scale_factor
+                if transform.add_offset is not None:
+                    variable = variable + transform.add_offset
                 if mask is not None:
                     variable = variable.where(~mask)
             elif mask is not None:
@@ -148,6 +152,9 @@ def _dask_write(
                 attrs["missing_value"] = replacement
             if transform.scale_factor is not None:
                 attrs["source_scale_factor"] = transform.scale_factor
+            if transform.add_offset is not None:
+                attrs["source_add_offset"] = transform.add_offset
+            if transform.scale_factor is not None or transform.add_offset is not None:
                 attrs.pop("scale_factor", None)
                 attrs.pop("add_offset", None)
             ds[name].attrs = attrs
@@ -160,6 +167,7 @@ def _dask_write(
         }
         if rename_map:
             ds = ds.rename(rename_map)
+        ds = sanitize_cf_references(ds, renames=rename_map)
 
         if output_layout is not None:
             reversals = {

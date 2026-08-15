@@ -1,6 +1,6 @@
 # 模块文档
 
-本文档目录按可执行模块组织，描述当前 v1.7.3 功能、使用方式和边界，以及 v1.7.3 的正式开发方案。项目总览、环境安装和快速示例见根目录 [README](../README.md)。
+本文档目录按可执行模块组织，描述当前 v1.7.4 功能、使用方式和边界，以及 v1.7.4 的正式开发方案。项目总览、环境安装和快速示例见根目录 [README](../README.md)。
 
 | 模块 | 作用 | 入口 |
 |---|---|---|
@@ -10,6 +10,7 @@
 | [重分块与重压缩](rechunking.md) | 调整 Zarr v3 chunks 和无损 codec | `pixi run rechunk` |
 | [Tauri 桌面应用](gui.md) | React + TypeScript 工作台、Tauri commands、任务中心和恢复 | `pixi run gui` |
 | [真实源数据校验](raw-validation.md) | 批量检查数据集目录，抽样源值并可执行小范围转换 | `pixi run validate-raw` |
+| [全面代码审查报告](comprehensive-code-audit-2026-08-15.md) | v1.7.3 基线代码功能、数据正确性、安全性、任务可靠性与发布流程审查 | `docs/comprehensive-code-audit-2026-08-15.md` |
 
 ## 共通约定
 
@@ -25,6 +26,5 @@
 首次处理源文件：先读 [源数据转换](converter.md)，再读 [一条龙处理](pipeline.md)。只处理现有 Zarr 时，直接阅读 [空间重采样](resampling.md) 和 [重分块与重压缩](rechunking.md)。批量接入真实数据前，使用 [真实源数据校验](raw-validation.md) 建立兼容性报告。
 
 ## 当前架构
-
-- [v1.7.3 开发方案](v1.7.3-development-plan.md)
+- [v1.7.4 开发方案](v1.7.4-development-plan.md)
 - [IPC contracts](../contracts/README.md)

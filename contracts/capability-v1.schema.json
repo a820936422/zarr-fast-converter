@@ -33,7 +33,12 @@
           "type": "array",
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
-        }
+        },
+        "backend": {"type": "string", "minLength": 1},
+        "fallback_reason": {"type": ["string", "null"]},
+        "supports_cancel": {"type": "boolean"},
+        "commit_state": {"type": "string", "minLength": 1},
+        "resource_budget": {"type": "object"}
       }
     }
   }

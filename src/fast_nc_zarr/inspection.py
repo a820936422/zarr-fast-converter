@@ -94,6 +94,8 @@ def _clean_attr(value: Any) -> Any:
     return value
 
 
+_SUPPORTED_CALENDARS = frozenset({"", "standard", "gregorian", "proleptic_gregorian", "julian"})
+
 def _normalize_daily_times(values: tuple[Any, ...], path: Path | None = None) -> tuple[np.datetime64, ...]:
     """Normalize source timestamps to midnight dates.
 
@@ -104,6 +106,13 @@ def _normalize_daily_times(values: tuple[Any, ...], path: Path | None = None) ->
     """
     normalized: list[np.datetime64] = []
     for value in values:
+        calendar = str(getattr(value, "calendar", "")).strip().lower()
+        if calendar not in _SUPPORTED_CALENDARS:
+            location = f" in {path.name}" if path is not None else ""
+            raise ValueError(
+                f"当前 native/兼容时间轴不支持 calendar={calendar!r}{location}；"
+                "请使用标准 Gregorian calendar 或显式预处理。"
+            )
         try:
             stamp = np.datetime64(value, "ns")
             if np.isnat(stamp):

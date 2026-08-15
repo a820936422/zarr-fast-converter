@@ -67,6 +67,7 @@ def _transform(value: dict[str, Any]) -> VariableTransform:
     return VariableTransform(
         fill_values=tuple(fills) if fills is not None else None,
         scale_factor=value.get("scale_factor"),
+        add_offset=value.get("add_offset"),
         output_fill=value.get("output_fill"),
     )
 
@@ -91,7 +92,7 @@ def _restore_config(
     resampling = dict(data.get("resampling") or {})
     chunking = dict(data.get("chunking") or {})
     compression = dict(data.get("compression") or {})
-    output_text = str(general.get("output") or payload.get("output") or "").strip()
+    output_text = str(payload.get("output") or general.get("output") or "").strip()
     if not output_text:
         raise PipelineRecoveryError("任务清单缺少最终输出路径。")
     remaining_resample = bool(operations.get("resample")) and checkpoint_stage == "conversion"

@@ -85,6 +85,13 @@ def preflight_writable(path: Path, operation: str) -> dict[str, object]:
 def make_staging_path(target: Path, operation: str) -> Path:
     return target.parent / f".{target.name}.{operation}-{uuid4().hex}.tmp"
 
+def _entry_identity(path: Path) -> tuple[int, int, int] | None:
+    try:
+        stat_result = path.lstat()
+    except FileNotFoundError:
+        return None
+    return (stat_result.st_dev, stat_result.st_ino, stat_result.st_mode)
+
 
 def publish_staging(
     staging: Path,
@@ -96,9 +103,11 @@ def publish_staging(
 ) -> None:
     """Atomically publish a validated directory and restore on rename failure."""
 
-    if not staging.is_dir():
-        raise FileNotFoundError(f"待发布的临时目录不存在：{staging}")
-    # Repeat target validation immediately before the rename.  Long-running
+    if not staging.is_dir() or staging.is_symlink():
+        raise FileNotFoundError(f"待发布的临时目录不存在或不安全：{staging}")
+    if staging.parent.stat().st_dev != target.parent.stat().st_dev:
+        raise OSError("staging 与 output 必须位于同一文件系统")
+    # Repeat target validation immediately before the rename. Long-running
     # conversions must not overwrite an unrelated directory that appeared
     # after the initial preflight check.
     target = validate_publish_target(
@@ -107,8 +116,15 @@ def publish_staging(
         operation=operation,
         require_zarr_v3=require_zarr_v3,
     )
+    target_identity = _entry_identity(target)
+    if target_identity is not None and target_identity[2] & 0o170000 == 0o120000:
+        raise ValueError(f"拒绝发布到符号链接：{target}")
+    if _entry_identity(target) != target_identity:
+        raise RuntimeError(f"发布目标在校验期间发生变化：{target}")
     backup: Path | None = None
     if target.exists():
+        if _entry_identity(target) != target_identity:
+            raise RuntimeError(f"发布目标在替换前发生变化：{target}")
         backup = target.parent / f".{target.name}.{operation}-backup-{uuid4().hex}"
         os.replace(target, backup)
     try:

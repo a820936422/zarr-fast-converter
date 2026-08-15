@@ -1,6 +1,16 @@
 use serde::{Deserialize, Serialize};
 
 pub const BACKEND_PROTOCOL_VERSION: u32 = 1;
+pub const DESKTOP_NATIVE_OPERATIONS: &[&str] = &[
+    "zarr.inspect",
+    "raw.netcdf.inspect",
+    "raw.netcdf.convert",
+    "resample.nearest",
+    "resample.bilinear",
+    "zarr.rechunk_f32",
+    "zarr.rechunk_multi",
+    "zarr.write_f64",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationCapability {
@@ -129,6 +139,55 @@ pub struct RechunkMetrics {
 }
 
 impl BackendCapability {
+    pub fn desktop() -> Self {
+        let operations = DESKTOP_NATIVE_OPERATIONS
+            .iter()
+            .map(|operation| (*operation).to_owned())
+            .collect::<Vec<_>>();
+        let capabilities = DESKTOP_NATIVE_OPERATIONS
+            .iter()
+            .map(|operation| {
+                let limitations: &[&str] = match *operation {
+                    "zarr.inspect" => &["Zarr v3 directory store"],
+                    "raw.netcdf.inspect" => &[
+                        "NetCDF-4/classic",
+                        "time/lat/lon dimensions",
+                        "numeric standard coordinates",
+                    ],
+                    "raw.netcdf.convert" => &[
+                        "NetCDF-4/classic",
+                        "float32/float64 data variables",
+                        "staged Zarr v3 output",
+                    ],
+                    "resample.nearest" | "resample.bilinear" => &[
+                        "float32",
+                        "regular latitude/longitude grids",
+                        "NaN outside source bounds",
+                    ],
+                    "zarr.rechunk_f32" => &[
+                        "single float32 data variable",
+                        "staged output",
+                        "cooperative cancellation",
+                    ],
+                    "zarr.rechunk_multi" => &[
+                        "float32, float64 and standard integer data variables",
+                        "staged output",
+                        "cooperative cancellation",
+                    ],
+                    "zarr.write_f64" => &["float64 arrays", "staged Zarr v3 output"],
+                    _ => &[],
+                };
+                OperationCapability::supported(operation, limitations)
+            })
+            .collect::<Vec<_>>();
+        Self {
+            backend: "rust".to_owned(),
+            protocol_version: BACKEND_PROTOCOL_VERSION,
+            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+            operations,
+            capabilities,
+        }
+    }
     pub fn smoke() -> Self {
         let supported = [
             ("probe", &[][..]),

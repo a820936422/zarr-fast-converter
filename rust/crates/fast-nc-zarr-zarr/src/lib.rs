@@ -83,6 +83,7 @@ fn open_array(root: &Path, array_path: &str) -> Result<ArrayStore> {
             root.display()
         )));
     }
+    array_relative_path(array_path)?;
     let store = Arc::new(FilesystemStore::new(root).map_err(ZarrError::from_display)?);
     Array::open(store, &normalise_array_path(array_path)).map_err(ZarrError::from_display)
 }
@@ -109,10 +110,45 @@ fn array_relative_path(array_path: &str) -> Result<PathBuf> {
     Ok(relative.to_path_buf())
 }
 
+fn canonical_path_for_overlap(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut cursor = path.to_path_buf();
+    while !cursor.exists() {
+        if let Some(name) = cursor.file_name().map(|value| value.to_os_string()) {
+            missing.push(name);
+        }
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        cursor = parent.to_path_buf();
+    }
+    let mut resolved = cursor.canonicalize().unwrap_or(cursor);
+    for name in missing.iter().rev() {
+        resolved.push(name);
+    }
+    resolved
+}
+
+fn stores_overlap(source: &Path, target: &Path) -> bool {
+    let source = canonical_path_for_overlap(source);
+    let target = canonical_path_for_overlap(target);
+    source == target || source.starts_with(&target) || target.starts_with(&source)
+}
+
 fn cancellation_requested(plan: &RechunkExecutionPlan) -> bool {
     plan.cancellation_file
         .as_deref()
         .is_some_and(|path| Path::new(path).is_file())
+}
+
+fn validate_codec_shuffle(value: &str) -> Result<()> {
+    if matches!(value, "" | "auto" | "noshuffle" | "shuffle" | "bitshuffle") {
+        Ok(())
+    } else {
+        Err(ZarrError::message(format!(
+            "unsupported Rust codec shuffle: {value}"
+        )))
+    }
 }
 
 fn report_progress(
@@ -395,6 +431,7 @@ pub fn write_f64_array(
         return Err(ZarrError::message("shape and chunks must be positive"));
     }
     let root = root.as_ref();
+    array_relative_path(array_path)?;
     if root.exists() {
         if !root.is_dir() {
             return Err(ZarrError::message(format!(
@@ -572,6 +609,7 @@ pub fn write_f32_array(
         return Err(ZarrError::message("shape and chunks must be positive"));
     }
     let root = root.as_ref();
+    array_relative_path(array_path)?;
     if root.exists() {
         if !root.is_dir() {
             return Err(ZarrError::message(format!(
@@ -645,6 +683,8 @@ pub fn write_f32_array(
 }
 
 pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> {
+    array_relative_path(&plan.array_path)?;
+    validate_codec_shuffle(&plan.codec_shuffle)?;
     if plan.expected_dtype != "float32" {
         return Err(ZarrError::message(format!(
             "P3 Rust rechunk backend only supports expected_dtype=float32, got {}",
@@ -714,6 +754,11 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
     };
 
     let target_root = Path::new(&plan.target);
+    if stores_overlap(source_root, target_root) {
+        return Err(ZarrError::message(
+            "source and target Zarr stores cannot overlap or nest",
+        ));
+    }
     copy_store_without_array(source_root, target_root, &plan.array_path)?;
     let target_store =
         Arc::new(FilesystemStore::new(target_root).map_err(ZarrError::from_display)?);
@@ -742,7 +787,13 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
                         let shuffle = match plan.codec_shuffle.as_str() {
                             "bitshuffle" => zarrs::array::codec::BloscShuffleMode::BitShuffle,
                             "shuffle" | "auto" => zarrs::array::codec::BloscShuffleMode::Shuffle,
-                            _ => zarrs::array::codec::BloscShuffleMode::NoShuffle,
+                            "noshuffle" | "" => zarrs::array::codec::BloscShuffleMode::NoShuffle,
+                            _ => {
+                                return Err(ZarrError::message(format!(
+                                    "unsupported Rust codec shuffle: {}",
+                                    plan.codec_shuffle
+                                )))
+                            }
                         };
                         std::sync::Arc::new(
                             zarrs::array::codec::BloscCodec::new(
@@ -865,6 +916,8 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
 }
 
 pub fn rechunk_f64_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> {
+    array_relative_path(&plan.array_path)?;
+    validate_codec_shuffle(&plan.codec_shuffle)?;
     if plan.expected_dtype != "float64" {
         return Err(ZarrError::message(format!(
             "P3 Rust float64 rechunk requires expected_dtype=float64, got {}",
@@ -929,6 +982,11 @@ pub fn rechunk_f64_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
         (plan.memory_budget_bytes / peak_bytes_per_worker.max(1)).max(1)
     };
     let target_root = Path::new(&plan.target);
+    if stores_overlap(source_root, target_root) {
+        return Err(ZarrError::message(
+            "source and target Zarr stores cannot overlap or nest",
+        ));
+    }
     if target_root.exists() {
         return Err(ZarrError::message(format!(
             "refusing to overwrite existing target store: {}",
@@ -1114,7 +1172,13 @@ fn configure_rechunk_codecs(builder: &mut ArrayBuilder, plan: &RechunkExecutionP
                 let shuffle = match plan.codec_shuffle.as_str() {
                     "bitshuffle" => zarrs::array::codec::BloscShuffleMode::BitShuffle,
                     "shuffle" | "auto" => zarrs::array::codec::BloscShuffleMode::Shuffle,
-                    _ => zarrs::array::codec::BloscShuffleMode::NoShuffle,
+                    "noshuffle" | "" => zarrs::array::codec::BloscShuffleMode::NoShuffle,
+                    _ => {
+                        return Err(ZarrError::message(format!(
+                            "unsupported Rust codec shuffle: {}",
+                            plan.codec_shuffle
+                        )))
+                    }
                 };
                 vec![std::sync::Arc::new(
                     zarrs::array::codec::BloscCodec::new(
@@ -1295,7 +1359,12 @@ fn rechunk_array_into(
         "uint16" => process_chunks!(u16),
         "uint32" => process_chunks!(u32),
         "uint64" => process_chunks!(u64),
-        _ => unreachable!("unsupported dtype validated before chunk processing"),
+        _ => {
+            return Err(ZarrError::message(format!(
+                "unsupported dtype validated before chunk processing: {}",
+                plan.expected_dtype
+            )))
+        }
     }?;
     if cancellation_requested(plan) {
         return Err(ZarrError::message("任务已取消"));
@@ -1331,6 +1400,7 @@ pub fn rechunk_multi_array(plan: &MultiRechunkExecutionPlan) -> Result<MultiRech
             "multi-variable rechunk requires at least one variable",
         ));
     }
+    validate_codec_shuffle(&plan.codec_shuffle)?;
     let source_root = Path::new(&plan.source);
     let target_root = Path::new(&plan.target);
     if !source_root.is_dir() {
@@ -1482,4 +1552,54 @@ pub fn rechunk_multi_array(plan: &MultiRechunkExecutionPlan) -> Result<MultiRech
         let _ = fs::remove_dir_all(target_root);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_paths_reject_parent_traversal_and_root() {
+        assert!(array_relative_path("../escape").is_err());
+        assert!(array_relative_path("/../escape").is_err());
+        assert!(array_relative_path("/").is_err());
+        assert_eq!(
+            array_relative_path("temperature").unwrap(),
+            PathBuf::from("temperature")
+        );
+    }
+
+    #[test]
+    fn rechunk_store_overlap_detects_nested_targets() {
+        assert!(stores_overlap(
+            Path::new("/tmp/fast-nc-zarr-source"),
+            Path::new("/tmp/fast-nc-zarr-source/target"),
+        ));
+        assert!(!stores_overlap(
+            Path::new("/tmp/fast-nc-zarr-source"),
+            Path::new("/tmp/fast-nc-zarr-target"),
+        ));
+    }
+
+    #[test]
+    fn rechunk_rejects_unknown_codec_shuffle() {
+        let plan = RechunkExecutionPlan {
+            source: "/tmp/missing-source.zarr".to_string(),
+            target: "/tmp/missing-target.zarr".to_string(),
+            array_path: "/value".to_string(),
+            target_chunks: vec![1, 1, 1],
+            expected_dtype: "float32".to_string(),
+            requested_workers: 1,
+            worker_ceiling: 1,
+            memory_budget_bytes: 0,
+            codec_concurrent_target: 1,
+            codec: "none".to_string(),
+            codec_level: None,
+            codec_shuffle: "typo".to_string(),
+            cancellation_file: None,
+            progress_file: None,
+        };
+        let error = rechunk_f32_array(&plan).expect_err("unknown shuffle must be rejected");
+        assert!(error.to_string().contains("unsupported Rust codec shuffle"));
+    }
 }

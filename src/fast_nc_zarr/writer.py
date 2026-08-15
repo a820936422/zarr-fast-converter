@@ -167,6 +167,7 @@ def _apply_transform(
     data: np.ndarray,
     fill_values: tuple[float, ...] | None,
     scale_factor: float | None,
+    add_offset: float | None,
     output_fill: float | int | None,
     output_dtype: str,
 ) -> np.ndarray:
@@ -175,7 +176,8 @@ def _apply_transform(
     needs_mask = bool(fill_values)
     needs_cast = raw.dtype != target_dtype
     needs_scale = scale_factor is not None
-    if not needs_mask and not needs_cast and not needs_scale:
+    needs_offset = add_offset is not None
+    if not needs_mask and not needs_cast and not needs_scale and not needs_offset:
         return raw if raw.flags.c_contiguous else np.ascontiguousarray(raw)
 
     mask = np.zeros(raw.shape, dtype=bool) if needs_mask else None
@@ -188,12 +190,20 @@ def _apply_transform(
             except TypeError:
                 pass
             mask |= raw == value
-    result = raw.astype(target_dtype, copy=needs_cast or needs_scale or mask is not None)
+    result = raw.astype(
+        target_dtype,
+        copy=needs_cast or needs_scale or needs_offset or mask is not None,
+    )
     if needs_scale:
         if mask is not None and mask.any():
             result[~mask] *= scale_factor
         else:
             result *= scale_factor
+    if needs_offset:
+        if mask is not None and mask.any():
+            result[~mask] += add_offset
+        else:
+            result += add_offset
     if mask is not None and mask.any():
         if output_fill is None:
             raise ValueError("缺少整型变量的输出缺失值。")
@@ -247,6 +257,7 @@ class ChunkTask:
     segments: tuple[SourceSegment, ...]
     fill_values: tuple[float, ...] | None = None
     scale_factor: float | None = None
+    add_offset: float | None = None
     output_fill: float | int | None = None
     source_dtype: str | None = None
     output_variable: str | None = None
@@ -341,7 +352,11 @@ def initialize_zarr(
             )
             transform = variable_transforms.get(name)
             output_dtype = np.dtype(inventory.variables[name].dtype)
-            if transform is not None and transform.scale_factor is not None and output_dtype.kind not in "fc":
+            if (
+                transform is not None
+                and (transform.scale_factor is not None or transform.add_offset is not None)
+                and output_dtype.kind not in "fc"
+            ):
                 output_dtype = np.dtype("float32" if output_dtype.itemsize <= 4 else "float64")
             output_fill = None
             if transform is not None and transform.output_fill is not None:
@@ -381,6 +396,9 @@ def initialize_zarr(
                 attrs["missing_value"] = output_fill
             if transform is not None and transform.scale_factor is not None:
                 attrs["source_scale_factor"] = transform.scale_factor
+            if transform is not None and transform.add_offset is not None:
+                attrs["source_add_offset"] = transform.add_offset
+            if transform is not None and (transform.scale_factor is not None or transform.add_offset is not None):
                 attrs.pop("scale_factor", None)
                 attrs.pop("add_offset", None)
             shape = tuple(
@@ -496,6 +514,7 @@ def _write_chunk(task: ChunkTask) -> int:
         data,
         task.fill_values,
         task.scale_factor,
+        task.add_offset,
         task.output_fill,
         task.dtype,
     )
@@ -574,7 +593,11 @@ def _chunk_task(
     ranges_by_dim = {"time": (t0, t1), "lat": (y0, y1), "lon": (x0, x1)}
     transform = (variable_transforms or {}).get(name)
     output_dtype = spec.dtype
-    if transform is not None and transform.scale_factor is not None and np.dtype(output_dtype).kind not in "fc":
+    if (
+        transform is not None
+        and (transform.scale_factor is not None or transform.add_offset is not None)
+        and np.dtype(output_dtype).kind not in "fc"
+    ):
         output_dtype = "float32" if np.dtype(output_dtype).itemsize <= 4 else "float64"
     output_fill = None
     if transform is not None and transform.output_fill is not None:
@@ -609,6 +632,7 @@ def _chunk_task(
         segments=_segments(lookup, t0, t1),
         fill_values=transform.fill_values if transform is not None else None,
         scale_factor=transform.scale_factor if transform is not None else None,
+        add_offset=transform.add_offset if transform is not None else None,
         output_fill=output_fill,
         source_dtype=spec.dtype,
         reverse_lat=reverse_lat,

@@ -1,9 +1,12 @@
 use std::fs;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use fast_nc_zarr_model::{MultiRechunkExecutionPlan, RechunkExecutionPlan};
+use fast_nc_zarr_model::{
+    MultiRechunkExecutionPlan, RechunkExecutionPlan, DESKTOP_NATIVE_OPERATIONS,
+};
 use fast_nc_zarr_zarr::{
     convert_netcdf_to_zarr, inspect_array, inspect_netcdf, rechunk_f32_array, rechunk_multi_array,
     resample_f32, write_f64_array, ResampleF32Request,
@@ -18,16 +21,9 @@ use crate::tasks::{
     cancellation_path, emit_task_event, new_request, now_seconds, progress_path, TaskRegistry,
     TaskRequest, TaskStatus, TaskSummary,
 };
-const NATIVE_OPERATIONS: &[&str] = &[
-    "zarr.inspect",
-    "raw.netcdf.inspect",
-    "raw.netcdf.convert",
-    "resample.nearest",
-    "resample.bilinear",
-    "zarr.rechunk_f32",
-    "zarr.rechunk_multi",
-    "zarr.write_f64",
-];
+
+const MAX_NATIVE_VECTOR_ITEMS: usize = 1024;
+const MAX_NATIVE_ARRAY_VALUES: usize = 4_000_000;
 
 #[tauri::command]
 pub fn start_native_task(
@@ -72,30 +68,39 @@ pub fn start_native_task(
         resource: Some(resource.clone()),
     })?;
 
-    let registry = registry.inner().clone();
+    let task_registry = registry.inner().clone();
+    let worker_registry = task_registry.clone();
     let operation = request.operation;
     let task_key = task_id.clone();
     let thread_name = format!("native-{operation}-{task_id}");
-    thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            run_native_task(
-                app,
-                registry,
-                task_key,
-                envelope,
-                operation,
-                cancellation_file,
-                progress_file,
-                resource,
-            );
-        })
-        .map_err(|error| AppError::new(ErrorKind::WorkerStartFailed, error.to_string()))?;
+    let spawn_result = thread::Builder::new().name(thread_name).spawn(move || {
+        run_native_task(
+            app,
+            worker_registry,
+            task_key,
+            envelope,
+            operation,
+            cancellation_file,
+            progress_file,
+            resource,
+        );
+    });
+    if let Err(error) = spawn_result {
+        let _ = task_registry.update_failure(
+            &task_id,
+            AppError::new(ErrorKind::WorkerStartFailed, error.to_string()),
+        );
+        let _ = fs::remove_file(cancellation_path(&task_id));
+        return Err(AppError::new(
+            ErrorKind::WorkerStartFailed,
+            error.to_string(),
+        ));
+    }
     Ok(task_id)
 }
 
 fn validate_operation(operation: &str) -> Result<(), AppError> {
-    if NATIVE_OPERATIONS.contains(&operation) {
+    if DESKTOP_NATIVE_OPERATIONS.contains(&operation) {
         Ok(())
     } else {
         Err(AppError::new(
@@ -154,7 +159,7 @@ fn run_native_task(
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     let _ = emit("resource", "resources", resource_payload);
-    let result = match operation.as_str() {
+    let result = catch_unwind(AssertUnwindSafe(|| match operation.as_str() {
         "zarr.inspect" => native_inspect(&request.payload),
         "raw.netcdf.inspect" => native_netcdf_inspect(&request.payload),
         "raw.netcdf.convert" => native_netcdf_convert(&request.payload),
@@ -176,12 +181,27 @@ fn run_native_task(
             ErrorKind::BackendUnavailable,
             format!("native operation is not available: {operation}"),
         )),
-    };
+    }))
+    .unwrap_or_else(|_| {
+        Err(AppError::new(
+            ErrorKind::Unknown,
+            "native task panicked while processing input",
+        )
+        .at_stage("native"))
+    });
 
     drop(emit);
     let terminal = match result {
-        Ok(payload) => make_event(&request, &mut sequence, "finished", "native", payload),
-        Err(error) if cancellation_file.is_file() || error.kind == ErrorKind::Cancelled => {
+        Ok(mut payload) => {
+            if cancellation_file.is_file() {
+                payload.insert(
+                    "cancel_requested_after_commit".to_string(),
+                    Value::Bool(true),
+                );
+            }
+            make_event(&request, &mut sequence, "finished", "native", payload)
+        }
+        Err(error) if error.kind == ErrorKind::Cancelled => {
             let mut payload = Map::new();
             payload.insert("reason".to_string(), Value::String(error.message));
             make_event(&request, &mut sequence, "cancelled", "native", payload)
@@ -274,6 +294,36 @@ fn native_resample(payload: &Map<String, Value>) -> Result<Map<String, Value>, A
         .map_err(|error| {
             AppError::new(ErrorKind::InvalidRequest, error.to_string()).at_stage("resampling")
         })?;
+    if request.values.len() > MAX_NATIVE_ARRAY_VALUES {
+        return Err(AppError::new(
+            ErrorKind::ResourceBudgetExceeded,
+            format!(
+                "native resample input exceeds {} values",
+                MAX_NATIVE_ARRAY_VALUES
+            ),
+        )
+        .at_stage("resources"));
+    }
+    let output_values = request.shape[0]
+        .checked_mul(request.target_lat.len())
+        .and_then(|value| value.checked_mul(request.target_lon.len()))
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorKind::ResourceBudgetExceeded,
+                "native resample output cardinality overflows usize",
+            )
+            .at_stage("resources")
+        })?;
+    if output_values > MAX_NATIVE_ARRAY_VALUES {
+        return Err(AppError::new(
+            ErrorKind::ResourceBudgetExceeded,
+            format!(
+                "native resample output exceeds {} values",
+                MAX_NATIVE_ARRAY_VALUES
+            ),
+        )
+        .at_stage("resources"));
+    }
     let result = resample_f32(&request)
         .map_err(|error| AppError::new(ErrorKind::InputInvalid, error).at_stage("resampling"))?;
     let mut output = Map::new();
@@ -288,20 +338,59 @@ fn native_resample(payload: &Map<String, Value>) -> Result<Map<String, Value>, A
     );
     Ok(output)
 }
+fn path_entry_exists(path: &Path) -> bool {
+    path.exists() || fs::symlink_metadata(path).is_ok()
+}
+
 fn native_write_f64(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
     let root = required_string(payload, "path")?;
     let array_path = required_string(payload, "array_path")?;
     let shape = required_u64_vec(payload, "shape")?;
     let chunks = required_u64_vec(payload, "chunks")?;
     let values = required_f64_vec(payload, "values")?;
-    if Path::new(&root).exists() {
+    let target = PathBuf::from(&root);
+    if path_entry_exists(&target) {
         return Err(AppError::new(
             ErrorKind::PublicationFailed,
             format!("native task refuses an existing target: {root}"),
         )
         .at_stage("native"));
     }
-    write_f64_array(&root, &array_path, &shape, &chunks, &values).map_err(|error| {
+    let staging = native_staging_path(&target, "native-write");
+    if path_entry_exists(&staging) {
+        return Err(AppError::new(
+            ErrorKind::PublicationFailed,
+            format!("native staging path already exists: {}", staging.display()),
+        )
+        .at_stage("native"));
+    }
+    if let Err(error) = write_f64_array(&staging, &array_path, &shape, &chunks, &values) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(
+            AppError::new(ErrorKind::PublicationFailed, error.to_string()).at_stage("native"),
+        );
+    }
+    if !staging.join("zarr.json").is_file() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(AppError::new(
+            ErrorKind::PublicationFailed,
+            "native write did not produce a Zarr v3 group",
+        )
+        .at_stage("native"));
+    }
+    if path_entry_exists(&target) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(AppError::new(
+            ErrorKind::PublicationFailed,
+            format!(
+                "native target appeared during publish: {}",
+                target.display()
+            ),
+        )
+        .at_stage("native"));
+    }
+    fs::rename(&staging, &target).map_err(|error| {
+        let _ = fs::remove_dir_all(&staging);
         AppError::new(ErrorKind::PublicationFailed, error.to_string()).at_stage("native")
     })?;
     let mut output = Map::new();
@@ -336,7 +425,7 @@ where
             AppError::new(ErrorKind::InvalidRequest, error.to_string()).at_stage("native")
         })?;
     let target = PathBuf::from(&plan.target);
-    if target.exists() {
+    if path_entry_exists(&target) {
         return Err(AppError::new(
             ErrorKind::PublicationFailed,
             format!(
@@ -346,6 +435,15 @@ where
         )
         .at_stage("native"));
     }
+    let staging = native_staging_path(&target, "native-rechunk");
+    if path_entry_exists(&staging) {
+        return Err(AppError::new(
+            ErrorKind::PublicationFailed,
+            format!("native staging path already exists: {}", staging.display()),
+        )
+        .at_stage("native"));
+    }
+    plan.target = staging.to_string_lossy().into_owned();
     plan.cancellation_file = Some(cancellation_file.to_string_lossy().into_owned());
     plan.progress_file = progress_file.map(|path| path.to_string_lossy().into_owned());
     let progress_path = progress_file.map(Path::to_path_buf);
@@ -367,10 +465,29 @@ where
         .join()
         .map_err(|_| AppError::new(ErrorKind::Unknown, "native task thread panicked"))?;
     if cancellation_file.is_file() || result.is_err() {
-        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&staging);
     }
-    let metrics = result
+    if cancellation_file.is_file() {
+        return Err(AppError::new(ErrorKind::Cancelled, "任务已取消").at_stage("native"));
+    }
+    let mut metrics = result
         .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()).at_stage("native"))?;
+    if path_entry_exists(&target) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(AppError::new(
+            ErrorKind::PublicationFailed,
+            format!(
+                "native target appeared during publish: {}",
+                target.display()
+            ),
+        )
+        .at_stage("native"));
+    }
+    fs::rename(&staging, &target).map_err(|error| {
+        let _ = fs::remove_dir_all(&staging);
+        AppError::new(ErrorKind::PublicationFailed, error.to_string()).at_stage("native")
+    })?;
+    metrics.output = target.to_string_lossy().into_owned();
     if let Some(progress) = read_progress(progress_path.as_deref()) {
         if last_progress != Some(progress) {
             let mut payload = Map::new();
@@ -391,12 +508,16 @@ where
     );
     Ok(output)
 }
-fn native_multi_staging_path(target: &Path) -> PathBuf {
+fn native_staging_path(target: &Path, label: &str) -> PathBuf {
     let name = target
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("output");
-    target.with_file_name(format!(".{name}.native-multi-{}.tmp", uuid::Uuid::new_v4()))
+    target.with_file_name(format!(".{name}.{label}-{}.tmp", uuid::Uuid::new_v4()))
+}
+
+fn native_multi_staging_path(target: &Path) -> PathBuf {
+    native_staging_path(target, "native-multi")
 }
 
 fn native_rechunk_multi<F>(
@@ -413,7 +534,7 @@ where
             AppError::new(ErrorKind::InvalidRequest, error.to_string()).at_stage("native")
         })?;
     let target = PathBuf::from(&plan.target);
-    if target.exists() {
+    if path_entry_exists(&target) {
         return Err(AppError::new(
             ErrorKind::PublicationFailed,
             format!(
@@ -453,7 +574,7 @@ where
     }
     let mut metrics = result
         .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()).at_stage("native"))?;
-    if target.exists() {
+    if path_entry_exists(&target) {
         let _ = fs::remove_dir_all(&staging);
         return Err(AppError::new(
             ErrorKind::PublicationFailed,
@@ -511,6 +632,13 @@ fn required_u64_vec(payload: &Map<String, Value>, key: &str) -> Result<Vec<u64>,
     let values = payload.get(key).and_then(Value::as_array).ok_or_else(|| {
         AppError::new(ErrorKind::InvalidRequest, format!("{key} must be an array"))
     })?;
+    if values.len() > MAX_NATIVE_VECTOR_ITEMS {
+        return Err(AppError::new(
+            ErrorKind::ResourceBudgetExceeded,
+            format!("{key} exceeds {MAX_NATIVE_VECTOR_ITEMS} items"),
+        )
+        .at_stage("resources"));
+    }
     let values = values
         .iter()
         .map(|value| {
@@ -535,6 +663,13 @@ fn required_f64_vec(payload: &Map<String, Value>, key: &str) -> Result<Vec<f64>,
     let values = payload.get(key).and_then(Value::as_array).ok_or_else(|| {
         AppError::new(ErrorKind::InvalidRequest, format!("{key} must be an array"))
     })?;
+    if values.len() > MAX_NATIVE_ARRAY_VALUES {
+        return Err(AppError::new(
+            ErrorKind::ResourceBudgetExceeded,
+            format!("{key} exceeds {MAX_NATIVE_ARRAY_VALUES} values"),
+        )
+        .at_stage("resources"));
+    }
     values
         .iter()
         .map(|value| {
@@ -561,8 +696,7 @@ fn read_progress(path: Option<&Path>) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_inspect, native_netcdf_inspect, native_rechunk, native_rechunk_multi,
-        native_write_f64, validate_operation,
+        native_inspect, native_rechunk, native_rechunk_multi, native_write_f64, validate_operation,
     };
     use crate::protocol::EventEnvelope;
     use fast_nc_zarr_zarr::write_f32_array;

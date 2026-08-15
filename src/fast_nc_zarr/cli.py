@@ -243,7 +243,14 @@ def _interactive_transforms(inventory, variables: list[str] | tuple[str, ...]) -
         scale = _parse_scale_value(
             input("请输入缩放因子（例如 0.01）；直接回车表示不缩放："), name
         )
-        transforms[name] = VariableTransform(fill_values=fill, scale_factor=scale)
+        offset = _parse_scale_value(
+            input("请输入偏移量（例如 -273.15）；直接回车表示不偏移："), name
+        )
+        transforms[name] = VariableTransform(
+            fill_values=fill,
+            scale_factor=scale,
+            add_offset=offset,
+        )
     return transforms
 
 
