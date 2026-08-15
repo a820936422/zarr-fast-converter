@@ -73,11 +73,11 @@ fn start_task(
 
 #[tauri::command]
 pub fn preview_pipeline(
-    state: State<'_, AppState>,
+    app: AppHandle,
+    registry: State<'_, TaskRegistry>,
     payload: Map<String, Value>,
-) -> Result<Value, AppError> {
-    let request = new_request("preview_pipeline", payload, None);
-    payload_or_error(send_request(&state.worker, &request)?)
+) -> Result<String, AppError> {
+    start_task(app, &registry, "preview_pipeline", payload)
 }
 
 #[tauri::command]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import math
+import numpy as np
 from pathlib import Path
 import subprocess
 import sys
@@ -11,7 +12,7 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
-from fast_nc_zarr.application.desktop_worker.worker import _pipeline_config  # noqa: E402
+from fast_nc_zarr.application.desktop_worker.worker import _pipeline_config, _safe  # noqa: E402
 
 
 class ProtocolContractTests(unittest.TestCase):
@@ -81,6 +82,9 @@ class ProtocolContractTests(unittest.TestCase):
 
 
 class DesktopWorkerTests(unittest.TestCase):
+    def test_worker_safe_serializes_multidimensional_arrays(self) -> None:
+        self.assertEqual(_safe(np.arange(4, dtype="int32").reshape(2, 2)), [[0, 1], [2, 3]])
+
     def test_pipeline_request_forwards_rust_resource_snapshot(self) -> None:
         request = {
             "protocol_version": 1,

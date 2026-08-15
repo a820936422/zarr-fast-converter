@@ -80,7 +80,7 @@ export type TimeInspection = {
   report: string;
 };
 
-export type InspectionTaskOperation = "inspect_time_metadata" | "inspect_source" | "inspect_zarr";
+export type InspectionTaskOperation = "inspect_time_metadata" | "inspect_source" | "inspect_zarr" | "preview_pipeline";
 
 export const startInspection = (operation: InspectionTaskOperation, payload: Record<string, unknown>) =>
   invoke<string>("start_inspection", { operation, payload });
@@ -91,6 +91,7 @@ export type InspectionResult = {
   report: string;
   warnings: string[];
   snapshot: Record<string, unknown>;
+  inspection_snapshot_path?: string;
 };
 
 export type PipelinePayload = Record<string, unknown> & { output: string };
@@ -150,7 +151,7 @@ export const inspectTimeMetadata = (inputDir: string, recursive = false, engine 
 export const saveInspectionSnapshot = (request: Record<string, unknown>) =>
   invoke<Record<string, unknown>>("save_inspection_snapshot", { payload: request });
 export const previewPipeline = (payload: PipelinePayload) =>
-  invoke<Record<string, unknown>>("preview_pipeline", { payload });
+  invoke<string>("preview_pipeline", { payload });
 export const startPipeline = (payload: PipelinePayload) => invoke<string>("start_pipeline", { payload });
 export const resumePipeline = (payload: PipelinePayload) => invoke<string>("resume_pipeline", { payload });
 export const inspectPipelineRecovery = (path: string) => invoke<InspectionResult>("inspect_pipeline_recovery", { path });

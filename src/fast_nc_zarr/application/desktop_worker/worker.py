@@ -36,10 +36,10 @@ def _safe(value: Any) -> Any:
         return [_safe(item) for item in value]
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
-    if hasattr(value, "item"):
-        return _safe(value.item())
     if hasattr(value, "tolist"):
         return _safe(value.tolist())
+    if hasattr(value, "item"):
+        return _safe(value.item())
     return value
 
 
@@ -461,6 +461,14 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
         except Exception as exc:
             _emit_inspection_failure(sink, cancel_event, stage, exc)
             return
+        snapshot_path = None
+        if result.kind == "source":
+            try:
+                from ..services import default_inspection_cache_path, save_inspection_snapshot
+
+                snapshot_path = save_inspection_snapshot(result, default_inspection_cache_path(result.path))
+            except Exception as exc:
+                sink.emit("log", {"stream": "stderr", "message": f"检查快照缓存写入失败：{exc}"}, stage=stage)
         payload = {
             "kind": result.kind,
             "path": str(result.path),
@@ -468,20 +476,34 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
             "warnings": result.warnings,
             "snapshot": result.snapshot(),
         }
+        if snapshot_path is not None:
+            payload["inspection_snapshot_path"] = str(snapshot_path)
         sink.emit("inspection_ready", payload, stage=stage)
         sink.emit("finished", payload, stage=stage)
         return
     if request.command in {"preview_pipeline", "run_pipeline", "resume_pipeline"}:
         from ..services import inspect_temporary_pipeline, preview_pipeline, run_pipeline
 
+        if request.command == "preview_pipeline":
+            try:
+                with _request_cancellation(request.payload, cancel_event):
+                    inspection = _inspection_from_payload(request.payload, cancel_event)
+                    config = _pipeline_config(request.payload)
+                    plan = preview_pipeline(inspection, config)
+                if cancel_event.is_set():
+                    sink.emit("cancelled", {"reason": "cancellation requested"}, stage="planning")
+                else:
+                    payload = {"plan_kind": type(plan).__name__, "plan": _safe(plan)}
+                    sink.emit("plan_ready", payload, stage="planning")
+                    sink.emit("finished", payload, stage="planning")
+            except Exception as exc:
+                if cancel_event.is_set():
+                    sink.emit("cancelled", {"reason": str(exc)}, stage="planning")
+                else:
+                    sink.emit("failed", {"error": error_payload("unknown", str(exc), stage="planning")}, stage="planning")
+            return
         inspection = _inspection_from_payload(request.payload, cancel_event)
         config = _pipeline_config(request.payload)
-        if request.command == "preview_pipeline":
-            plan = preview_pipeline(inspection, config)
-            payload = {"plan_kind": type(plan).__name__, "plan": _safe(plan)}
-            sink.emit("plan_ready", payload, stage="planning")
-            sink.emit("finished", payload, stage="planning")
-            return
         if request.command == "resume_pipeline":
             inspection = inspect_temporary_pipeline(_path(request.payload, "path"))
         cancel_file = _optional_path(request.payload, "cancellation_file")

@@ -504,6 +504,13 @@ function App() {
       }
       return next;
     });
+    if (event.event === "plan_ready" && inspectionTaskOperation === "preview_pipeline") {
+      const planPayload = asRecord(event.payload.plan);
+      if (planPayload) {
+        setPlan(planPayload);
+        setInspectionProgress((current) => current ? { ...current, message: "处理计划已生成。" } : current);
+      }
+    }
     if ((event.event === "inspection_ready" || event.event === "finished") && inspectionTaskOperation === "inspect_time_metadata" && Array.isArray(event.payload.files)) {
       const result = event.payload as unknown as TimeInspection;
       setTimeInspection(result);
@@ -517,6 +524,7 @@ function App() {
         report: typeof event.payload.report === "string" ? event.payload.report : "结构检查完成",
         warnings: Array.isArray(event.payload.warnings) ? event.payload.warnings.filter((item): item is string => typeof item === "string") : [],
         snapshot: event.payload.snapshot && typeof event.payload.snapshot === "object" && !Array.isArray(event.payload.snapshot) ? event.payload.snapshot as Record<string, unknown> : {},
+        inspection_snapshot_path: typeof event.payload.inspection_snapshot_path === "string" ? event.payload.inspection_snapshot_path : undefined,
       });
       setStage("structure");
     }
@@ -610,7 +618,9 @@ function App() {
     setInspectionTaskOperation(operation);
     setInspectionProgress({ taskId: null, operation, label, message: "正在启动后端检查……", completed: 0, total: 0, status: "starting", startedAt });
     try {
-      const taskId = await startInspection(operation, payload);
+      const taskId = operation === "preview_pipeline"
+        ? await previewPipeline(payload as PipelinePayload)
+        : await startInspection(operation, payload);
       setInspectionTaskId(taskId);
       setInspectionProgress((current) => current ? { ...current, taskId, status: "running" } : current);
     } catch (reason) {
@@ -751,6 +761,9 @@ function App() {
       input_dir: inputPath,
       input_kind: inputKind === "zarr" ? "zarr" : "raw",
       inspection_kind: inspection.kind,
+      inspection_snapshot_path: inspection.inspection_snapshot_path || null,
+      validate_snapshot: false,
+      validation_mode: fullStructureValidation ? "full" : "fast",
       time_rule: timeRule,
       recursive,
       engine,
@@ -786,15 +799,7 @@ function App() {
       return;
     }
     if (!payload) return;
-    setBusy(true);
-    setError(null);
-    try {
-      setPlan(await previewPipeline(payload));
-    } catch (reason) {
-      setError(reasonText(reason));
-    } finally {
-      setBusy(false);
-    }
+    await startInspectionTask("preview_pipeline", payload, "生成处理计划");
   };
 
   const runPipeline = async () => {
@@ -1035,6 +1040,7 @@ function App() {
               <div className="pipeline-layout">
                 <section className="surface pipeline-surface">
                   <div className="surface-title"><div><span className="section-kicker">PROCESS FLOW</span><h2>处理阶段</h2></div><span className="surface-number">02</span></div>
+                  {inspectionProgress && inspectionTaskOperation === "preview_pipeline" && <InspectionProgressCard progress={inspectionProgress} nowMs={progressNowMs} onCancel={inspectionTaskId ? cancelInspection : undefined} />}
                   <div className="stage-flow"><div className="flow-stage complete"><span>01</span><Icon name="database" size={16} /><div><strong>输入检查</strong><small>{inputPath.split(/[\\/]/).pop() || "已确认数据"}</small></div><Icon name="spark" size={14} /></div><div className="flow-connector" /><label className={`flow-stage toggle-stage ${resample ? "enabled" : ""}`}><span>02</span><Icon name="grid" size={16} /><div><strong>空间重采样</strong><small>{resample ? resampleMethod : "未启用"}</small></div><input type="checkbox" checked={resample} onChange={(event) => setResample(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${rechunk ? "enabled" : ""}`}><span>03</span><Icon name="layers" size={16} /><div><strong>重分块</strong><small>{rechunk ? `目标 ${targetMib} MiB` : "未启用"}</small></div><input type="checkbox" checked={rechunk} onChange={(event) => setRechunk(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${recompress ? "enabled" : ""}`}><span>04</span><Icon name="spark" size={16} /><div><strong>重压缩</strong><small>{recompress ? compression : "未启用"}</small></div><input type="checkbox" checked={recompress} onChange={(event) => setRecompress(event.target.checked)} /><span className="toggle-switch" /></label></div>
                   {resample && (
                     <div className="advanced-panel">
