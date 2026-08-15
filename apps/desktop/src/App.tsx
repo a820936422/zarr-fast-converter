@@ -392,6 +392,7 @@ function App() {
   const [variableTransforms, setVariableTransforms] = useState<Record<string, VariableTransformDraft>>({});
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
+  const [temporaryDir, setTemporaryDir] = useState("");
   const [recursive, setRecursive] = useState(false);
   const [engine, setEngine] = useState("auto");
   const [timeInspection, setTimeInspection] = useState<TimeInspection | null>(null);
@@ -427,6 +428,11 @@ function App() {
   const [targetMib, setTargetMib] = useState(128);
   const [recompress, setRecompress] = useState(false);
   const [compression, setCompression] = useState("auto");
+  const [compressionCodec, setCompressionCodec] = useState("");
+  const [compressionLevel, setCompressionLevel] = useState<number | "">("");
+  const [compressionShuffle, setCompressionShuffle] = useState("auto");
+  const [compressionObjective, setCompressionObjective] = useState("balanced");
+  const [compressionTuneBudget, setCompressionTuneBudget] = useState(60);
   const [backendMode, setBackendMode] = useState<BackendMode>("auto");
   const [favorites, setFavorites] = useState<string[]>([]);
   const [recentPaths, setRecentPaths] = useState<string[]>([]);
@@ -595,6 +601,15 @@ function App() {
       setError(reasonText(reason));
     }
   };
+  const chooseTemporaryDirectory = async () => {
+    setError(null);
+    try {
+      const selected = await pickDirectory();
+      if (typeof selected === "string") setTemporaryDir(selected);
+    } catch (reason) {
+      setError(reasonText(reason));
+    }
+  };
 
   const inspectNativeZarr = async () => {
     if (!inputPath || inputKind !== "zarr") return;
@@ -758,6 +773,7 @@ function App() {
     );
     return {
       output: outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`,
+      temporary_dir: temporaryDir || null,
       input_dir: inputPath,
       input_kind: inputKind === "zarr" ? "zarr" : "raw",
       inspection_kind: inspection.kind,
@@ -770,6 +786,11 @@ function App() {
       variables: selectedVariables,
       variable_names: outputNames,
       variable_transforms: transforms,
+      compression_codec: recompress && compressionCodec ? compressionCodec : null,
+      compression_level: recompress && compressionLevel !== "" ? compressionLevel : null,
+      compression_shuffle: compressionShuffle,
+      compression_objective: compressionObjective,
+      compression_tune_budget: compressionTuneBudget,
       resample,
       method: resampleMethod,
       resolution,
@@ -1059,7 +1080,19 @@ function App() {
                     </div>
                   )}
                   {rechunk && <div className="advanced-panel"><div className="panel-label"><Icon name="layers" size={15} />重分块参数</div><div className="advanced-fields"><label>目标 chunk MiB<input type="number" min="1" step="1" value={targetMib} onChange={(event) => setTargetMib(Number(event.target.value))} /></label></div></div>}
-                  {recompress && <div className="advanced-panel"><div className="panel-label"><Icon name="spark" size={15} />压缩参数</div><div className="advanced-fields"><label>压缩配置<select value={compression} onChange={(event) => setCompression(event.target.value)}><option value="auto">自动选择</option><option value="zstd">Zstd</option><option value="blosc-lz4">Blosc LZ4</option><option value="gzip">Gzip</option></select></label></div></div>}
+                  {recompress && (
+                    <div className="advanced-panel">
+                      <div className="panel-label"><Icon name="spark" size={15} />重压缩参数</div>
+                      <div className="advanced-fields compression-fields">
+                        <label>压缩方案<select value={compression} onChange={(event) => setCompression(event.target.value)}><option value="auto">自动调优</option><option value="fast">快速</option><option value="balanced">平衡</option><option value="maximum">最高压缩率</option></select></label>
+                        <label>压缩格式<select value={compressionCodec} onChange={(event) => { const value = event.target.value; setCompressionCodec(value); if ((value === "zstd" || value === "gzip") && !["auto", "noshuffle"].includes(compressionShuffle)) setCompressionShuffle("auto"); }}><option value="">按方案自动</option><option value="blosc-zstd">Blosc Zstd</option><option value="blosc-lz4">Blosc LZ4</option><option value="blosc-lz4hc">Blosc LZ4HC</option><option value="blosc-zlib">Blosc Zlib</option><option value="zstd">原生 Zstd</option><option value="gzip">原生 Gzip</option></select></label>
+                        <label>压缩等级<input type="number" min={compressionCodec === "zstd" ? -7 : 0} max={compressionCodec === "zstd" ? 22 : 9} step="1" value={compressionLevel} onChange={(event) => setCompressionLevel(event.target.value === "" ? "" : Number(event.target.value))} placeholder="按方案" /></label>
+                        <label>Shuffle<select value={compressionShuffle} onChange={(event) => setCompressionShuffle(event.target.value)}><option value="auto">按 dtype 自动</option><option value="noshuffle">不使用</option><option value="shuffle" disabled={compressionCodec === "zstd" || compressionCodec === "gzip"}>字节 shuffle</option><option value="bitshuffle" disabled={compressionCodec === "zstd" || compressionCodec === "gzip"}>bitshuffle</option></select></label>
+                        <label>优化目标<select value={compressionObjective} onChange={(event) => setCompressionObjective(event.target.value)}><option value="speed">速度优先</option><option value="balanced">平衡</option><option value="compact">体积优先</option></select></label>
+                        <label>调参预算(s)<input type="number" min="0" step="1" value={compressionTuneBudget} onChange={(event) => setCompressionTuneBudget(Number(event.target.value))} /></label>
+                      </div>
+                    </div>
+                  )}
                   {variableDetails.length > 0 && (
                     <div className="advanced-panel variable-settings-panel">
                       <div className="panel-label"><Icon name="layers" size={15} />变量选择与处理参数</div>
@@ -1086,7 +1119,17 @@ function App() {
                       </div>
                     </div>
                   )}
-                  <div className="output-block"><label className="field-label" htmlFor="output-path">输出 Zarr 目录</label><div className="input-with-action"><Icon name="upload" size={17} /><input id="output-path" value={outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`} onChange={(event) => setOutputPath(event.target.value)} /><span className="path-valid"><Icon name="spark" size={13} /></span></div></div>
+                  <div className="output-block">
+                    <div className="output-option">
+                      <label className="field-label" htmlFor="temporary-path">临时处理目录</label>
+                      <div className="input-with-action"><Icon name="layers" size={17} /><input id="temporary-path" value={temporaryDir} onChange={(event) => setTemporaryDir(event.target.value)} placeholder="留空：使用输出目录旁的临时目录" /><button className="field-action" type="button" onClick={() => void chooseTemporaryDirectory()}>浏览</button></div>
+                      <p className="path-help">用于中间 Zarr、权重、缓存和 staging；建议选择空间充足的本地磁盘。</p>
+                    </div>
+                    <div className="output-option">
+                      <label className="field-label" htmlFor="output-path">输出 Zarr 目录</label>
+                      <div className="input-with-action"><Icon name="upload" size={17} /><input id="output-path" value={outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`} onChange={(event) => setOutputPath(event.target.value)} /><span className="path-valid"><Icon name="spark" size={13} /></span></div>
+                    </div>
+                  </div>
                   <div className="surface-actions"><button className="quiet-button" disabled={busy} type="button" onClick={() => void runPreview()}><Icon name="layers" size={16} />预览计划</button><button className="primary-button" disabled={busy} type="button" onClick={() => void runPipeline()}><Icon name="play" size={16} />启动处理</button></div>
                 </section>
                 <aside className="pipeline-side"><section className="surface execution-card"><div className="surface-title compact"><div><span className="section-kicker">EXECUTION POLICY</span><h2>执行策略</h2></div><Icon name="activity" size={18} /></div><label className="route-select-label">后端路由<select value={backendMode} onChange={(event) => setBackendMode(event.target.value as BackendMode)}><option value="auto">自动路由 · 推荐</option><option value="rust">原生强制 · 能力不足时失败</option></select></label><div className="policy-note"><span className="note-icon"><Icon name="spark" size={14} /></span><p><strong>Auto route</strong><br />优先使用已通过能力验证的原生操作，其他阶段保持结果语义不变。</p></div><div className="policy-list"><div><span className="policy-dot native" />原生能力优先</div><div><span className="policy-dot safe" />staging 校验后发布</div><div><span className="policy-dot trace" />manifest 全程留痕</div></div></section><section className="surface plan-card"><div className="surface-title compact"><div><span className="section-kicker">PLAN PREVIEW</span><h2>计划摘要</h2></div><span className="plan-state">{plan ? "READY" : "DRAFT"}</span></div>{plan ? <pre>{JSON.stringify(plan, null, 2)}</pre> : <div className="plan-empty"><Icon name="layers" size={22} /><span>点击“预览计划”<br />查看资源和阶段估算</span></div>}</section></aside>

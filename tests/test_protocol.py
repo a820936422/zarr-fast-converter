@@ -118,6 +118,7 @@ class DesktopWorkerTests(unittest.TestCase):
         config = _pipeline_config(
             {
                 "output": "/tmp/restored-controls.zarr",
+                "temporary_dir": "/tmp/processing",
                 "input_kind": "raw",
                 "variables": ["value"],
                 "variable_names": {"value": "renamed_value"},
@@ -137,6 +138,12 @@ class DesktopWorkerTests(unittest.TestCase):
                 "before_results": "0",
                 "after_conditions": ">100",
                 "after_results": "100",
+                "compression": "balanced",
+                "compression_codec": "zstd",
+                "compression_level": 5,
+                "compression_shuffle": "noshuffle",
+                "compression_objective": "compact",
+                "compression_tune_budget": 30,
             }
         )
         transform = config.conversion.variable_transforms["value"]
@@ -148,6 +155,13 @@ class DesktopWorkerTests(unittest.TestCase):
         self.assertFalse(config.resampling.skipna)
         self.assertEqual(config.resampling.before_conditions, "<0")
         self.assertEqual(config.resampling.after_results, "100")
+        self.assertEqual(config.general.temporary_dir, Path("/tmp/processing"))
+        self.assertEqual(config.compression.profile, "balanced")
+        self.assertEqual(config.compression.codec, "zstd")
+        self.assertEqual(config.compression.level, 5)
+        self.assertEqual(config.compression.shuffle, "noshuffle")
+        self.assertEqual(config.compression.objective, "compact")
+        self.assertEqual(config.compression.tune_budget, 30)
 
     def test_invalid_request_returns_structured_failure(self) -> None:
         result = subprocess.run(
