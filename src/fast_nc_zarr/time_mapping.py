@@ -142,7 +142,7 @@ def inspect_time_metadata(
     total = 4
     _report_progress(progress_callback, 0, total, "扫描输入文件")
     source = Path(input_dir).expanduser().resolve()
-    files = discover_filename_files(source, recursive=recursive)
+    files = discover_filename_files(source, recursive=recursive, cancel_event=cancel_event)
     _raise_if_cancelled(cancel_event)
     _report_progress(progress_callback, 1, total, f"读取首个文件结构（共 {len(files)} 个文件）")
     engine, dimensions, coordinates, has_time, _has_space = probe_dataset_structure(

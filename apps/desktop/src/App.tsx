@@ -94,7 +94,7 @@ function timeRuleSummary(rule: TimeRule | null, options: TimeFieldOption[]): str
   return parts.join("；");
 }
 
-type InspectionProgressStatus = "starting" | "running" | "finished" | "failed" | "cancelled";
+type InspectionProgressStatus = "starting" | "running" | "cancelling" | "finished" | "failed" | "cancelled";
 type InspectionProgressState = {
   taskId: string | null;
   operation: InspectionTaskOperation;
@@ -231,7 +231,7 @@ function StructuredTimeInspection({ inspection }: { inspection: TimeInspection }
 }
 
 function progressStatusLabel(status: InspectionProgressStatus): string {
-  return { starting: "正在启动", running: "后端执行中", finished: "检查完成", failed: "检查失败", cancelled: "已取消" }[status];
+  return { starting: "正在启动", running: "后端执行中", cancelling: "正在取消", finished: "检查完成", failed: "检查失败", cancelled: "已取消" }[status];
 }
 
 function InspectionProgressCard({
@@ -394,7 +394,7 @@ function App() {
   }, [events, inputPath]);
 
   useEffect(() => {
-    if (!busy || !inspectionProgress || !["starting", "running"].includes(inspectionProgress.status)) return;
+    if (!busy || !inspectionProgress || !["starting", "running", "cancelling"].includes(inspectionProgress.status)) return;
     const timer = window.setInterval(() => setProgressNowMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [busy, inspectionProgress?.status]);
@@ -412,19 +412,27 @@ function App() {
       if (!current) return current;
       const next = { ...current };
       if (event.event === "accepted") {
-        next.status = "starting";
-        next.message = "已连接后端检查 worker，等待执行。";
+        if (next.status !== "cancelling") {
+          next.status = "starting";
+          next.message = "已连接后端检查 worker，等待执行。";
+        }
       } else if (event.event === "started") {
-        next.status = "running";
-        next.message = "后端已开始读取输入数据。";
+        if (next.status !== "cancelling") {
+          next.status = "running";
+          next.message = "后端已开始读取输入数据。";
+        }
       } else if (event.event === "progress") {
-        next.status = "running";
-        next.message = payloadMessage || event.stage || "后端正在处理。";
+        if (next.status !== "cancelling") {
+          next.status = "running";
+          next.message = payloadMessage || event.stage || "后端正在处理。";
+        }
         if (typeof event.payload.completed === "number") next.completed = event.payload.completed;
         if (typeof event.payload.total === "number") next.total = event.payload.total;
       } else if (event.event === "log") {
-        next.status = "running";
-        next.message = payloadMessage || next.message;
+        if (next.status !== "cancelling") {
+          next.status = "running";
+          next.message = payloadMessage || next.message;
+        }
       } else if (event.event === "finished") {
         next.status = "finished";
         next.message = "后端检查完成，正在整理结果。";
@@ -553,6 +561,17 @@ function App() {
       setInspectionProgress((current) => current ? { ...current, status: "failed", message } : current);
     }
   };
+  const cancelInspection = async () => {
+    if (!inspectionTaskId) return;
+    setInspectionProgress((current) => current ? { ...current, status: "cancelling", message: "已发送取消请求，等待后端停止当前读取。" } : current);
+    try {
+      await cancel(inspectionTaskId);
+    } catch (reason) {
+      const message = reasonText(reason);
+      setError(message);
+      setInspectionProgress((current) => current ? { ...current, status: "running", message: "取消请求未发送成功，后端仍在执行。" } : current);
+    }
+  };
 
   const inspectTime = async () => {
     if (!inputPath || inputKind !== "source" || busy) return;
@@ -623,7 +642,7 @@ function App() {
     }
     await startInspectionTask(
       "inspect_source",
-      { input_dir: inputPath, mode: "auto", recursive, engine, time_rule: timeRule },
+      { input_dir: inputPath, mode: "auto", recursive, engine, time_rule: timeRule, validation_mode: "fast" },
       "读取数据结构",
     );
   };
@@ -859,7 +878,7 @@ function App() {
                   <label className="field-label" htmlFor="input-path">数据路径</label><div className="input-with-action"><Icon name="folder" size={17} /><input id="input-path" value={inputPath} onChange={(event) => setInputPath(event.target.value)} placeholder={inputKind === "source" ? "选择 NetCDF / HDF / TIFF 目录" : "选择 Zarr v3 目录"} /><button className="field-action" type="button" onClick={() => void chooseInput()}>浏览</button></div>
                   {inputKind === "zarr" && <div className="input-with-action secondary-input"><Icon name="layers" size={17} /><input aria-label="Zarr array path" value={arrayPath} onChange={(event) => setArrayPath(event.target.value)} placeholder="array path，例如 /value" /><button className="field-action" type="button" disabled={!inputPath || busy} onClick={() => void inspectNativeZarr()}>原生检查</button></div>}
                   {inputKind === "source" && <div className="inline-options"><label className="check-control"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /><span className="fake-check" />递归扫描</label><label className="select-control">读取引擎<select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="auto">自动选择</option><option value="h5netcdf">h5netcdf</option><option value="netcdf4">netcdf4</option><option value="rasterio">rasterio</option></select></label></div>}
-                  {inspectionProgress && <InspectionProgressCard progress={inspectionProgress} nowMs={progressNowMs} onCancel={inspectionTaskId ? () => void cancel(inspectionTaskId) : undefined} />}
+                  {inspectionProgress && <InspectionProgressCard progress={inspectionProgress} nowMs={progressNowMs} onCancel={inspectionTaskId ? cancelInspection : undefined} />}
                   {timeInspection && (
                     <div className="inline-result time-inspection-result">
                       <div className="result-icon"><Icon name="clock" size={16} /></div>
@@ -875,7 +894,7 @@ function App() {
                       </div>
                     </div>
                   )}
-                  {inspection && <div className="inline-result success"><div className="result-icon"><Icon name="spark" size={16} /></div><div><strong>结构检查完成</strong><p>{inspection.report}</p><span>{inspection.warnings.length ? `${inspection.warnings.length} 条警告` : "未发现警告"}</span></div><button className="icon-button" type="button" title="保存检查快照" onClick={() => void saveSnapshot()}><Icon name="archive" size={16} /></button></div>}
+                  {inspection && <div className="inline-result success"><div className="result-icon"><Icon name="spark" size={16} /></div><div><strong>结构检查完成</strong><p>{inspection.report}</p><span>{inspection.warnings.length ? `${inspection.warnings.length} 条警告` : "未发现警告"}</span>{inspection.warnings.length > 0 && <div className="inspection-warning-list">{inspection.warnings.map((warning) => <div key={warning}><Icon name="activity" size={12} />{warning}</div>)}</div>}</div><button className="icon-button" type="button" title="保存检查快照" onClick={() => void saveSnapshot()}><Icon name="archive" size={16} /></button></div>}
                   {variableOptions.length > 0 && <div className="variable-block"><div className="variable-heading"><strong>参与处理的变量</strong><span>{selectedVariables.length} / {variableOptions.length}</span></div><div className="variable-list">{variableOptions.map((name) => <label key={name}><input type="checkbox" checked={selectedVariables.includes(name)} onChange={(event) => setSelectedVariables((current) => event.target.checked ? [...current, name] : current.filter((item) => item !== name))} /><span className="fake-check" />{name}</label>)}</div></div>}
                   <div className="surface-actions"><button className="quiet-button" type="button" disabled={!canInspectTime} onClick={() => void inspectTime()}><Icon name="clock" size={16} />检查时间轴</button><button className="primary-button" type="button" disabled={!canInspectStructure} onClick={() => void inspectStructure()}><Icon name="arrow" size={16} />读取结构</button></div>
                 </section>

@@ -45,6 +45,7 @@ export type InspectionRequest = {
   source_dimensions?: [string, string, string];
   workers?: number;
   time_rule?: TimeRule | null;
+  validation_mode?: "full" | "fast";
   cache_path?: string | null;
 };
 

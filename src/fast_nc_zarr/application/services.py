@@ -22,6 +22,7 @@ from ..filename_mode import (
     convert_filename as core_convert_filename,
     discover_filename_files,
     filename_logical_bytes,
+    FAST_STRUCTURE_SAMPLE_LIMIT,
     inspect_filename_inventory,
     probe_dataset_structure,
     scan_filename_times,
@@ -76,6 +77,7 @@ from ..time_mapping import (
 
 
 SourceMode = Literal["auto", "complete", "filename"]
+InspectionValidationMode = Literal["full", "fast"]
 
 def default_inspection_cache_path(input_dir: Path) -> Path:
     """Return a stable per-source cache outside the potentially slow source drive."""
@@ -96,8 +98,23 @@ class SourceInspectionConfig:
     source_dimensions: tuple[str, str, str] | None = None
     workers: int | None = None
     time_rule: TimeRule | None = None
+    validation_mode: InspectionValidationMode = "full"
     time_inspection: TimeInspectionResult | None = None
     cache_path: Path | None = None
+
+
+def _fast_structure_warning(config: SourceInspectionConfig, engine: str, files: tuple[Path, ...] | list[Path]) -> str | None:
+    if (
+        config.validation_mode == "fast"
+        and engine == "netcdf4"
+        and len(files) > FAST_STRUCTURE_SAMPLE_LIMIT
+        and all(path.suffix.lower() == ".hdf" for path in files)
+    ):
+        return (
+            f"大目录已启用快速结构检查：抽样验证 {FAST_STRUCTURE_SAMPLE_LIMIT} 个 HDF 文件；"
+            "其余文件将在转换写入暂存目录时逐文件读取，发现不一致会终止发布。"
+        )
+    return None
 
 
 @dataclass
@@ -347,12 +364,17 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None, progres
             and config.time_rule.full.source == "filename"
             and not time_result.time_dimension.exists
         ):
+            if progress_callback is not None:
+                progress_callback(0, 1, "解析已确认的文件名时间规则")
             scan = _scan_selected_filename_full_time(
                 source,
                 config.time_rule.full,
                 time_result.filename_fields,
                 recursive=config.recursive,
+                cancel_event=cancel_event,
             )
+            if progress_callback is not None:
+                progress_callback(1, 1, "文件名时间规则解析完成")
             inventory = inspect_filename_inventory(
                 scan,
                 resolved_engine,
@@ -361,8 +383,12 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None, progres
                 cached_inventory=cached_inventory,
                 cancel_event=cancel_event,
                 progress_callback=progress_callback,
+                fast_structure_validation=config.validation_mode == "fast",
             )
             warnings = []
+            fast_warning = _fast_structure_warning(config, resolved_engine, scan.files)
+            if fast_warning:
+                warnings.append(fast_warning)
             if scan.missing_times:
                 warnings.append(f"理论时间轴缺少 {len(scan.missing_times)} 个日期，转换时将写入空值切片。")
             return _cache_inspection_result(InspectionResult(
@@ -405,7 +431,11 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None, progres
             time_inspection=time_result,
             time_rule=config.time_rule,
         ), config.cache_path)
-    files = discover_filename_files(source, recursive=config.recursive)
+    if progress_callback is not None:
+        progress_callback(0, 1, "扫描源文件列表")
+    files = discover_filename_files(source, recursive=config.recursive, cancel_event=cancel_event)
+    if progress_callback is not None:
+        progress_callback(1, 1, f"发现 {len(files)} 个源文件")
     if mode == "auto":
         resolved_engine, dims, _coords, has_time, has_space = probe_dataset_structure(
             files[0], requested_engine
@@ -454,12 +484,17 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None, progres
     if mode != "filename":
         raise ValueError(f"不支持的数据检查模式：{mode}")
     template = None if not config.template or config.template == "auto" else config.template
+    if progress_callback is not None:
+        progress_callback(0, 1, "解析文件名时间字段")
     scan = scan_filename_times(
         source,
         template=template,
         field_values=config.field_values,
         recursive=config.recursive,
+        cancel_event=cancel_event,
     )
+    if progress_callback is not None:
+        progress_callback(1, 1, "文件名时间字段解析完成")
     inventory = inspect_filename_inventory(
         scan,
         resolved_engine,
@@ -468,8 +503,12 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None, progres
         cached_inventory=cached_inventory,
         cancel_event=cancel_event,
         progress_callback=progress_callback,
+        fast_structure_validation=config.validation_mode == "fast",
     )
     warnings = []
+    fast_warning = _fast_structure_warning(config, resolved_engine, scan.files)
+    if fast_warning:
+        warnings.append(fast_warning)
     if scan.missing_times:
         warnings.append(f"理论时间轴缺少 {len(scan.missing_times)} 个日期，转换时将写入空值切片。")
     if not scan.step_days:
@@ -1034,6 +1073,7 @@ def _scan_selected_filename_full_time(
     fields: tuple[FilenameField, ...],
     *,
     recursive: bool,
+    cancel_event=None,
 ) -> FilenameScan:
     from ..filename_mode import scan_filename_times
 
@@ -1055,6 +1095,7 @@ def _scan_selected_filename_full_time(
         template=template,
         field_values=values,
         recursive=recursive,
+        cancel_event=cancel_event,
     )
 
 

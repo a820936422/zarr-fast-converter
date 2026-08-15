@@ -104,7 +104,7 @@ def _source_config(payload: dict[str, Any]):
         field_values=field_values,
         source_dimensions=source_dimensions,
         workers=int(payload["workers"]) if payload.get("workers") is not None else None,
-        time_rule=_time_rule(payload.get("time_rule")),
+        validation_mode=str(payload.get("validation_mode", "full")),
         cache_path=_optional_path(payload, "cache_path"),
     )
 
@@ -324,6 +324,13 @@ def _emit_progress(sink: _EventSink, stage: str, completed: int, total: int, mes
         {"completed": completed, "total": total, "message": message},
         stage=stage,
     )
+
+
+def _emit_inspection_failure(sink: _EventSink, cancel_event: ThreadEvent, stage: str, error: Exception) -> None:
+    if cancel_event.is_set():
+        sink.emit("cancelled", {"reason": str(error) or "任务已取消。"}, stage=stage)
+    else:
+        sink.emit("failed", {"error": error_payload("unknown", str(error), stage=stage)}, stage=stage)
 def _dispatch(request: Request, output: TextIO, cancel_event: ThreadEvent) -> None:
     sink = _EventSink(output, request)
     with redirect_stdout(_OutputStream(sink, stream_name="stdout")), redirect_stderr(_OutputStream(sink, stream_name="stderr")):
@@ -356,16 +363,20 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
     if request.command == "inspect_time_metadata":
         from ...time_mapping import inspect_time_metadata
 
-        with _request_cancellation(request.payload, cancel_event):
-            result = inspect_time_metadata(
-                _path(request.payload, "input_dir"),
-                recursive=bool(request.payload.get("recursive", False)),
-                requested_engine=str(request.payload.get("engine", "auto")),
-                cancel_event=cancel_event,
-                progress_callback=lambda completed, total, message: _emit_progress(
-                    sink, "time_inspection", completed, total, message
-                ),
-            )
+        try:
+            with _request_cancellation(request.payload, cancel_event):
+                result = inspect_time_metadata(
+                    _path(request.payload, "input_dir"),
+                    recursive=bool(request.payload.get("recursive", False)),
+                    requested_engine=str(request.payload.get("engine", "auto")),
+                    cancel_event=cancel_event,
+                    progress_callback=lambda completed, total, message: _emit_progress(
+                        sink, "time_inspection", completed, total, message
+                    ),
+                )
+        except Exception as exc:
+            _emit_inspection_failure(sink, cancel_event, "time_inspection", exc)
+            return
         payload = _time_inspection_payload(result)
         sink.emit("inspection_ready", payload, stage="time_inspection")
         sink.emit("finished", payload, stage="time_inspection")
@@ -380,14 +391,19 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
         sink.emit("finished", payload, stage="inspection")
         return
     if request.command in {"inspect_source", "inspect_zarr"}:
-        with _request_cancellation(request.payload, cancel_event):
-            result = _inspection(
-                request,
-                cancel_event,
-                progress_callback=lambda completed, total, message: _emit_progress(
-                    sink, "inspection", completed, total, message
-                ),
-            )
+        stage = "inspection"
+        try:
+            with _request_cancellation(request.payload, cancel_event):
+                result = _inspection(
+                    request,
+                    cancel_event,
+                    progress_callback=lambda completed, total, message: _emit_progress(
+                        sink, stage, completed, total, message
+                    ),
+                )
+        except Exception as exc:
+            _emit_inspection_failure(sink, cancel_event, stage, exc)
+            return
         payload = {
             "kind": result.kind,
             "path": str(result.path),
@@ -395,8 +411,8 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
             "warnings": result.warnings,
             "snapshot": result.snapshot(),
         }
-        sink.emit("inspection_ready", payload, stage="inspection")
-        sink.emit("finished", payload, stage="inspection")
+        sink.emit("inspection_ready", payload, stage=stage)
+        sink.emit("finished", payload, stage=stage)
         return
     if request.command in {"preview_pipeline", "run_pipeline", "resume_pipeline"}:
         from ..services import inspect_temporary_pipeline, preview_pipeline, run_pipeline

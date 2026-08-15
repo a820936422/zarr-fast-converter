@@ -206,6 +206,9 @@ button:disabled { cursor: not-allowed !important; opacity: .48; }
 .inline-result.success p { color: #66877c; }
 .inline-result select { padding: 5px 7px; font-size: 10px; }
 .inline-result > div > span { color: #238362; font-size: 10px; }
+.inspection-warning-list { display: grid; gap: 5px; margin-top: 8px; border-top: 1px solid rgb(202 235 223 / 90%); padding-top: 7px; }
+.inspection-warning-list > div { display: flex; align-items: flex-start; gap: 5px; color: #9a753e; font-size: 9px; line-height: 1.5; }
+.inspection-warning-list .icon { flex: 0 0 auto; margin-top: 1px; color: #d18a34; }
 .time-rule-action { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .time-rule-action > span { min-width: 0; flex: 1 1 240px; color: #806337; font-size: 10px; line-height: 1.5; }
 .time-rule-action .quiet-button { padding: 7px 10px; font-size: 10px; }
@@ -241,6 +244,8 @@ button:disabled { cursor: not-allowed !important; opacity: .48; }
 .raw-inspection-report pre { max-height: 180px; overflow: auto; margin: 8px 0 0; border-radius: 7px; padding: 8px; color: #806337; background: rgb(255 255 255 / 64%); font-size: 9px; line-height: 1.55; white-space: pre-wrap; }
 .inspection-progress-card { display: flex; align-items: flex-start; gap: 10px; margin-top: 20px; border: 1px solid #c9dbf6; border-radius: 10px; padding: 12px; color: #4a6d9b; background: #f2f7ff; }
 .inspection-progress-card.finished { border-color: #caebdf; color: #297a62; background: #f1fcf8; }
+.inspection-progress-card.cancelling { border-color: #d7e0ef; color: #56718f; background: #f5f8fc; }
+.cancelling .progress-icon { color: #56718f; background: #e6edf7; }
 .inspection-progress-card.failed { border-color: #f0c9c9; color: #a65353; background: #fff4f4; }
 .inspection-progress-card.cancelled { border-color: #e8d8bc; color: #8b7047; background: #fffaf0; }
 .progress-icon { display: grid; flex: 0 0 26px; place-items: center; width: 26px; height: 26px; border-radius: 8px; color: #397de2; background: #e3efff; }

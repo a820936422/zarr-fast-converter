@@ -54,6 +54,7 @@ from .writer import _monitor, compressor_from_spec, make_compressor, progress_li
 
 
 FILENAME_SUFFIXES = {".nc", ".nc4", ".nc3", ".cdf", ".hdf", ".tif", ".tiff"}
+FAST_STRUCTURE_SAMPLE_LIMIT = 32
 Template = Literal["doy", "ymd"]
 
 
@@ -112,18 +113,18 @@ class FilenameScan:
         return tuple(time_key(value) for value in self.expected_times)
 
 
-def discover_filename_files(input_dir: Path, recursive: bool = False) -> tuple[Path, ...]:
+def discover_filename_files(input_dir: Path, recursive: bool = False, cancel_event=None) -> tuple[Path, ...]:
     input_dir = input_dir.expanduser().resolve()
     if not input_dir.is_dir():
         raise FileNotFoundError(f"输入目录不存在：{input_dir}")
     iterator = input_dir.rglob("*") if recursive else input_dir.iterdir()
-    files = tuple(
-        sorted(
-            path
-            for path in iterator
-            if path.is_file() and path.suffix.lower() in FILENAME_SUFFIXES
-        )
-    )
+    files = []
+    for path in iterator:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("任务已取消。")
+        if path.is_file() and path.suffix.lower() in FILENAME_SUFFIXES:
+            files.append(path)
+    files = tuple(sorted(files))
     if not files:
         raise FileNotFoundError(f"没有在 {input_dir} 中找到支持的源文件。")
     suffixes = {path.suffix.lower() for path in files}
@@ -266,7 +267,7 @@ def _expected_times(
     )
 
 
-def _automatic_rule_candidates(files: tuple[Path, ...]) -> tuple[FilenameRuleCandidate, ...]:
+def _automatic_rule_candidates(files: tuple[Path, ...], cancel_event=None) -> tuple[FilenameRuleCandidate, ...]:
     if not files:
         raise FilenameTimeError("没有可用于推断时间字段的文件。")
     names = tuple(path.name for path in files)
@@ -285,6 +286,8 @@ def _automatic_rule_candidates(files: tuple[Path, ...]) -> tuple[FilenameRuleCan
         raise FilenameTimeError("文件扩展名不一致，无法自动推断时间字段。")
     candidates: list[FilenameRuleCandidate] = []
     for template, length in (("doy", 7), ("ymd", 8)):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("任务已取消。")
         for start in range(0, len(sample) - length + 1):
             end = start + length
             # A date field should be a complete numeric token, not a sliding
@@ -334,11 +337,12 @@ def scan_filename_times(
     field_values: tuple[str, ...] | None = None,
     step_days: int | None = None,
     recursive: bool = False,
+    cancel_event=None,
 ) -> FilenameScan:
-    files = discover_filename_files(input_dir, recursive)
+    files = discover_filename_files(input_dir, recursive, cancel_event=cancel_event)
     sample_name = files[0].name
     if template is None or field_values is None:
-        candidates = _automatic_rule_candidates(files)
+        candidates = _automatic_rule_candidates(files, cancel_event=cancel_event)
         if len(candidates) != 1:
             if not candidates:
                 raise FilenameTimeError(
@@ -381,6 +385,8 @@ def scan_filename_times(
     actual_pairs: list[tuple[Path, date]] = []
     seen: dict[date, Path] = {}
     for path in files:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("任务已取消。")
         name = path.name
         if path.suffix.lower() != files[0].suffix.lower():
             raise FilenameTimeError(f"文件扩展名不一致：{name}")
@@ -1040,6 +1046,43 @@ def _inspect_filename_file(task) -> FileRecord:
             return _inspect_filename_file_rasterio(task)
         except _LowLevelUnsupported:
             return _inspect_filename_file_xarray(task)
+def _fast_filename_record(task) -> FileRecord:
+    (
+        path,
+        _engine,
+        _expected_signature,
+        expected_lat_hash,
+        expected_lon_hash,
+        expected_lat_size,
+        expected_lon_size,
+        reference_specs,
+        time_value,
+    ) = task
+    stat = path.stat()
+    timestamp = np.datetime64(time_value, "ns")
+    return FileRecord(
+        path=path,
+        size_bytes=stat.st_size,
+        times=(timestamp,),
+        time_keys=(time_key(timestamp),),
+        lat_hash=expected_lat_hash,
+        lon_hash=expected_lon_hash,
+        lat_size=expected_lat_size,
+        lon_size=expected_lon_size,
+        variables=reference_specs,
+        mtime_ns=stat.st_mtime_ns,
+    )
+
+
+def _sample_filename_tasks(tasks: list[tuple], limit: int) -> list[tuple]:
+    if len(tasks) <= limit:
+        return tasks
+    indices = {0, len(tasks) - 1}
+    for position in range(1, limit - 1):
+        indices.add(round(position * (len(tasks) - 1) / (limit - 1)))
+    return [tasks[index] for index in sorted(indices)]
+
+
 
 
 def inspect_filename_inventory(
@@ -1051,6 +1094,7 @@ def inspect_filename_inventory(
     cached_inventory: Inventory | None = None,
     cancel_event=None,
     progress_callback=None,
+    fast_structure_validation: bool = False,
 ) -> Inventory:
     if progress:
         print(f"扫描到 {len(scan.files)} 个文件，使用文件名时间模式。")
@@ -1147,8 +1191,16 @@ def inspect_filename_inventory(
             records_by_path[path] = cached
         else:
             changed_tasks.append(task)
+    fast_mode = (
+        fast_structure_validation
+        and engine == "netcdf4"
+        and len(changed_tasks) > FAST_STRUCTURE_SAMPLE_LIMIT
+        and all(task[0].suffix.lower() == ".hdf" for task in changed_tasks)
+    )
+    validation_tasks = _sample_filename_tasks(changed_tasks, FAST_STRUCTURE_SAMPLE_LIMIT) if fast_mode else changed_tasks
+    validation_paths = {task[0] for task in validation_tasks}
     worker_count = choose_inspection_workers(
-        [task[0] for task in changed_tasks] or list(scan.files), workers
+        [task[0] for task in validation_tasks] or list(scan.files), workers
     )
     if progress:
         method = (
@@ -1158,33 +1210,47 @@ def inspect_filename_inventory(
             if engine == "rasterio"
             else "xarray"
         )
-        print(
-            f"复用 {len(records_by_path)} 个文件；检查 {len(changed_tasks)} 个文件的"
-            f"变量、网格和属性（{worker_count} 个进程，{method}）……"
-        )
-    total_changed = max(1, len(changed_tasks))
+        if fast_mode:
+            print(
+                f"复用 {len(records_by_path)} 个文件；快速抽样检查 {len(validation_tasks)} / "
+                f"{len(changed_tasks)} 个文件（{worker_count} 个进程，{method}）……"
+            )
+        else:
+            print(
+                f"复用 {len(records_by_path)} 个文件；检查 {len(changed_tasks)} 个文件的"
+                f"变量、网格和属性（{worker_count} 个进程，{method}）……"
+            )
+    total_changed = max(1, len(validation_tasks))
     completed_changed = 0
     report_every = max(1, total_changed // 100)
     if progress_callback is not None:
         progress_callback(
             completed_changed,
             total_changed,
-            f"准备读取结构：复用 {len(records_by_path)} 个，待检查 {len(changed_tasks)} 个文件",
+            (
+                f"快速结构检查：抽样验证 {len(validation_tasks)} / {len(changed_tasks)} 个文件"
+                if fast_mode
+                else f"准备读取结构：复用 {len(records_by_path)} 个，待检查 {len(changed_tasks)} 个文件"
+            ),
         )
     for record in bounded_process_map(
         _inspect_filename_file,
-        changed_tasks,
-        workers=min(worker_count, max(1, len(changed_tasks))),
+        validation_tasks,
+        workers=min(worker_count, max(1, len(validation_tasks))),
         cancel_event=cancel_event,
     ):
         records_by_path[record.path] = record
         completed_changed += 1
-        if progress_callback is not None and (completed_changed == len(changed_tasks) or completed_changed % report_every == 0):
+        if progress_callback is not None and (completed_changed == len(validation_tasks) or completed_changed % report_every == 0):
             progress_callback(
                 completed_changed,
                 total_changed,
-                f"读取文件结构：{len(records_by_path)}/{len(scan.files)}",
+                f"读取文件结构：{completed_changed}/{len(validation_tasks)}",
             )
+    if fast_mode:
+        for task in changed_tasks:
+            if task[0] not in validation_paths:
+                records_by_path[task[0]] = _fast_filename_record(task)
     records = [records_by_path[path] for path in scan.files]
 
     full_times = np.asarray(scan.expected_times, dtype="datetime64[ns]")
