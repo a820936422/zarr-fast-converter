@@ -31,21 +31,25 @@ impl WorkerProcess {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
         let target = option_env!("TAURI_ENV_TARGET_TRIPLE").unwrap_or("");
+        let source_worker = cfg!(debug_assertions)
+            && env::var("FAST_NC_ZARR_SOURCE_WORKER").ok().as_deref() == Some("1");
         let mut candidates = Vec::new();
-        if cfg!(debug_assertions) {
+        if cfg!(debug_assertions) && !source_worker {
             if let Some(explicit) = env::var_os("FAST_NC_ZARR_WORKER") {
                 candidates.push(PathBuf::from(explicit));
             }
         }
-        if let Ok(executable) = env::current_exe() {
-            if let Some(directory) = executable.parent() {
-                candidates.push(directory.join("fast-nc-zarr-worker"));
-                if !target.is_empty() {
-                    candidates.push(directory.join(format!("fast-nc-zarr-worker-{target}")));
+        if !source_worker {
+            if let Ok(executable) = env::current_exe() {
+                if let Some(directory) = executable.parent() {
+                    candidates.push(directory.join("fast-nc-zarr-worker"));
+                    if !target.is_empty() {
+                        candidates.push(directory.join(format!("fast-nc-zarr-worker-{target}")));
+                    }
                 }
             }
         }
-        if cfg!(debug_assertions) {
+        if cfg!(debug_assertions) && !source_worker {
             candidates
                 .push(project_root.join("apps/desktop/src-tauri/binaries/fast-nc-zarr-worker"));
             if !target.is_empty() {
@@ -54,9 +58,13 @@ impl WorkerProcess {
                 )));
             }
         }
-        let sidecar = candidates
-            .into_iter()
-            .find(|candidate| trusted_worker(candidate));
+        let sidecar = if source_worker {
+            None
+        } else {
+            candidates
+                .into_iter()
+                .find(|candidate| trusted_worker(candidate))
+        };
         let use_sidecar = sidecar.is_some();
         if !use_sidecar && !cfg!(debug_assertions) {
             return Err(AppError::new(
