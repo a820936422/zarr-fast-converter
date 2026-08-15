@@ -96,7 +96,25 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
 }
 
 function reasonText(reason: unknown): string {
-  return reason instanceof Error ? reason.message : String(reason);
+  if (reason instanceof Error) return reason.message;
+  if (typeof reason === "string") return reason;
+  if (reason && typeof reason === "object") {
+    const value = reason as Record<string, unknown>;
+    const message = typeof value.message === "string" ? value.message : null;
+    const kind = typeof value.kind === "string" ? value.kind : null;
+    const stage = typeof value.stage === "string" ? value.stage : null;
+    if (message) {
+      const context = [kind, stage].filter(Boolean).join(" / ");
+      return context ? `${context}: ${message}` : message;
+    }
+    try {
+      const serialized = JSON.stringify(reason);
+      if (serialized) return serialized;
+    } catch {
+      // Keep the final fallback below for non-serializable rejection values.
+    }
+  }
+  return String(reason);
 }
 
 function formatBytes(value: number): string {

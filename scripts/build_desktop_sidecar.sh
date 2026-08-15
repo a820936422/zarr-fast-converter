@@ -20,10 +20,25 @@ pixi run native-develop
 # Package the Python runtime and application sources as a relocatable sidecar
 # when PyInstaller is available. Native builds remain usable without it.
 if command -v pyinstaller >/dev/null 2>&1; then
-  NATIVE_MODULE="$(python -c 'import fast_nc_zarr._native as n; print(n.__file__)')"
+  NATIVE_MODULE="$($PYTHON -c 'import fast_nc_zarr._native as n; print(n.__file__)')"
   BUILD_DIR="${PYINSTALLER_BUILD_DIR:-$ROOT/build/fast-nc-zarr-worker}"
   DIST_DIR="${PYINSTALLER_DIST_DIR:-$ROOT/dist}"
+  RUNTIME_LIB_DIR="$BUILD_DIR/runtime-libs"
   mkdir -p "$BUILD_DIR" "$DIST_DIR"
+  rm -rf "$RUNTIME_LIB_DIR"
+  "$PYTHON" scripts/collect_sidecar_libs.py \
+    --output "$RUNTIME_LIB_DIR" \
+    --module netCDF4 \
+    --module h5py \
+    --module rasterio \
+    --module numpy \
+    --module scipy \
+    --module fast_nc_zarr._native
+  runtime_binary_args=()
+  for library in "$RUNTIME_LIB_DIR"/*; do
+    [[ -f "$library" ]] || continue
+    runtime_binary_args+=(--add-binary "$library:runtime-libs")
+  done
   pyinstaller --noconfirm --clean --onefile \
     --name fast-nc-zarr-worker \
     --paths src \
@@ -31,6 +46,7 @@ if command -v pyinstaller >/dev/null 2>&1; then
     --specpath "$BUILD_DIR" \
     --distpath "$DIST_DIR" \
     --add-binary "$NATIVE_MODULE:fast_nc_zarr" \
+    "${runtime_binary_args[@]}" \
     src/fast_nc_zarr/application/desktop_worker/sidecar_main.py
   WORKER="$DIST_DIR/fast-nc-zarr-worker"
 else
