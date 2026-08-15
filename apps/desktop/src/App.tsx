@@ -610,6 +610,15 @@ function App() {
       setError(reasonText(reason));
     }
   };
+  const chooseOutputDirectory = async () => {
+    setError(null);
+    try {
+      const selected = await pickDirectory();
+      if (typeof selected === "string") setOutputPath(selected);
+    } catch (reason) {
+      setError(reasonText(reason));
+    }
+  };
 
   const inspectNativeZarr = async () => {
     if (!inputPath || inputKind !== "zarr") return;
@@ -1127,7 +1136,7 @@ function App() {
                     </div>
                     <div className="output-option">
                       <label className="field-label" htmlFor="output-path">输出 Zarr 目录</label>
-                      <div className="input-with-action"><Icon name="upload" size={17} /><input id="output-path" value={outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`} onChange={(event) => setOutputPath(event.target.value)} /><span className="path-valid"><Icon name="spark" size={13} /></span></div>
+                      <div className="input-with-action"><Icon name="upload" size={17} /><input id="output-path" value={outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`} onChange={(event) => setOutputPath(event.target.value)} /><button className="field-action" type="button" onClick={() => void chooseOutputDirectory()}>浏览</button></div>
                     </div>
                   </div>
                   <div className="surface-actions"><button className="quiet-button" disabled={busy} type="button" onClick={() => void runPreview()}><Icon name="layers" size={16} />预览计划</button><button className="primary-button" disabled={busy} type="button" onClick={() => void runPipeline()}><Icon name="play" size={16} />启动处理</button></div>
