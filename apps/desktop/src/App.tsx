@@ -20,11 +20,79 @@ import {
   type PipelinePayload,
   type TaskEvent,
   type TaskSummary,
+  type TimeFieldOption,
   type TimeInspection,
+  type TimeRef,
   type TimeRule,
 } from "./api";
 import { useTaskEvents } from "./taskEvents";
 import "./styles.css";
+
+type TimeRuleMode = "full" | "doy" | "calendar";
+type TimeComponent = "full" | "year" | "month" | "day" | "doy";
+
+const TIME_COMPONENT_LABELS: Record<TimeComponent, string> = {
+  full: "完整日期/时间",
+  year: "年份",
+  month: "月份",
+  day: "日期",
+  doy: "年内日序（DOY）",
+};
+
+function timeRefKey(ref: TimeRef | undefined): string {
+  return ref ? `${ref.source}:${ref.component}:${ref.index}` : "";
+}
+
+function firstTimeRef(options: TimeFieldOption[], component: TimeComponent): TimeRef | undefined {
+  return options.find((option) => option.ref.component === component)?.ref;
+}
+
+function timeRuleMode(rule: TimeRule | null): TimeRuleMode {
+  if (rule?.full) return "full";
+  if (rule?.doy) return "doy";
+  return "calendar";
+}
+
+function initialTimeRule(
+  inspection: TimeInspection,
+  current: TimeRule | null,
+): { rule: TimeRule | null; mode: TimeRuleMode } {
+  if (current) return { rule: current, mode: timeRuleMode(current) };
+  if (inspection.suggested_rule) {
+    return { rule: inspection.suggested_rule, mode: timeRuleMode(inspection.suggested_rule) };
+  }
+  const full = firstTimeRef(inspection.options, "full");
+  if (full) return { rule: { full }, mode: "full" };
+  const year = firstTimeRef(inspection.options, "year");
+  const doy = firstTimeRef(inspection.options, "doy");
+  if (year && doy) return { rule: { year, doy }, mode: "doy" };
+  const month = firstTimeRef(inspection.options, "month");
+  const day = firstTimeRef(inspection.options, "day");
+  if (year && month && day) return { rule: { year, month, day }, mode: "calendar" };
+  return { rule: null, mode: "full" };
+}
+
+function validateTimeRule(mode: TimeRuleMode, rule: TimeRule | null): string | null {
+  if (mode === "full" && !rule?.full) return "请选择一个完整日期或完整时间字段。";
+  if (mode === "doy" && (!rule?.year || !rule.doy)) return "请选择年份字段和 DOY 字段。";
+  if (mode === "calendar" && (!rule?.year || !rule.month || !rule.day)) {
+    return "请选择年份、月份和日期字段。";
+  }
+  return null;
+}
+
+function timeRuleOptionLabel(options: TimeFieldOption[], ref: TimeRef | undefined): string {
+  return options.find((option) => timeRefKey(option.ref) === timeRefKey(ref))?.label || "未选择";
+}
+
+function timeRuleSummary(rule: TimeRule | null, options: TimeFieldOption[]): string {
+  if (!rule) return "尚未选择时间规则";
+  if (rule.full) return `${TIME_COMPONENT_LABELS.full}：${timeRuleOptionLabel(options, rule.full)}`;
+  const parts = (["year", "month", "day", "doy"] as const)
+    .filter((component) => rule[component])
+    .map((component) => `${TIME_COMPONENT_LABELS[component]}：${timeRuleOptionLabel(options, rule[component])}`);
+  return parts.join("；");
+}
 
 type InputKind = "source" | "zarr";
 type InspectionStage = "input" | "time" | "structure";
@@ -175,6 +243,10 @@ function App() {
   const [engine, setEngine] = useState("auto");
   const [timeInspection, setTimeInspection] = useState<TimeInspection | null>(null);
   const [timeRule, setTimeRule] = useState<TimeRule | null>(null);
+  const [timeRuleModalOpen, setTimeRuleModalOpen] = useState(false);
+  const [timeRuleDraft, setTimeRuleDraft] = useState<TimeRule | null>(null);
+  const [timeRuleMode, setTimeRuleMode] = useState<TimeRuleMode>("full");
+  const [timeRuleError, setTimeRuleError] = useState<string | null>(null);
   const [inspection, setInspection] = useState<InspectionResult | null>(null);
   const [stage, setStage] = useState<InspectionStage>("input");
   const [busy, setBusy] = useState(false);
@@ -242,10 +314,14 @@ function App() {
   const clearInspection = () => {
     setTimeInspection(null);
     setTimeRule(null);
+    setTimeRuleModalOpen(false);
+    setTimeRuleDraft(null);
+    setTimeRuleError(null);
     setInspection(null);
     setSelectedVariables([]);
     setPlan(null);
     setStage("input");
+
   };
 
   const chooseInput = async () => {
@@ -292,6 +368,62 @@ function App() {
     } finally {
       setBusy(false);
     }
+  };
+  const openTimeRuleModal = () => {
+    if (!timeInspection) return;
+    const initial = initialTimeRule(timeInspection, timeRule);
+    setTimeRuleDraft(initial.rule);
+    setTimeRuleMode(initial.mode);
+    setTimeRuleError(null);
+    setTimeRuleModalOpen(true);
+  };
+
+  const selectTimeRuleMode = (mode: TimeRuleMode) => {
+    setTimeRuleMode(mode);
+    setTimeRuleError(null);
+    setTimeRuleDraft((current) => {
+      const options = timeInspection?.options || [];
+      const next: TimeRule = {};
+      if (mode === "full") {
+        const full = current?.full || firstTimeRef(options, "full");
+        if (full) next.full = full;
+      } else if (mode === "doy") {
+        const year = current?.year || firstTimeRef(options, "year");
+        const doy = current?.doy || firstTimeRef(options, "doy");
+        if (year) next.year = year;
+        if (doy) next.doy = doy;
+      } else {
+        const year = current?.year || firstTimeRef(options, "year");
+        const month = current?.month || firstTimeRef(options, "month");
+        const day = current?.day || firstTimeRef(options, "day");
+        if (year) next.year = year;
+        if (month) next.month = month;
+        if (day) next.day = day;
+      }
+      return next;
+    });
+  };
+
+  const selectTimeRuleComponent = (component: TimeComponent, value: string) => {
+    const option = timeInspection?.options.find((item) => timeRefKey(item.ref) === value);
+    setTimeRuleDraft((current) => {
+      const next: TimeRule = { ...(current || {}) };
+      if (option) next[component] = option.ref;
+      else delete next[component];
+      return next;
+    });
+    setTimeRuleError(null);
+  };
+
+  const confirmTimeRule = () => {
+    const validation = validateTimeRule(timeRuleMode, timeRuleDraft);
+    if (validation) {
+      setTimeRuleError(validation);
+      return;
+    }
+    setTimeRule(timeRuleDraft);
+    setTimeRuleModalOpen(false);
+    setTimeRuleError(null);
   };
 
   const inspectStructure = async () => {
@@ -413,7 +545,8 @@ function App() {
 
   const stageIndex = stage === "input" ? 1 : stage === "time" ? 2 : 3;
   const canInspectTime = inputKind === "source" && Boolean(inputPath) && !busy;
-  const canInspectStructure = Boolean(inputPath) && (inputKind === "zarr" || Boolean(timeRule) || stage === "time") && !busy;
+  const hasTimeAxis = Boolean(timeInspection?.time_dimension?.exists);
+  const canInspectStructure = Boolean(inputPath) && (inputKind === "zarr" || Boolean(timeRule) || (stage === "time" && hasTimeAxis)) && !busy;
   const runningTasks = useMemo(() => tasks.filter((task) => task.status === "running" || task.status === "cancelling"), [tasks]);
   const supported = (operation: string) => nativeCapability?.capabilities.find((item) => item.operation === operation);
   const variableOptions = useMemo(() => {
@@ -541,7 +674,21 @@ function App() {
                   <label className="field-label" htmlFor="input-path">数据路径</label><div className="input-with-action"><Icon name="folder" size={17} /><input id="input-path" value={inputPath} onChange={(event) => setInputPath(event.target.value)} placeholder={inputKind === "source" ? "选择 NetCDF / HDF / TIFF 目录" : "选择 Zarr v3 目录"} /><button className="field-action" type="button" onClick={() => void chooseInput()}>浏览</button></div>
                   {inputKind === "zarr" && <div className="input-with-action secondary-input"><Icon name="layers" size={17} /><input aria-label="Zarr array path" value={arrayPath} onChange={(event) => setArrayPath(event.target.value)} placeholder="array path，例如 /value" /><button className="field-action" type="button" disabled={!inputPath || busy} onClick={() => void inspectNativeZarr()}>原生检查</button></div>}
                   {inputKind === "source" && <div className="inline-options"><label className="check-control"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /><span className="fake-check" />递归扫描</label><label className="select-control">读取引擎<select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="auto">自动选择</option><option value="h5netcdf">h5netcdf</option><option value="netcdf4">netcdf4</option><option value="rasterio">rasterio</option></select></label></div>}
-                  {timeInspection && <div className="inline-result"><div className="result-icon"><Icon name="clock" size={16} /></div><div><strong>时间规则待确认</strong><p>{timeInspection.report}</p><select aria-label="时间规则" value={timeRule ? JSON.stringify(timeRule) : ""} onChange={(event) => setTimeRule(event.target.value ? JSON.parse(event.target.value) as TimeRule : null)}><option value="">请选择已确认规则</option><option value={timeInspection.suggested_rule ? JSON.stringify(timeInspection.suggested_rule) : ""}>使用建议规则</option></select></div></div>}
+                  {timeInspection && (
+                    <div className="inline-result time-inspection-result">
+                      <div className="result-icon"><Icon name="clock" size={16} /></div>
+                      <div>
+                        <strong>时间规则待确认</strong>
+                        <p>{timeInspection.report}</p>
+                        <div className="time-rule-action">
+                          <span>{timeRuleSummary(timeRule, timeInspection.options)}</span>
+                          <button className="quiet-button" type="button" onClick={openTimeRuleModal}>
+                            {timeRule ? "修改时间规则" : "选择时间规则"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   {inspection && <div className="inline-result success"><div className="result-icon"><Icon name="spark" size={16} /></div><div><strong>结构检查完成</strong><p>{inspection.report}</p><span>{inspection.warnings.length ? `${inspection.warnings.length} 条警告` : "未发现警告"}</span></div><button className="icon-button" type="button" title="保存检查快照" onClick={() => void saveSnapshot()}><Icon name="archive" size={16} /></button></div>}
                   {variableOptions.length > 0 && <div className="variable-block"><div className="variable-heading"><strong>参与处理的变量</strong><span>{selectedVariables.length} / {variableOptions.length}</span></div><div className="variable-list">{variableOptions.map((name) => <label key={name}><input type="checkbox" checked={selectedVariables.includes(name)} onChange={(event) => setSelectedVariables((current) => event.target.checked ? [...current, name] : current.filter((item) => item !== name))} /><span className="fake-check" />{name}</label>)}</div></div>}
                   <div className="surface-actions"><button className="quiet-button" type="button" disabled={!canInspectTime} onClick={() => void inspectTime()}><Icon name="clock" size={16} />检查时间轴</button><button className="primary-button" type="button" disabled={!canInspectStructure} onClick={() => void inspectStructure()}><Icon name="arrow" size={16} />读取结构</button></div>
@@ -586,6 +733,81 @@ function App() {
             </>
           )}
         </div>
+        {timeRuleModalOpen && timeInspection && (
+          <div
+            className="modal-backdrop"
+            role="presentation"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) setTimeRuleModalOpen(false);
+            }}
+          >
+            <section className="time-rule-modal" role="dialog" aria-modal="true" aria-labelledby="time-rule-title">
+              <div className="modal-heading">
+                <div>
+                  <span className="section-kicker">TIME RULE</span>
+                  <h2 id="time-rule-title">选择时间规则</h2>
+                </div>
+                <button className="icon-button" type="button" aria-label="关闭" onClick={() => setTimeRuleModalOpen(false)}>×</button>
+              </div>
+              <p className="modal-description">请选择用于生成每日时间坐标的字段。完整日期适合文件名中的 YYYYDOY/YYYYMMDD；组合字段适合年份与 DOY 或年月日分开存储的产品。</p>
+              <div className="rule-mode-tabs" role="tablist" aria-label="时间规则类型">
+                <button className={timeRuleMode === "full" ? "active" : ""} type="button" onClick={() => selectTimeRuleMode("full")}>完整日期/时间</button>
+                <button className={timeRuleMode === "doy" ? "active" : ""} type="button" onClick={() => selectTimeRuleMode("doy")}>年份 + DOY</button>
+                <button className={timeRuleMode === "calendar" ? "active" : ""} type="button" onClick={() => selectTimeRuleMode("calendar")}>年份 + 月 + 日</button>
+              </div>
+              <div className="time-rule-fields">
+                {timeRuleMode === "full" && (
+                  <label className="time-rule-field">
+                    <span>{TIME_COMPONENT_LABELS.full}</span>
+                    <select
+                      value={timeRefKey(timeRuleDraft?.full)}
+                      onChange={(event) => selectTimeRuleComponent("full", event.target.value)}
+                    >
+                      <option value="">请选择字段</option>
+                      {timeInspection.options.filter((option) => option.ref.component === "full").map((option) => (
+                        <option key={timeRefKey(option.ref)} value={timeRefKey(option.ref)}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {timeRuleMode === "doy" && (["year", "doy"] as const).map((component) => (
+                  <label className="time-rule-field" key={component}>
+                    <span>{TIME_COMPONENT_LABELS[component]}</span>
+                    <select
+                      value={timeRefKey(timeRuleDraft?.[component])}
+                      onChange={(event) => selectTimeRuleComponent(component, event.target.value)}
+                    >
+                      <option value="">请选择字段</option>
+                      {timeInspection.options.filter((option) => option.ref.component === component).map((option) => (
+                        <option key={timeRefKey(option.ref)} value={timeRefKey(option.ref)}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                ))}
+                {timeRuleMode === "calendar" && (["year", "month", "day"] as const).map((component) => (
+                  <label className="time-rule-field" key={component}>
+                    <span>{TIME_COMPONENT_LABELS[component]}</span>
+                    <select
+                      value={timeRefKey(timeRuleDraft?.[component])}
+                      onChange={(event) => selectTimeRuleComponent(component, event.target.value)}
+                    >
+                      <option value="">请选择字段</option>
+                      {timeInspection.options.filter((option) => option.ref.component === component).map((option) => (
+                        <option key={timeRefKey(option.ref)} value={timeRefKey(option.ref)}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                ))}
+              </div>
+              {timeRuleError && <div className="modal-error" role="alert">{timeRuleError}</div>}
+              <div className="modal-preview"><span>当前选择</span><strong>{timeRuleSummary(timeRuleDraft, timeInspection.options)}</strong></div>
+              <div className="modal-actions">
+                <button className="quiet-button" type="button" onClick={() => setTimeRuleModalOpen(false)}>取消</button>
+                <button className="primary-button" type="button" onClick={confirmTimeRule}>确认规则</button>
+              </div>
+            </section>
+          </div>
+        )}
         {(error || backendError) && <div className="error-toast" role="alert"><Icon name="terminal" size={17} /><span>{error || backendError}</span><button type="button" onClick={() => { setError(null); setBackendError(null); }}>×</button></div>}
       </main>
     </div>

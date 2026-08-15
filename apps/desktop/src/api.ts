@@ -29,6 +29,12 @@ export type TimeRef = {
 
 export type TimeRule = Partial<Record<"full" | "year" | "month" | "day" | "doy", TimeRef>>;
 
+export type TimeFieldOption = {
+  ref: TimeRef;
+  label: string;
+  sample: string;
+};
+
 export type InspectionRequest = {
   input_dir: string;
   mode?: "auto" | "complete" | "filename";
@@ -50,7 +56,7 @@ export type TimeInspection = {
   coordinates: string[];
   filename_fields: Array<Record<string, unknown>>;
   time_dimension: Record<string, unknown>;
-  options: Array<Record<string, unknown>>;
+  options: TimeFieldOption[];
   suggested_rule: TimeRule | null;
   report: string;
 };
