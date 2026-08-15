@@ -76,8 +76,7 @@ def main() -> int:
         "apps/desktop/src-tauri/src/lib.rs": _read_rust_runtime_version(ROOT / "apps/desktop/src-tauri/src/lib.rs"),
         "contracts/README.md": _read_regex_version(ROOT / "contracts/README.md", r"^# v([0-9]+\.[0-9]+\.[0-9]+) IPC contract$"),
         "contracts/fixtures/capability-v1.json": _read_json_value(ROOT / "contracts/fixtures/capability-v1.json", "crate_version"),
-        "docs/README.md": _read_regex_version(ROOT / "docs/README.md", r"当前 v([0-9]+\.[0-9]+\.[0-9]+) 功能"),
-        "docs/gui.md": _read_regex_version(ROOT / "docs/gui.md", r"^## v([0-9]+\.[0-9]+\.[0-9]+) Linux 发布范围$"),
+        "docs/README.md release": _read_regex_version(ROOT / "docs/README.md", r"^## v([0-9]+\.[0-9]+\.[0-9]+) Linux 发布范围$"),
     }
     mismatches = {name: value for name, value in values.items() if value != expected}
     for name, value in values.items():

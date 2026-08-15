@@ -152,8 +152,6 @@ pixi run tauri-build
 ## 文档
 
 - [模块文档](docs/README.md)
-- [Tauri 桌面应用](docs/gui.md)
-- [v1.7.4 开发方案](docs/v1.7.4-development-plan.md)
 - [IPC contracts](contracts/README.md)
 
 ## 结果安全边界

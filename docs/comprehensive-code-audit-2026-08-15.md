@@ -58,7 +58,7 @@
 **H-01 — native NetCDF conversion 直接写最终输出目录，失败会留下部分 Zarr。**
 
 - **证据**：`rust/crates/fast-nc-zarr-zarr/src/netcdf_native.rs:396-431` 只检查 `output.exists()`，随后直接 `create_dir_all(output)` 和写 group metadata/data；没有 staging、回滚或失败清理。
-- **影响**：磁盘、权限、读取或写 chunk 失败后，最终路径仍可能存在半成品；自动化或用户可能把它当成有效结果。这与 `docs/converter.md:32-34,97-98` 和根 README 的 staging 承诺冲突。
+- **影响**：磁盘、权限、读取或写 chunk 失败后，最终路径仍可能存在半成品；自动化或用户可能把它当成有效结果。这与模块总览 `docs/README.md` 和根 README 的 staging 承诺冲突。
 - **建议**：所有 native output 先写唯一 sibling staging，执行结构/语义校验，再原子 rename；失败、取消和 panic 路径都清理 staging，必要时对 metadata 和父目录执行持久化同步。
 
 **H-02 — `_FillValue`、`scale_factor`、`add_offset` 没有保持为统一的 Zarr 语义。**
@@ -252,7 +252,7 @@
 
 **M-15 — contract 测试没有真正校验 JSON Schema 和 canonical fixture。**
 
-- **证据**：`tests/test_contracts.py:15-27` 只解析 JSON、检查 `$schema` 字符串和常量；`:55-78` 只断言少量事件名/数量，未比较 payload、sequence、required/additional properties。
+- **证据**：`tests/test_protocol.py:15-27` 只解析 JSON、检查 `$schema` 字符串和常量；协议 fixture 断言仍未比较 payload、sequence、required/additional properties。
 - **影响**：字段 drift、额外字段、必需字段缺失以及动态事件结构变化可能不被发现；`native_task` 还在 protocol command 中声明但 Python dispatch 拒绝。
 - **建议**：使用 JSON Schema validator 校验 request/event/error/capability 实例；对动态 ID 做归一化后比较完整 fixture；区分 Tauri native command 与 Python worker command。
 
@@ -264,7 +264,7 @@
 
 **M-17 — Python wheel 之外的真实格式覆盖仍不足。**
 
-- **证据**：当前 focused tests 主要覆盖 NetCDF/Zarr；`tests/test_filename_mode.py` 使用 NetCDF fixtures，未见 TIFF-specific integration；未见 HDF-EOS `StructMetadata.0` 坐标重建 fixture。`docs/raw-validation.md:104-109` 也明确抽样校验不是完整科学等价证明。
+- **证据**：当前 focused tests 主要覆盖 NetCDF/Zarr；`tests/test_filename_mode.py` 使用 NetCDF fixtures，未见 TIFF-specific integration；未见 HDF-EOS `StructMetadata.0` 坐标重建 fixture。模块总览 `docs/README.md` 也明确抽样校验不是完整科学等价证明。
 - **影响**：真实个人数据中的 CRS、nodata、旋转/轴方向、多 band、HDF group 和 EOS metadata 问题可能在发布后才暴露。
 - **建议**：加入最小但真实的 GeoTIFF、HDF4/HDF5/HDF-EOS、packed NetCDF、不同 calendar 和异常维度 fixtures，并将代表性数据 smoke 纳入 CI。
 
@@ -302,7 +302,7 @@
 | 检查 | 结果 |
 |---|---|
 | `pixi run version-check` | 通过，所有已覆盖 manifest 为 1.7.3 |
-| `pixi run python -m pytest -q tests/test_contracts.py tests/test_desktop_worker.py` | **7 passed** |
+| `pixi run python -m pytest -q tests/test_protocol.py` | **6 passed** |
 | `CFLAGS=-std=gnu17 cargo test -p fast-nc-zarr-desktop` | **17 passed**，0 failed |
 | `pixi run python -m pytest -q tests/test_native_smoke.py` | **25 passed** |
 | `pixi run python -m pytest -q tests/test_runtime_publication.py` | **8 passed** |
