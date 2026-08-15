@@ -267,6 +267,40 @@ def _expected_times(
     )
 
 
+def _repeated_date_like_positions(names: tuple[str, ...]) -> set[int]:
+    """Return changing positions occupied by repeated date-like metadata.
+
+    Some products include both an observation date and a processing date in
+    each filename.  A processing date that changes only at a product-version
+    boundary must not invalidate the unique observation-date candidate, but a
+    second date field that is unique for every file remains ambiguous.
+    """
+    sample = names[0]
+    positions: set[int] = set()
+    for match in re.finditer(r"\d+", sample):
+        start, end = match.span()
+        length = end - start
+        if length == 7:
+            template, part_lengths = "doy", (4, 3)
+        elif length == 8:
+            template, part_lengths = "ymd", (4, 2, 2)
+        else:
+            continue
+        values = tuple(name[start:end] for name in names)
+        if any(not value.isdigit() for value in values):
+            continue
+        try:
+            dates = tuple(
+                _date_from_parts(template, _parts_from_text(template, value, part_lengths))
+                for value in values
+            )
+        except FilenameTimeError:
+            continue
+        if len(set(dates)) < len(dates):
+            positions.update(range(start, end))
+    return positions
+
+
 def _automatic_rule_candidates(files: tuple[Path, ...], cancel_event=None) -> tuple[FilenameRuleCandidate, ...]:
     if not files:
         raise FilenameTimeError("没有可用于推断时间字段的文件。")
@@ -281,6 +315,7 @@ def _automatic_rule_candidates(files: tuple[Path, ...], cancel_event=None) -> tu
     }
     if not changed_positions:
         raise FilenameTimeError("所有文件名都相同，无法推断时间字段。")
+    repeated_date_like_positions = _repeated_date_like_positions(names)
     suffix = files[0].suffix.lower()
     if any(path.suffix.lower() != suffix for path in files):
         raise FilenameTimeError("文件扩展名不一致，无法自动推断时间字段。")
@@ -306,10 +341,11 @@ def _automatic_rule_candidates(files: tuple[Path, ...], cancel_event=None) -> tu
                 # when one of the occurrences happens to be constant across
                 # the directory.
                 continue
-            if not changed_positions.issubset(range(start, end)):
-                # The automatic rule must account for every changing filename
-                # position.  Otherwise a changing orbit/version/product token
-                # could be silently mistaken for a consistent time series.
+            outside_positions = changed_positions.difference(range(start, end))
+            if outside_positions and not outside_positions.issubset(repeated_date_like_positions):
+                # Ignore only a repeated, valid date-like metadata field (for example
+                # a processing date); arbitrary changing tokens remain unsafe to
+                # ignore, and a second unique date field remains ambiguous.
                 continue
             try:
                 dates = tuple(

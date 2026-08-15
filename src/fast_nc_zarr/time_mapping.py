@@ -403,9 +403,18 @@ def _suggest_rule(
     full_time = next((item.ref for item in options if item.ref.source == "time" and item.ref.component == "full"), None)
     if full_time is not None:
         return TimeRule(full=full_time)
-    full_filename = [item.ref for item in options if item.ref.source == "filename" and item.ref.component == "full"]
-    if len(full_filename) == 1 and not time_info.exists:
-        return TimeRule(full=full_filename[0])
+    field_by_index = {field.index: field for field in fields}
+    unique_full_filename = [
+        item.ref
+        for item in options
+        if item.ref.source == "filename"
+        and item.ref.component == "full"
+        and item.ref.index in field_by_index
+        and len(set(field_by_index[item.ref.index].values))
+        == len(field_by_index[item.ref.index].values)
+    ]
+    if len(unique_full_filename) == 1 and not time_info.exists:
+        return TimeRule(full=unique_full_filename[0])
     year_filename = next((item.ref for item in options if item.ref.source == "filename" and item.ref.component == "year"), None)
     doy_time = next((item.ref for item in options if item.ref.source == "time" and item.ref.component == "doy"), None)
     if year_filename is not None and doy_time is not None:

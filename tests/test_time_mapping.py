@@ -34,6 +34,7 @@ class TimeMappingTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         shutil.rmtree(ROOT, ignore_errors=True)
         (ROOT / "filename").mkdir(parents=True)
+        (ROOT / "filename-processing").mkdir(parents=True)
         (ROOT / "hybrid").mkdir(parents=True)
         (ROOT / "complete").mkdir(parents=True)
         lat = np.asarray([10, 20], dtype="float32")
@@ -44,6 +45,12 @@ class TimeMappingTests(unittest.TestCase):
             coords={"lat": lat, "lon": lon},
         )
         filename_data.to_netcdf(ROOT / "filename" / "product_2001001.nc", engine="h5netcdf")
+        for name in (
+            "GLASS14B01.V10.A2001001.2023068.hdf",
+            "GLASS14B01.V10.A2001009.2023068.hdf",
+            "GLASS14B01.V10.A2001017.2025133.hdf",
+        ):
+            filename_data.to_netcdf(ROOT / "filename-processing" / name, engine="h5netcdf")
         filename_data.close()
 
         for year in (2001, 2002):
@@ -95,6 +102,12 @@ class TimeMappingTests(unittest.TestCase):
             result.filename_fields,
         )
         self.assertEqual(str(dates[0])[:10], "2001-01-01")
+
+    def test_repeated_processing_date_suggests_unique_filename_date(self) -> None:
+        result = inspect_time_metadata(ROOT / "filename-processing", requested_engine="h5netcdf")
+        self.assertIsNotNone(result.suggested_rule)
+        self.assertEqual(result.suggested_rule.full.source, "filename")
+        self.assertEqual(result.suggested_rule.full.index, 3)
 
     def test_time_metadata_reports_progress_phases(self) -> None:
         progress: list[tuple[int, int, str]] = []

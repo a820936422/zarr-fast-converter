@@ -95,6 +95,24 @@ class FilenameModeTests(unittest.TestCase):
         with self.assertRaises(FilenameTimeError):
             scan_filename_times(folder)
 
+    def test_repeated_processing_date_does_not_mask_observation_doy(self) -> None:
+        folder = ROOT / "glass-processing-date"
+        folder.mkdir()
+        for name in (
+            "GLASS14B01.V10.A2001001.2023068.hdf",
+            "GLASS14B01.V10.A2001009.2023068.hdf",
+            "GLASS14B01.V10.A2001017.2025133.hdf",
+        ):
+            (folder / name).touch()
+        scan = scan_filename_times(folder)
+        self.assertEqual(scan.template, "doy")
+        self.assertEqual(scan.sample_start, 16)
+        self.assertEqual(scan.sample_length, 7)
+        self.assertEqual(
+            [str(value)[:10] for value in scan.actual_times],
+            ["2001-01-01", "2001-01-09", "2001-01-17"],
+        )
+
     def test_manual_rule_allows_non_time_tokens_to_change(self) -> None:
         folder = ROOT / "manual"
         folder.mkdir()
