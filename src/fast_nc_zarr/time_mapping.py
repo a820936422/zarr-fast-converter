@@ -122,25 +122,36 @@ def _raise_if_cancelled(cancel_event) -> None:
         raise RuntimeError("任务已取消。")
 
 
+def _report_progress(progress_callback, completed: int, total: int, message: str) -> None:
+    if progress_callback is not None:
+        progress_callback(completed, total, message)
+
+
 def inspect_time_metadata(
     input_dir: Path,
     *,
     recursive: bool = False,
     requested_engine: str = "auto",
     cancel_event=None,
+    progress_callback=None,
 ) -> TimeInspectionResult:
     """Read only filenames and the first file's metadata/time coordinate."""
 
     from .filename_mode import discover_filename_files, probe_dataset_structure
 
+    total = 4
+    _report_progress(progress_callback, 0, total, "扫描输入文件")
     source = Path(input_dir).expanduser().resolve()
     files = discover_filename_files(source, recursive=recursive)
     _raise_if_cancelled(cancel_event)
+    _report_progress(progress_callback, 1, total, f"读取首个文件结构（共 {len(files)} 个文件）")
     engine, dimensions, coordinates, has_time, _has_space = probe_dataset_structure(
         files[0], requested_engine
     )
+    _report_progress(progress_callback, 2, total, "分析文件名中的时间字段")
     filename_fields = _discover_filename_fields(files, cancel_event=cancel_event)
     _raise_if_cancelled(cancel_event)
+    _report_progress(progress_callback, 3, total, "读取首个文件的时间维度")
     time_info = _inspect_time_dimension(
         files[0], engine, dimensions, has_time, cancel_event=cancel_event
     )
@@ -157,6 +168,7 @@ def inspect_time_metadata(
         time_info,
         suggested,
     )
+    _report_progress(progress_callback, total, total, "时间字段候选生成完成")
     return TimeInspectionResult(
         input_dir=source,
         files=files,

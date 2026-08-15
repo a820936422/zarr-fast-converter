@@ -3,23 +3,23 @@ import {
   getBackendInfo,
   getNativeCapabilities,
   inspectPipelineRecovery,
-  inspectSource,
-  inspectTimeMetadata,
-  inspectZarr,
   pickDirectory,
   pickSnapshotDestination,
   previewPipeline,
   resumePipeline,
   saveInspectionSnapshot,
+  startInspection,
   startNativeTask,
   startPipeline,
   type BackendCapability,
   type BackendInfo,
-  type InspectionRequest,
+  type FilenameFieldSummary,
   type InspectionResult,
+  type InspectionTaskOperation,
   type PipelinePayload,
   type TaskEvent,
   type TaskSummary,
+  type TimeDimensionSummary,
   type TimeFieldOption,
   type TimeInspection,
   type TimeRef,
@@ -94,6 +94,17 @@ function timeRuleSummary(rule: TimeRule | null, options: TimeFieldOption[]): str
   return parts.join("；");
 }
 
+type InspectionProgressStatus = "starting" | "running" | "finished" | "failed" | "cancelled";
+type InspectionProgressState = {
+  taskId: string | null;
+  operation: InspectionTaskOperation;
+  label: string;
+  message: string;
+  completed: number;
+  total: number;
+  status: InspectionProgressStatus;
+  startedAt: number;
+};
 type InputKind = "source" | "zarr";
 type InspectionStage = "input" | "time" | "structure";
 type View = "overview" | "inspection" | "pipeline" | "tasks" | "settings";
@@ -162,6 +173,94 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     </svg>
   );
 }
+function fieldValuesPreview(field: FilenameFieldSummary): string {
+  const values = field.values.slice(0, 4);
+  if (!values.length) return "暂无样例值";
+  return values.join("、") + (field.values.length > values.length ? " ……" : "");
+}
+
+function timeValuesPreview(values: string[]): string {
+  if (!values.length) return "未发现可解码值";
+  const preview = values.slice(0, 3).join("、");
+  return preview + (values.length > 3 ? " ……" : "");
+}
+
+function StructuredTimeInspection({ inspection }: { inspection: TimeInspection }) {
+  const dimension: TimeDimensionSummary = inspection.time_dimension;
+  const attributes = Object.entries(dimension.attrs).filter(([, value]) => value !== null && value !== "").slice(0, 4);
+  return (
+    <div className="structured-time-report">
+      <div className="inspection-report-grid">
+        <div><span>文件数量</span><strong>{inspection.files.length.toLocaleString()}</strong></div>
+        <div><span>读取引擎</span><strong>{inspection.engine}</strong></div>
+        <div><span>数据维度</span><strong>{inspection.dimensions.length || "—"}</strong><small>{inspection.dimensions.join(" · ") || "未识别"}</small></div>
+        <div><span>坐标数量</span><strong>{inspection.coordinates.length || "—"}</strong><small>{inspection.coordinates.join(" · ") || "未识别"}</small></div>
+      </div>
+      <section className="report-section">
+        <div className="report-section-heading"><strong>文件名时间字段</strong><span>{inspection.filename_fields.length} 个数字字段</span></div>
+        {inspection.filename_fields.length ? (
+          <div className="filename-field-list">
+            {inspection.filename_fields.map((field) => (
+              <div className="filename-field-card" key={field.index}>
+                <div className="filename-field-head"><strong>字段 #{field.index}</strong><span className={field.changed ? "field-status changed" : "field-status"}>{field.changed ? "跨文件变化" : "稳定/未验证"}</span></div>
+                <div className="filename-field-meta"><span>样例 <b>{field.sample}</b></span><span>位置 {field.start}–{field.start + field.length - 1}</span><span>长度 {field.length}</span></div>
+                <small>{fieldValuesPreview(field)}</small>
+              </div>
+            ))}
+          </div>
+        ) : <p className="report-empty">未发现可用于时间解析的文件名数字字段。</p>}
+      </section>
+      <section className="report-section">
+        <div className="report-section-heading"><strong>数据内时间维度</strong><span className={dimension.exists ? "report-status good" : "report-status warning"}>{dimension.exists ? "已发现" : "未发现"}</span></div>
+        {dimension.exists ? (
+          <div className="report-detail-grid">
+            <div><span>维度名称</span><strong>{dimension.name || "未命名"}</strong></div>
+            <div><span>格式</span><strong>{dimension.format_label || "未识别"}</strong></div>
+            <div className="wide"><span>解码样例</span><strong>{timeValuesPreview(dimension.decoded_values)}</strong></div>
+            {attributes.map(([key, value]) => <div key={key}><span>{key}</span><strong>{String(value)}</strong></div>)}
+          </div>
+        ) : <p className="report-empty">首个文件没有可识别的 time 维度，将依赖文件名规则生成时间轴。</p>}
+      </section>
+      <section className="report-section">
+        <div className="report-section-heading"><strong>可用时间规则</strong><span>{inspection.options.length} 个候选</span></div>
+        {inspection.options.length ? <div className="rule-option-list">{inspection.options.map((option) => <span key={`${option.ref.source}:${option.ref.component}:${option.ref.index}`}>{option.label}</span>)}</div> : <p className="report-empty">暂无可用候选，请检查输入文件的命名或时间维度。</p>}
+      </section>
+      <details className="raw-inspection-report"><summary>查看原始检查日志</summary><pre>{inspection.report}</pre></details>
+    </div>
+  );
+}
+
+function progressStatusLabel(status: InspectionProgressStatus): string {
+  return { starting: "正在启动", running: "后端执行中", finished: "检查完成", failed: "检查失败", cancelled: "已取消" }[status];
+}
+
+function InspectionProgressCard({
+  progress,
+  nowMs,
+  onCancel,
+}: {
+  progress: InspectionProgressState;
+  nowMs: number;
+  onCancel?: () => void;
+}) {
+  const determinate = progress.total > 0;
+  const percentage = determinate ? Math.min(100, Math.max(0, Math.round((progress.completed / progress.total) * 100))) : 0;
+  const elapsed = Math.max(0, Math.round((nowMs - progress.startedAt) / 1000));
+  return (
+    <div className={`inspection-progress-card ${progress.status}`} role="status" aria-live="polite">
+      <div className="progress-icon"><Icon name={progress.status === "failed" ? "terminal" : "activity"} size={16} /></div>
+      <div className="inspection-progress-content">
+        <div className="inspection-progress-heading"><strong>{progress.label}</strong><span>{progressStatusLabel(progress.status)}</span></div>
+        <p>{progress.message}</p>
+        <div className="inspection-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={determinate ? percentage : undefined} aria-label={`${progress.label}进度`}>
+          <span className={!determinate ? "indeterminate" : ""} style={determinate ? { width: `${percentage}%` } : undefined} />
+        </div>
+        <div className="inspection-progress-foot"><span>{determinate ? `${percentage}% · ${progress.completed}/${progress.total}` : "正在等待后端反馈"}</span><span>已用 {elapsed}s</span>{onCancel && (progress.status === "starting" || progress.status === "running") && <button type="button" onClick={onCancel}>取消</button>}</div>
+      </div>
+    </div>
+  );
+}
+
 
 function reasonText(reason: unknown): string {
   if (reason instanceof Error) return reason.message;
@@ -207,6 +306,9 @@ function formatCommand(command: string): string {
     native_task: "原生任务",
     run_pipeline: "数据处理",
     resume_pipeline: "恢复处理",
+    inspect_time_metadata: "时间轴检查",
+    inspect_source: "结构检查",
+    inspect_zarr: "Zarr 结构检查",
   }[command] || command;
 }
 
@@ -220,6 +322,8 @@ function capabilityReason(item: BackendCapability["capabilities"][number]): stri
 }
 
 function eventText(event: TaskEvent): string {
+  const message = event.payload.message;
+  if (typeof message === "string" && message) return message;
   if (event.event === "progress") {
     const completed = event.payload.completed;
     const total = event.payload.total;
@@ -250,6 +354,10 @@ function App() {
   const [inspection, setInspection] = useState<InspectionResult | null>(null);
   const [stage, setStage] = useState<InspectionStage>("input");
   const [busy, setBusy] = useState(false);
+  const [inspectionTaskId, setInspectionTaskId] = useState<string | null>(null);
+  const [inspectionTaskOperation, setInspectionTaskOperation] = useState<InspectionTaskOperation | null>(null);
+  const [inspectionProgress, setInspectionProgress] = useState<InspectionProgressState | null>(null);
+  const [progressNowMs, setProgressNowMs] = useState(() => Date.now());
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("overview");
   const [plan, setPlan] = useState<Record<string, unknown> | null>(null);
@@ -286,6 +394,76 @@ function App() {
   }, [events, inputPath]);
 
   useEffect(() => {
+    if (!busy || !inspectionProgress || !["starting", "running"].includes(inspectionProgress.status)) return;
+    const timer = window.setInterval(() => setProgressNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [busy, inspectionProgress?.status]);
+
+  useEffect(() => {
+    if (!inspectionTaskId || !inspectionTaskOperation) return;
+    const event = [...events].reverse().find((item) => item.task_id === inspectionTaskId);
+    if (!event) return;
+    const payloadMessage = typeof event.payload.message === "string" ? event.payload.message : null;
+    const errorPayload = event.payload.error;
+    const errorMessage = errorPayload && typeof errorPayload === "object" && !Array.isArray(errorPayload)
+      ? reasonText(errorPayload)
+      : typeof event.payload.reason === "string" ? event.payload.reason : null;
+    setInspectionProgress((current) => {
+      if (!current) return current;
+      const next = { ...current };
+      if (event.event === "accepted") {
+        next.status = "starting";
+        next.message = "已连接后端检查 worker，等待执行。";
+      } else if (event.event === "started") {
+        next.status = "running";
+        next.message = "后端已开始读取输入数据。";
+      } else if (event.event === "progress") {
+        next.status = "running";
+        next.message = payloadMessage || event.stage || "后端正在处理。";
+        if (typeof event.payload.completed === "number") next.completed = event.payload.completed;
+        if (typeof event.payload.total === "number") next.total = event.payload.total;
+      } else if (event.event === "log") {
+        next.status = "running";
+        next.message = payloadMessage || next.message;
+      } else if (event.event === "finished") {
+        next.status = "finished";
+        next.message = "后端检查完成，正在整理结果。";
+        if (next.total <= 0) { next.completed = 1; next.total = 1; }
+        else next.completed = next.total;
+      } else if (event.event === "cancelled") {
+        next.status = "cancelled";
+        next.message = errorMessage || "检查已取消。";
+      } else if (event.event === "failed") {
+        next.status = "failed";
+        next.message = errorMessage || "后端检查失败。";
+      }
+      return next;
+    });
+    if ((event.event === "inspection_ready" || event.event === "finished") && inspectionTaskOperation === "inspect_time_metadata" && Array.isArray(event.payload.files)) {
+      const result = event.payload as unknown as TimeInspection;
+      setTimeInspection(result);
+      setTimeRule(result.suggested_rule || null);
+      setStage("time");
+    }
+    if ((event.event === "inspection_ready" || event.event === "finished") && inspectionTaskOperation !== "inspect_time_metadata" && typeof event.payload.kind === "string" && typeof event.payload.path === "string") {
+      setInspection({
+        kind: event.payload.kind as InspectionResult["kind"],
+        path: event.payload.path,
+        report: typeof event.payload.report === "string" ? event.payload.report : "结构检查完成",
+        warnings: Array.isArray(event.payload.warnings) ? event.payload.warnings.filter((item): item is string => typeof item === "string") : [],
+        snapshot: event.payload.snapshot && typeof event.payload.snapshot === "object" && !Array.isArray(event.payload.snapshot) ? event.payload.snapshot as Record<string, unknown> : {},
+      });
+      setStage("structure");
+    }
+    if (["finished", "failed", "cancelled"].includes(event.event)) {
+      setBusy(false);
+      if (event.event === "failed") setError(errorMessage || "后端检查失败。");
+      setInspectionTaskId(null);
+      setInspectionTaskOperation(null);
+    }
+  }, [events, inputPath, inspectionTaskId, inspectionTaskOperation]);
+
+  useEffect(() => {
     try {
       setFavorites(JSON.parse(localStorage.getItem("fast-nc-zarr:favorites") || "[]") as string[]);
       setRecentPaths(JSON.parse(localStorage.getItem("fast-nc-zarr:recent") || "[]") as string[]);
@@ -320,6 +498,9 @@ function App() {
     setInspection(null);
     setSelectedVariables([]);
     setPlan(null);
+    setInspectionTaskId(null);
+    setInspectionTaskOperation(null);
+    setInspectionProgress(null);
     setStage("input");
 
   };
@@ -354,20 +535,28 @@ function App() {
     }
   };
 
-  const inspectTime = async () => {
-    if (!inputPath || inputKind !== "source") return;
+  const startInspectionTask = async (operation: InspectionTaskOperation, payload: Record<string, unknown>, label: string) => {
+    const startedAt = Date.now();
     setBusy(true);
     setError(null);
+    setProgressNowMs(startedAt);
+    setInspectionTaskOperation(operation);
+    setInspectionProgress({ taskId: null, operation, label, message: "正在启动后端检查……", completed: 0, total: 0, status: "starting", startedAt });
     try {
-      const result = await inspectTimeMetadata(inputPath, recursive, engine);
-      setTimeInspection(result);
-      setTimeRule(result.suggested_rule);
-      setStage("time");
+      const taskId = await startInspection(operation, payload);
+      setInspectionTaskId(taskId);
+      setInspectionProgress((current) => current ? { ...current, taskId, status: "running" } : current);
     } catch (reason) {
-      setError(reasonText(reason));
-    } finally {
+      const message = reasonText(reason);
       setBusy(false);
+      setError(message);
+      setInspectionProgress((current) => current ? { ...current, status: "failed", message } : current);
     }
+  };
+
+  const inspectTime = async () => {
+    if (!inputPath || inputKind !== "source" || busy) return;
+    await startInspectionTask("inspect_time_metadata", { input_dir: inputPath, recursive, engine }, "检查时间轴");
   };
   const openTimeRuleModal = () => {
     if (!timeInspection) return;
@@ -427,20 +616,16 @@ function App() {
   };
 
   const inspectStructure = async () => {
-    if (!inputPath) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const result = inputKind === "zarr"
-        ? await inspectZarr(inputPath)
-        : await inspectSource({ input_dir: inputPath, mode: "auto", recursive, engine, time_rule: timeRule } satisfies InspectionRequest);
-      setInspection(result);
-      setStage("structure");
-    } catch (reason) {
-      setError(reasonText(reason));
-    } finally {
-      setBusy(false);
+    if (!inputPath || busy) return;
+    if (inputKind === "zarr") {
+      await startInspectionTask("inspect_zarr", { path: inputPath }, "读取 Zarr 结构");
+      return;
     }
+    await startInspectionTask(
+      "inspect_source",
+      { input_dir: inputPath, mode: "auto", recursive, engine, time_rule: timeRule },
+      "读取数据结构",
+    );
   };
 
   const saveSnapshot = async () => {
@@ -674,15 +859,16 @@ function App() {
                   <label className="field-label" htmlFor="input-path">数据路径</label><div className="input-with-action"><Icon name="folder" size={17} /><input id="input-path" value={inputPath} onChange={(event) => setInputPath(event.target.value)} placeholder={inputKind === "source" ? "选择 NetCDF / HDF / TIFF 目录" : "选择 Zarr v3 目录"} /><button className="field-action" type="button" onClick={() => void chooseInput()}>浏览</button></div>
                   {inputKind === "zarr" && <div className="input-with-action secondary-input"><Icon name="layers" size={17} /><input aria-label="Zarr array path" value={arrayPath} onChange={(event) => setArrayPath(event.target.value)} placeholder="array path，例如 /value" /><button className="field-action" type="button" disabled={!inputPath || busy} onClick={() => void inspectNativeZarr()}>原生检查</button></div>}
                   {inputKind === "source" && <div className="inline-options"><label className="check-control"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /><span className="fake-check" />递归扫描</label><label className="select-control">读取引擎<select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="auto">自动选择</option><option value="h5netcdf">h5netcdf</option><option value="netcdf4">netcdf4</option><option value="rasterio">rasterio</option></select></label></div>}
+                  {inspectionProgress && <InspectionProgressCard progress={inspectionProgress} nowMs={progressNowMs} onCancel={inspectionTaskId ? () => void cancel(inspectionTaskId) : undefined} />}
                   {timeInspection && (
                     <div className="inline-result time-inspection-result">
                       <div className="result-icon"><Icon name="clock" size={16} /></div>
                       <div>
                         <strong>时间规则待确认</strong>
-                        <p>{timeInspection.report}</p>
+                        <StructuredTimeInspection inspection={timeInspection} />
                         <div className="time-rule-action">
                           <span>{timeRuleSummary(timeRule, timeInspection.options)}</span>
-                          <button className="quiet-button" type="button" onClick={openTimeRuleModal}>
+                          <button className="quiet-button" type="button" onClick={openTimeRuleModal} disabled={busy}>
                             {timeRule ? "修改时间规则" : "选择时间规则"}
                           </button>
                         </div>

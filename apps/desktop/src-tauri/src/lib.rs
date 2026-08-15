@@ -42,7 +42,7 @@ pub fn run() {
             tasks::cancel_task,
             native::start_native_task,
             pipeline::preview_pipeline,
-            pipeline::start_pipeline,
+            pipeline::start_inspection,
             pipeline::resume_pipeline,
             pipeline::inspect_pipeline_recovery,
         ])

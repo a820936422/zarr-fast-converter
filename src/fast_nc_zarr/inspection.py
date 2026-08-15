@@ -618,6 +618,7 @@ def inspect_dataset(
     filename_fields: tuple[FilenameField, ...] = (),
     cached_inventory: Inventory | None = None,
     cancel_event=None,
+    progress_callback=None,
 ) -> Inventory:
     file_entries = _discover_files_with_stats(input_dir, recursive)
     files = [path for path, _stat in file_entries]
@@ -659,6 +660,15 @@ def inspect_dataset(
             f"发现 {len(files)} 个 NetCDF 文件；复用 {len(records_by_path)} 个，"
             f"检查 {len(changed_files)} 个（{worker_count} 个进程）……"
         )
+    total_changed = max(1, len(changed_files))
+    completed_changed = 0
+    report_every = max(1, total_changed // 100)
+    if progress_callback is not None:
+        progress_callback(
+            completed_changed,
+            total_changed,
+            f"准备读取结构：复用 {len(records_by_path)} 个，待检查 {len(changed_files)} 个文件",
+        )
     tasks = (
         (path, engine, source_dimensions, time_rule, filename_fields, stats_by_path[path])
         for path in changed_files
@@ -676,6 +686,13 @@ def inspect_dataset(
     ):
         for record in batch_records:
             records_by_path[record.path] = record
+        completed_changed += len(batch_records)
+        if progress_callback is not None and (completed_changed == len(changed_files) or completed_changed % report_every == 0):
+            progress_callback(
+                completed_changed,
+                total_changed,
+                f"读取文件结构：{len(records_by_path)}/{len(files)}",
+            )
     records = [records_by_path[path] for path in files]
     reference = records[0]
     reference_variables = _variable_signatures(reference.variables)
@@ -711,6 +728,8 @@ def inspect_dataset(
     source_time, source_lat, source_lon = source_dimensions
     lat, lon = _read_reference_axes(reference.path, engine, source_lat, source_lon)
     frequency, gaps = _infer_frequency(ordered_times)
+    if progress_callback is not None:
+        progress_callback(total_changed, total_changed, "结构检查完成")
     return Inventory(
         input_dir=Path(input_dir).expanduser().resolve(),
         files=records,

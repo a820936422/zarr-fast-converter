@@ -1050,6 +1050,7 @@ def inspect_filename_inventory(
     progress: bool = True,
     cached_inventory: Inventory | None = None,
     cancel_event=None,
+    progress_callback=None,
 ) -> Inventory:
     if progress:
         print(f"扫描到 {len(scan.files)} 个文件，使用文件名时间模式。")
@@ -1161,6 +1162,15 @@ def inspect_filename_inventory(
             f"复用 {len(records_by_path)} 个文件；检查 {len(changed_tasks)} 个文件的"
             f"变量、网格和属性（{worker_count} 个进程，{method}）……"
         )
+    total_changed = max(1, len(changed_tasks))
+    completed_changed = 0
+    report_every = max(1, total_changed // 100)
+    if progress_callback is not None:
+        progress_callback(
+            completed_changed,
+            total_changed,
+            f"准备读取结构：复用 {len(records_by_path)} 个，待检查 {len(changed_tasks)} 个文件",
+        )
     for record in bounded_process_map(
         _inspect_filename_file,
         changed_tasks,
@@ -1168,6 +1178,13 @@ def inspect_filename_inventory(
         cancel_event=cancel_event,
     ):
         records_by_path[record.path] = record
+        completed_changed += 1
+        if progress_callback is not None and (completed_changed == len(changed_tasks) or completed_changed % report_every == 0):
+            progress_callback(
+                completed_changed,
+                total_changed,
+                f"读取文件结构：{len(records_by_path)}/{len(scan.files)}",
+            )
     records = [records_by_path[path] for path in scan.files]
 
     full_times = np.asarray(scan.expected_times, dtype="datetime64[ns]")
@@ -1179,6 +1196,8 @@ def inspect_filename_inventory(
             frequency, gaps = f"年度 DOY 尺度不一致（{rendered}）", []
     else:
         frequency, gaps = _infer_frequency(full_times)
+    if progress_callback is not None:
+        progress_callback(total_changed, total_changed, "结构检查完成")
     missing_keys = tuple(time_key(item) for item in scan.missing_times)
     return Inventory(
         input_dir=scan.input_dir,

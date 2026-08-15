@@ -96,6 +96,18 @@ class TimeMappingTests(unittest.TestCase):
         )
         self.assertEqual(str(dates[0])[:10], "2001-01-01")
 
+    def test_time_metadata_reports_progress_phases(self) -> None:
+        progress: list[tuple[int, int, str]] = []
+        inspect_time_metadata(
+            ROOT / "filename",
+            requested_engine="h5netcdf",
+            progress_callback=lambda completed, total, message: progress.append((completed, total, message)),
+        )
+        self.assertGreaterEqual(len(progress), 4)
+        self.assertEqual(progress[0][:2], (0, 4))
+        self.assertEqual(progress[-1][:2], (4, 4))
+        self.assertIn("时间字段候选", progress[-1][2])
+
     def test_source_time_full_date_is_suggested(self) -> None:
         result = inspect_time_metadata(ROOT / "complete", requested_engine="h5netcdf")
         self.assertIsNotNone(result.suggested_rule)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, is_dataclass
 import io
 import json
@@ -124,7 +124,7 @@ def _time_inspection_payload(result: Any) -> dict[str, Any]:
     }
 
 
-def _inspection(request: Request, cancel_event: ThreadEvent):
+def _inspection(request: Request, cancel_event: ThreadEvent, progress_callback=None):
     from ..services import inspect_source, inspect_zarr
 
     if request.command == "inspect_zarr":
@@ -132,7 +132,11 @@ def _inspection(request: Request, cancel_event: ThreadEvent):
     payload = dict(request.payload)
     if "source_path" in payload and "input_dir" not in payload:
         payload["input_dir"] = payload["source_path"]
-    return inspect_source(_source_config(payload), cancel_event=cancel_event)
+    return inspect_source(
+        _source_config(payload),
+        cancel_event=cancel_event,
+        progress_callback=progress_callback,
+    )
 
 
 def _inspection_from_payload(payload: dict[str, Any], cancel_event: ThreadEvent):
@@ -301,6 +305,25 @@ def _monitor_cancellation(path: Path | None, cancel_event: ThreadEvent, stop: Th
             return
 
 
+@contextmanager
+def _request_cancellation(payload: dict[str, Any], cancel_event: ThreadEvent):
+    path = _optional_path(payload, "cancellation_file")
+    stop = ThreadEvent()
+    monitor = Thread(target=_monitor_cancellation, args=(path, cancel_event, stop), daemon=True)
+    monitor.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        monitor.join(timeout=1)
+
+
+def _emit_progress(sink: _EventSink, stage: str, completed: int, total: int, message: str) -> None:
+    sink.emit(
+        "progress",
+        {"completed": completed, "total": total, "message": message},
+        stage=stage,
+    )
 def _dispatch(request: Request, output: TextIO, cancel_event: ThreadEvent) -> None:
     sink = _EventSink(output, request)
     with redirect_stdout(_OutputStream(sink, stream_name="stdout")), redirect_stderr(_OutputStream(sink, stream_name="stderr")):
@@ -333,12 +356,16 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
     if request.command == "inspect_time_metadata":
         from ...time_mapping import inspect_time_metadata
 
-        result = inspect_time_metadata(
-            _path(request.payload, "input_dir"),
-            recursive=bool(request.payload.get("recursive", False)),
-            requested_engine=str(request.payload.get("engine", "auto")),
-            cancel_event=cancel_event,
-        )
+        with _request_cancellation(request.payload, cancel_event):
+            result = inspect_time_metadata(
+                _path(request.payload, "input_dir"),
+                recursive=bool(request.payload.get("recursive", False)),
+                requested_engine=str(request.payload.get("engine", "auto")),
+                cancel_event=cancel_event,
+                progress_callback=lambda completed, total, message: _emit_progress(
+                    sink, "time_inspection", completed, total, message
+                ),
+            )
         payload = _time_inspection_payload(result)
         sink.emit("inspection_ready", payload, stage="time_inspection")
         sink.emit("finished", payload, stage="time_inspection")
@@ -353,8 +380,21 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
         sink.emit("finished", payload, stage="inspection")
         return
     if request.command in {"inspect_source", "inspect_zarr"}:
-        result = _inspection(request, cancel_event)
-        payload = {"kind": result.kind, "path": str(result.path), "report": result.report, "warnings": result.warnings, "snapshot": result.snapshot()}
+        with _request_cancellation(request.payload, cancel_event):
+            result = _inspection(
+                request,
+                cancel_event,
+                progress_callback=lambda completed, total, message: _emit_progress(
+                    sink, "inspection", completed, total, message
+                ),
+            )
+        payload = {
+            "kind": result.kind,
+            "path": str(result.path),
+            "report": result.report,
+            "warnings": result.warnings,
+            "snapshot": result.snapshot(),
+        }
         sink.emit("inspection_ready", payload, stage="inspection")
         sink.emit("finished", payload, stage="inspection")
         return

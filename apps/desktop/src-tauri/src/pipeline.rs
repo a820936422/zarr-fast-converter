@@ -103,6 +103,23 @@ pub fn resume_pipeline(
 }
 
 #[tauri::command]
+pub fn start_inspection(
+    app: AppHandle,
+    registry: State<'_, TaskRegistry>,
+    operation: String,
+    payload: Map<String, Value>,
+) -> Result<String, AppError> {
+    if !matches!(operation.as_str(), "inspect_time_metadata" | "inspect_source" | "inspect_zarr") {
+        return Err(AppError::new(
+            ErrorKind::InvalidRequest,
+            format!("不支持的检查操作：{operation}"),
+        )
+        .at_stage("inspection"));
+    }
+    start_task(app, &registry, &operation, payload)
+}
+
+#[tauri::command]
 pub fn inspect_pipeline_recovery(
     state: State<'_, AppState>,
     path: String,

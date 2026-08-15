@@ -307,7 +307,7 @@ class ResamplePreview:
     plan: ResamplePlan
 
 
-def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> InspectionResult:
+def inspect_source(config: SourceInspectionConfig, *, cancel_event=None, progress_callback=None) -> InspectionResult:
     """Inspect a source directory and resolve its time ingestion mode."""
 
     source = Path(config.input_dir).expanduser().resolve()
@@ -339,6 +339,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
             recursive=config.recursive,
             requested_engine=requested_engine,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
         resolved_engine = time_result.engine
         if (
@@ -359,6 +360,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
                 progress=True,
                 cached_inventory=cached_inventory,
                 cancel_event=cancel_event,
+                progress_callback=progress_callback,
             )
             warnings = []
             if scan.missing_times:
@@ -386,6 +388,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
             filename_fields=time_result.filename_fields,
             cached_inventory=cached_inventory,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
         warnings = [
             f"检测到 {len(inventory.gaps)} 个源时间间隔缺口。"
@@ -432,6 +435,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
             progress=True,
             cached_inventory=cached_inventory,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
         warnings = [
             f"检测到 {len(inventory.gaps)} 个源时间间隔缺口。"
@@ -463,6 +467,7 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None) -> Insp
         progress=True,
         cached_inventory=cached_inventory,
         cancel_event=cancel_event,
+        progress_callback=progress_callback,
     )
     warnings = []
     if scan.missing_times:

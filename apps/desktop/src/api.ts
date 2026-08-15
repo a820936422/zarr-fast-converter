@@ -48,18 +48,41 @@ export type InspectionRequest = {
   cache_path?: string | null;
 };
 
+export type FilenameFieldSummary = {
+  index: number;
+  start: number;
+  length: number;
+  sample: string;
+  values: string[];
+  changed: boolean;
+};
+
+export type TimeDimensionSummary = {
+  exists: boolean;
+  name: string | null;
+  raw_values: string[];
+  decoded_values: string[];
+  attrs: Record<string, unknown>;
+  format_label: string;
+};
+
 export type TimeInspection = {
   input_dir: string;
   files: string[];
   engine: string;
   dimensions: string[];
   coordinates: string[];
-  filename_fields: Array<Record<string, unknown>>;
-  time_dimension: Record<string, unknown>;
+  filename_fields: FilenameFieldSummary[];
+  time_dimension: TimeDimensionSummary;
   options: TimeFieldOption[];
   suggested_rule: TimeRule | null;
   report: string;
 };
+
+export type InspectionTaskOperation = "inspect_time_metadata" | "inspect_source" | "inspect_zarr";
+
+export const startInspection = (operation: InspectionTaskOperation, payload: Record<string, unknown>) =>
+  invoke<string>("start_inspection", { operation, payload });
 
 export type InspectionResult = {
   kind: "source" | "zarr" | "temporary";
