@@ -5,6 +5,7 @@ from dataclasses import asdict, is_dataclass
 import io
 import json
 from pathlib import Path
+import math
 import re
 import sys
 from threading import Event as ThreadEvent, Thread
@@ -153,8 +154,63 @@ def _inspection_from_payload(payload: dict[str, Any], cancel_event: ThreadEvent)
     return inspect_source(_source_config(payload), cancel_event=cancel_event)
 
 
+def _numeric_value(value: Any, label: str, *, allow_nan: bool = False) -> float:
+    if isinstance(value, str) and value.strip().lower() == "nan":
+        if allow_nan:
+            return float("nan")
+        raise ValueError(f"{label} 不能是 NaN。")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} 必须是数值。") from exc
+    if math.isinf(result) or (math.isnan(result) and not allow_nan):
+        raise ValueError(f"{label} 必须是有限数值。")
+    return result
+
+
+def _variable_transforms(payload: dict[str, Any]):
+    from ...models import VariableTransform
+
+    raw = payload.get("variable_transforms") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("variable_transforms must be an object")
+    result = {}
+    for name, value in raw.items():
+        if not isinstance(value, dict):
+            raise ValueError(f"变量 {name} 的处理规则必须是对象。")
+        fills = value.get("fill_values")
+        if isinstance(fills, str):
+            fills = [item.strip() for item in fills.split(",") if item.strip()]
+        if fills is not None and not isinstance(fills, (list, tuple)):
+            raise ValueError(f"变量 {name} 的填充值必须是数组。")
+        fill_values = (
+            tuple(_numeric_value(item, f"变量 {name} 的填充值", allow_nan=True) for item in fills)
+            if fills is not None
+            else None
+        )
+        result[str(name)] = VariableTransform(
+            fill_values=fill_values,
+            scale_factor=(
+                _numeric_value(value["scale_factor"], f"变量 {name} 的缩放因子")
+                if value.get("scale_factor") not in (None, "")
+                else None
+            ),
+            add_offset=(
+                _numeric_value(value["add_offset"], f"变量 {name} 的偏移量")
+                if value.get("add_offset") not in (None, "")
+                else None
+            ),
+            output_fill=(
+                _numeric_value(value["output_fill"], f"变量 {name} 的输出填充值", allow_nan=True)
+                if value.get("output_fill") not in (None, "")
+                else None
+            ),
+        )
+    return result
+
+
 def _pipeline_config(payload: dict[str, Any]):
-    from ..pipeline.models import (
+    from ...pipeline.models import (
         PipelineChunkingOptions,
         PipelineCompressionOptions,
         PipelineConfig,
@@ -190,6 +246,7 @@ def _pipeline_config(payload: dict[str, Any]):
             variables=variables,
             variable_names={str(key): str(value) for key, value in (payload.get("variable_names") or {}).items()},
             auto_tune=bool(payload.get("auto_tune", True)),
+            variable_transforms=_variable_transforms(payload),
             tune_budget=float(payload.get("tune_budget", 60.0)),
             tuning_objective=str(payload.get("tuning_objective", "balanced")),
             max_workers=int(payload["max_workers"]) if payload.get("max_workers") is not None else None,

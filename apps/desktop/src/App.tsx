@@ -94,6 +94,53 @@ function timeRuleSummary(rule: TimeRule | null, options: TimeFieldOption[]): str
   return parts.join("；");
 }
 
+type VariableDetail = {
+  name: string;
+  dtype: string;
+  dims: string[];
+  attrs: Record<string, unknown>;
+};
+
+type VariableTransformDraft = {
+  fillValues: string;
+  scaleFactor: string;
+  addOffset: string;
+  outputFill: string;
+};
+
+const EMPTY_VARIABLE_TRANSFORM: VariableTransformDraft = {
+  fillValues: "",
+  scaleFactor: "",
+  addOffset: "",
+  outputFill: "",
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function attributeText(attrs: Record<string, unknown>, key: string): string {
+  const value = attrs[key];
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function parseOptionalNumber(value: string, label: string): number | "nan" | undefined {
+  const text = value.trim();
+  if (!text) return undefined;
+  if (text.toLowerCase() === "nan") return "nan";
+  const result = Number(text);
+  if (!Number.isFinite(result)) throw new Error(`${label} 必须是有限数值或 nan。`);
+  return result;
+}
+
+function parseFillValues(value: string, label: string): Array<number | "nan"> | undefined {
+  const text = value.trim();
+  if (!text) return undefined;
+  return text.split(",").map((item) => parseOptionalNumber(item, label)).filter(
+    (item): item is number | "nan" => item !== undefined,
+  );
+}
+
 type InspectionProgressStatus = "starting" | "running" | "cancelling" | "finished" | "failed" | "cancelled";
 type InspectionProgressState = {
   taskId: string | null;
@@ -341,6 +388,8 @@ function App() {
   const [inputKind, setInputKind] = useState<InputKind>("source");
   const [arrayPath, setArrayPath] = useState("/value");
   const [selectedVariables, setSelectedVariables] = useState<string[]>([]);
+  const [variableNames, setVariableNames] = useState<Record<string, string>>({});
+  const [variableTransforms, setVariableTransforms] = useState<Record<string, VariableTransformDraft>>({});
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [recursive, setRecursive] = useState(false);
@@ -367,6 +416,13 @@ function App() {
   const [resample, setResample] = useState(false);
   const [resampleMethod, setResampleMethod] = useState("bilinear");
   const [resolution, setResolution] = useState(0.1);
+  const [skipna, setSkipna] = useState(true);
+  const [naThres, setNaThres] = useState(1);
+  const [computeDtype, setComputeDtype] = useState("source");
+  const [beforeConditions, setBeforeConditions] = useState("");
+  const [beforeResults, setBeforeResults] = useState("");
+  const [afterConditions, setAfterConditions] = useState("");
+  const [afterResults, setAfterResults] = useState("");
   const [rechunk, setRechunk] = useState(false);
   const [targetMib, setTargetMib] = useState(128);
   const [recompress, setRecompress] = useState(false);
@@ -506,6 +562,8 @@ function App() {
     setTimeRuleError(null);
     setInspection(null);
     setSelectedVariables([]);
+    setVariableNames({});
+    setVariableTransforms({});
     setPlan(null);
     setInspectionTaskId(null);
     setInspectionTaskOperation(null);
@@ -661,6 +719,33 @@ function App() {
 
   const buildPipelinePayload = (): PipelinePayload | null => {
     if (!inspection || !inputPath) return null;
+    if (variableDetails.length > 0 && selectedVariables.length === 0) {
+      throw new Error("至少选择一个要处理的变量。");
+    }
+    const outputNames = Object.fromEntries(
+      selectedVariables
+        .map((name) => [name, (variableNames[name] || name).trim()] as const)
+        .filter(([, name]) => name && name !== ""),
+    );
+    const outputNameValues = Object.values(outputNames);
+    if (new Set(outputNameValues).size !== outputNameValues.length) {
+      throw new Error("输出变量名不能重复。");
+    }
+    const transforms = Object.fromEntries(
+      selectedVariables.flatMap((name) => {
+        const draft = variableTransforms[name] || EMPTY_VARIABLE_TRANSFORM;
+        const fillValues = parseFillValues(draft.fillValues, `变量 ${name} 的缺失值`);
+        const scaleFactor = parseOptionalNumber(draft.scaleFactor, `变量 ${name} 的缩放因子`);
+        const addOffset = parseOptionalNumber(draft.addOffset, `变量 ${name} 的偏移量`);
+        const outputFill = parseOptionalNumber(draft.outputFill, `变量 ${name} 的输出填充值`);
+        const transform: Record<string, unknown> = {};
+        if (fillValues !== undefined) transform.fill_values = fillValues;
+        if (scaleFactor !== undefined) transform.scale_factor = scaleFactor;
+        if (addOffset !== undefined) transform.add_offset = addOffset;
+        if (outputFill !== undefined) transform.output_fill = outputFill;
+        return Object.keys(transform).length ? [[name, transform] as const] : [];
+      }),
+    );
     return {
       output: outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`,
       input_dir: inputPath,
@@ -670,9 +755,18 @@ function App() {
       recursive,
       engine,
       variables: selectedVariables,
+      variable_names: outputNames,
+      variable_transforms: transforms,
       resample,
       method: resampleMethod,
       resolution,
+      skipna,
+      na_thres: naThres,
+      compute_dtype: computeDtype,
+      before_conditions: beforeConditions,
+      before_results: beforeResults,
+      after_conditions: afterConditions,
+      after_results: afterResults,
       rechunk,
       strategy: "time",
       target_mib: targetMib,
@@ -684,7 +778,13 @@ function App() {
   };
 
   const runPreview = async () => {
-    const payload = buildPipelinePayload();
+    let payload: PipelinePayload | null;
+    try {
+      payload = buildPipelinePayload();
+    } catch (reason) {
+      setError(reasonText(reason));
+      return;
+    }
     if (!payload) return;
     setBusy(true);
     setError(null);
@@ -698,7 +798,13 @@ function App() {
   };
 
   const runPipeline = async () => {
-    const payload = buildPipelinePayload();
+    let payload: PipelinePayload | null;
+    try {
+      payload = buildPipelinePayload();
+    } catch (reason) {
+      setError(reasonText(reason));
+      return;
+    }
     if (!payload) return;
     setBusy(true);
     setError(null);
@@ -753,15 +859,21 @@ function App() {
   const canInspectStructure = Boolean(inputPath) && (inputKind === "zarr" || Boolean(timeRule) || (stage === "time" && hasTimeAxis)) && !busy;
   const runningTasks = useMemo(() => tasks.filter((task) => task.status === "running" || task.status === "cancelling"), [tasks]);
   const supported = (operation: string) => nativeCapability?.capabilities.find((item) => item.operation === operation);
-  const variableOptions = useMemo(() => {
+  const variableDetails = useMemo<VariableDetail[]>(() => {
     const raw = inspection?.snapshot.variables;
     if (!Array.isArray(raw)) return [];
     return raw.flatMap((item) => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-      const name = (item as Record<string, unknown>).name;
-      return typeof name === "string" && name ? [name] : [];
+      const record = asRecord(item);
+      if (!record || record.is_coord === true || typeof record.name !== "string" || !record.name) return [];
+      return [{
+        name: record.name,
+        dtype: typeof record.dtype === "string" ? record.dtype : "unknown",
+        dims: Array.isArray(record.dims) ? record.dims.filter((value): value is string => typeof value === "string") : [],
+        attrs: asRecord(record.attrs) || {},
+      }];
     });
   }, [inspection]);
+  const variableOptions = useMemo(() => variableDetails.map((item) => item.name), [variableDetails]);
 
   useEffect(() => {
     setSelectedVariables((current) => {
@@ -769,6 +881,17 @@ function App() {
       return valid.length ? valid : variableOptions;
     });
   }, [variableOptions]);
+  useEffect(() => {
+    setVariableNames((current) => Object.fromEntries(variableDetails.map((item) => [item.name, current[item.name] || item.name])));
+    setVariableTransforms((current) => Object.fromEntries(variableDetails.map((item) => [item.name, current[item.name] || { ...EMPTY_VARIABLE_TRANSFORM }])));
+  }, [variableDetails]);
+
+  const updateVariableTransform = (name: string, patch: Partial<VariableTransformDraft>) => {
+    setVariableTransforms((current) => ({
+      ...current,
+      [name]: { ...EMPTY_VARIABLE_TRANSFORM, ...(current[name] || {}), ...patch },
+    }));
+  };
 
   const capabilityItems = nativeCapability?.capabilities || [];
   const supportedCount = capabilityItems.filter((item) => item.supported).length;
@@ -913,9 +1036,50 @@ function App() {
                 <section className="surface pipeline-surface">
                   <div className="surface-title"><div><span className="section-kicker">PROCESS FLOW</span><h2>处理阶段</h2></div><span className="surface-number">02</span></div>
                   <div className="stage-flow"><div className="flow-stage complete"><span>01</span><Icon name="database" size={16} /><div><strong>输入检查</strong><small>{inputPath.split(/[\\/]/).pop() || "已确认数据"}</small></div><Icon name="spark" size={14} /></div><div className="flow-connector" /><label className={`flow-stage toggle-stage ${resample ? "enabled" : ""}`}><span>02</span><Icon name="grid" size={16} /><div><strong>空间重采样</strong><small>{resample ? resampleMethod : "未启用"}</small></div><input type="checkbox" checked={resample} onChange={(event) => setResample(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${rechunk ? "enabled" : ""}`}><span>03</span><Icon name="layers" size={16} /><div><strong>重分块</strong><small>{rechunk ? `目标 ${targetMib} MiB` : "未启用"}</small></div><input type="checkbox" checked={rechunk} onChange={(event) => setRechunk(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${recompress ? "enabled" : ""}`}><span>04</span><Icon name="spark" size={16} /><div><strong>重压缩</strong><small>{recompress ? compression : "未启用"}</small></div><input type="checkbox" checked={recompress} onChange={(event) => setRecompress(event.target.checked)} /><span className="toggle-switch" /></label></div>
-                  {resample && <div className="advanced-panel"><div className="panel-label"><Icon name="grid" size={15} />重采样参数</div><div className="advanced-fields"><label>方法<select value={resampleMethod} onChange={(event) => setResampleMethod(event.target.value)}><option value="nearest_s2d">nearest_s2d</option><option value="nearest_d2s">nearest_d2s</option><option value="bilinear">bilinear</option><option value="conservative">conservative</option></select></label><label>目标分辨率<input type="number" min="0" step="any" value={resolution} onChange={(event) => setResolution(Number(event.target.value))} /></label></div></div>}
+                  {resample && (
+                    <div className="advanced-panel">
+                      <div className="panel-label"><Icon name="grid" size={15} />重采样参数</div>
+                      <div className="advanced-fields resample-fields">
+                        <label>方法<select value={resampleMethod} onChange={(event) => setResampleMethod(event.target.value)}><option value="nearest_s2d">nearest_s2d</option><option value="nearest_d2s">nearest_d2s</option><option value="bilinear">bilinear</option><option value="conservative">conservative</option><option value="conservative_normed">conservative_normed</option><option value="patch">patch</option></select></label>
+                        <label>目标分辨率<input type="number" min="0" step="any" value={resolution} onChange={(event) => setResolution(Number(event.target.value))} /></label>
+                        <label>缺测阈值<input type="number" min="0" max="1" step="0.01" value={naThres} onChange={(event) => setNaThres(Number(event.target.value))} /></label>
+                        <label>计算 dtype<select value={computeDtype} onChange={(event) => setComputeDtype(event.target.value)}><option value="source">保持源 dtype</option><option value="float32">浮点转 float32</option></select></label>
+                        <label className="check-control"><input type="checkbox" checked={skipna} onChange={(event) => setSkipna(event.target.checked)} /><span className="fake-check" />忽略缺测值</label>
+                        <label className="wide-field">采样前替换值<input value={beforeConditions} onChange={(event) => setBeforeConditions(event.target.value)} placeholder="例如 &lt;0, &gt;100" /></label>
+                        <label className="wide-field">采样前替换结果<input value={beforeResults} onChange={(event) => setBeforeResults(event.target.value)} placeholder="例如 0, 100" /></label>
+                        <label className="wide-field">采样后替换值<input value={afterConditions} onChange={(event) => setAfterConditions(event.target.value)} placeholder="例如 &lt;=median" /></label>
+                        <label className="wide-field">采样后替换结果<input value={afterResults} onChange={(event) => setAfterResults(event.target.value)} placeholder="例如 100" /></label>
+                      </div>
+                    </div>
+                  )}
                   {rechunk && <div className="advanced-panel"><div className="panel-label"><Icon name="layers" size={15} />重分块参数</div><div className="advanced-fields"><label>目标 chunk MiB<input type="number" min="1" step="1" value={targetMib} onChange={(event) => setTargetMib(Number(event.target.value))} /></label></div></div>}
                   {recompress && <div className="advanced-panel"><div className="panel-label"><Icon name="spark" size={15} />压缩参数</div><div className="advanced-fields"><label>压缩配置<select value={compression} onChange={(event) => setCompression(event.target.value)}><option value="auto">自动选择</option><option value="zstd">Zstd</option><option value="blosc-lz4">Blosc LZ4</option><option value="gzip">Gzip</option></select></label></div></div>}
+                  {variableDetails.length > 0 && (
+                    <div className="advanced-panel variable-settings-panel">
+                      <div className="panel-label"><Icon name="layers" size={15} />变量选择与处理参数</div>
+                      <p className="variable-settings-help">可选择变量、重命名输出变量，并覆盖源文件中的缺失值、缩放因子和偏移量。留空表示沿用源元数据或默认行为。</p>
+                      <div className="variable-settings-table">
+                        <div className="variable-settings-head"><span>处理</span><span>源变量</span><span>输出变量名</span><span>缺失值</span><span>缩放因子</span><span>偏移量</span><span>输出填充值</span></div>
+                        {variableDetails.map((detail) => {
+                          const draft = variableTransforms[detail.name] || EMPTY_VARIABLE_TRANSFORM;
+                          const sourceFill = attributeText(detail.attrs, "_FillValue") || attributeText(detail.attrs, "missing_value");
+                          const sourceScale = attributeText(detail.attrs, "scale_factor");
+                          const sourceOffset = attributeText(detail.attrs, "add_offset");
+                          return (
+                            <div className="variable-settings-row" key={detail.name}>
+                              <label className="variable-enabled"><input type="checkbox" checked={selectedVariables.includes(detail.name)} onChange={(event) => setSelectedVariables((current) => event.target.checked ? [...current, detail.name] : current.filter((item) => item !== detail.name))} /><span className="fake-check" /></label>
+                              <div className="variable-source"><strong>{detail.name}</strong><small>{detail.dtype} · {detail.dims.join(" × ") || "未知维度"}</small></div>
+                              <input aria-label={`${detail.name} 输出变量名`} value={variableNames[detail.name] ?? detail.name} onChange={(event) => setVariableNames((current) => ({ ...current, [detail.name]: event.target.value }))} />
+                              <input aria-label={`${detail.name} 缺失值`} value={draft.fillValues} onChange={(event) => updateVariableTransform(detail.name, { fillValues: event.target.value })} placeholder={sourceFill ? `源: ${sourceFill}` : "不处理"} />
+                              <input aria-label={`${detail.name} 缩放因子`} value={draft.scaleFactor} onChange={(event) => updateVariableTransform(detail.name, { scaleFactor: event.target.value })} placeholder={sourceScale ? `源: ${sourceScale}` : "不额外缩放"} />
+                              <input aria-label={`${detail.name} 偏移量`} value={draft.addOffset} onChange={(event) => updateVariableTransform(detail.name, { addOffset: event.target.value })} placeholder={sourceOffset ? `源: ${sourceOffset}` : "不额外偏移"} />
+                              <input aria-label={`${detail.name} 输出填充值`} value={draft.outputFill} onChange={(event) => updateVariableTransform(detail.name, { outputFill: event.target.value })} placeholder="浮点默认 NaN" />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                   <div className="output-block"><label className="field-label" htmlFor="output-path">输出 Zarr 目录</label><div className="input-with-action"><Icon name="upload" size={17} /><input id="output-path" value={outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`} onChange={(event) => setOutputPath(event.target.value)} /><span className="path-valid"><Icon name="spark" size={13} /></span></div></div>
                   <div className="surface-actions"><button className="quiet-button" disabled={busy} type="button" onClick={() => void runPreview()}><Icon name="layers" size={16} />预览计划</button><button className="primary-button" disabled={busy} type="button" onClick={() => void runPipeline()}><Icon name="play" size={16} />启动处理</button></div>
                 </section>

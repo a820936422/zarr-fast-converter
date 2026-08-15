@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,8 @@ import unittest
 
 
 PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT / "src"))
+from fast_nc_zarr.application.desktop_worker.worker import _pipeline_config  # noqa: E402
 
 
 class ProtocolContractTests(unittest.TestCase):
@@ -106,6 +109,41 @@ class DesktopWorkerTests(unittest.TestCase):
         self.assertEqual(events[2]["event"], "resource")
         self.assertEqual(events[2]["payload"]["logicalCpus"], 2)
         self.assertEqual(events[-1]["event"], "failed")
+
+    def test_pipeline_payload_preserves_variable_and_resampling_rules(self) -> None:
+        config = _pipeline_config(
+            {
+                "output": "/tmp/restored-controls.zarr",
+                "input_kind": "raw",
+                "variables": ["value"],
+                "variable_names": {"value": "renamed_value"},
+                "variable_transforms": {
+                    "value": {
+                        "fill_values": [-999, "nan"],
+                        "scale_factor": 2,
+                        "add_offset": 1,
+                        "output_fill": -7,
+                    }
+                },
+                "resample": True,
+                "skipna": False,
+                "na_thres": 0.25,
+                "compute_dtype": "float32",
+                "before_conditions": "<0",
+                "before_results": "0",
+                "after_conditions": ">100",
+                "after_results": "100",
+            }
+        )
+        transform = config.conversion.variable_transforms["value"]
+        self.assertEqual(config.conversion.variable_names["value"], "renamed_value")
+        self.assertEqual(transform.fill_values[0], -999)
+        self.assertTrue(math.isnan(transform.fill_values[1]))
+        self.assertEqual(transform.scale_factor, 2)
+        self.assertEqual(config.resampling.compute_dtype, "float32")
+        self.assertFalse(config.resampling.skipna)
+        self.assertEqual(config.resampling.before_conditions, "<0")
+        self.assertEqual(config.resampling.after_results, "100")
 
     def test_invalid_request_returns_structured_failure(self) -> None:
         result = subprocess.run(
