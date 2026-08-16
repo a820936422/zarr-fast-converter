@@ -18,6 +18,16 @@ SpaceWorkers = int | Literal["auto"]
 TimeBlock = int | Literal["auto"]
 ComputeDType = Literal["source", "float32"]
 
+@dataclass(frozen=True)
+class ResampleVariableOptions:
+    """Resolved resampling controls for one spatial data variable."""
+
+    method: str = "bilinear"
+    skipna: bool = True
+    na_thres: float = 1.0
+    compute_dtype: ComputeDType = "source"
+
+
 
 @dataclass(frozen=True)
 class GridInfo:
@@ -105,6 +115,7 @@ class ResampleConfig:
     space_workers: SpaceWorkers = "auto"
     tuning_objective: Literal["speed", "balanced", "compact"] = "balanced"
     tune_budget: float = 60.0
+    variable_options: dict[str, ResampleVariableOptions] = field(default_factory=dict)
     resource_budget: EffectiveResourceBudget | None = None
     temporary_dir: Path | None = None
     output_layout: OutputLayout | None = None
@@ -157,6 +168,7 @@ class ResamplePlan:
     tile_size_requested: TileSize = "auto"
     tuning_objective: Literal["speed", "balanced", "compact"] = "balanced"
     tune_budget: float = 60.0
+    variable_options: dict[str, ResampleVariableOptions] = field(default_factory=dict)
     tuning_trials: tuple[dict[str, object], ...] = ()
     space_workers_requested: SpaceWorkers = "auto"
     auto_tile: AutoTileDecision | None = None
@@ -167,6 +179,17 @@ class ResamplePlan:
     after_replacements: ReplacementRules = field(default_factory=ReplacementRules)
     statistics_policy: Literal["auto", "sample", "exact"] = "auto"
     statistics: dict[str, dict[str, float]] = field(default_factory=dict)
+
+    def options_for(self, name: str) -> ResampleVariableOptions:
+        return self.variable_options.get(
+            name,
+            ResampleVariableOptions(
+                method=self.method,
+                skipna=self.skipna,
+                na_thres=self.na_thres,
+                compute_dtype=self.compute_dtype,
+            ),
+        )
 
     @property
     def output_dimensions(self) -> dict[str, int]:

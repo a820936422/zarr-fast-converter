@@ -20,6 +20,7 @@ from .models import (
     PipelineOperations,
     PipelineResamplingOptions,
 )
+from ..resampling.models import ResampleVariableOptions
 
 
 class PipelineRecoveryError(ValueError):
@@ -78,6 +79,22 @@ def _as_auto_int(value: Any) -> int | str:
 
 def _as_auto_worker(value: Any) -> int | str:
     return "auto" if value == "auto" else int(value)
+
+
+def _restore_variable_options(value: Any) -> dict[str, ResampleVariableOptions]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, ResampleVariableOptions] = {}
+    for name, raw in value.items():
+        if not isinstance(raw, dict):
+            continue
+        result[str(name)] = ResampleVariableOptions(
+            method=str(raw.get("method", "bilinear")),
+            skipna=bool(raw.get("skipna", True)),
+            na_thres=float(raw.get("na_thres", 1.0)),
+            compute_dtype=str(raw.get("compute_dtype", "source")),
+        )
+    return result
 
 
 def _restore_config(
@@ -161,12 +178,14 @@ def _restore_config(
             after_conditions=str(resampling.get("after_conditions", "")),
             after_results=str(resampling.get("after_results", "")),
             statistics_policy=str(resampling.get("statistics_policy", "auto")),
+            variable_options=_restore_variable_options(resampling.get("variable_options")),
         ),
         chunking=PipelineChunkingOptions(
             strategy=str(chunking.get("strategy", "time")),
             target_mib=float(chunking.get("target_mib", 128.0)),
             custom_chunks=tuple(int(item) for item in custom) if custom else None,
             workers=_as_auto_worker(chunking.get("workers", "auto")),
+            tune_budget=float(chunking.get("tune_budget", 60.0)),
         ),
         compression=PipelineCompressionOptions(
             profile=str(compression.get("profile", "balanced")),

@@ -24,6 +24,7 @@ from ..application.services import (
 )
 from ..publication import preflight_writable, publish_staging, validate_publish_target
 from ..selection import selected_logical_bytes
+from ..runtime import ProcessLifecycle
 from ..system import effective_resource_budget, runtime_resource_snapshot
 from ..resampling.engine import (
     _build_regridder,
@@ -99,6 +100,20 @@ def _stage_event_payload(
         "manifest": manifest.get("manifest"),
         "terminal_status": terminal_status,
     }
+    config = manifest.get("config")
+    if isinstance(config, dict):
+        budget_values: dict[str, object] = {}
+        sections = {
+            "tune_budget": ("conversion", "tune_budget"),
+            "rechunk_tune_budget": ("chunking", "tune_budget"),
+            "compression_tune_budget": ("compression", "tune_budget"),
+        }
+        for name, (section_name, field_name) in sections.items():
+            section = config.get(section_name)
+            if isinstance(section, dict) and field_name in section:
+                budget_values[name] = section[field_name]
+        if budget_values:
+            evidence["tuning_budgets"] = budget_values
     evidence.update(payload or {})
     return evidence
 
@@ -135,6 +150,15 @@ def _storage_progress_snapshot(roots: tuple[Path, ...]) -> tuple[int, int]:
     return total_bytes, total_files
 
 
+def _rss_bytes() -> int:
+    try:
+        import psutil
+
+        return int(psutil.Process().memory_info().rss)
+    except (ImportError, OSError, AttributeError):
+        return 0
+
+
 @contextlib.contextmanager
 def _stage_progress(
     event_path: Path,
@@ -143,46 +167,106 @@ def _stage_progress(
     roots: tuple[Path, ...],
     *,
     checkpoint: str,
+    logical_total: int = 0,
+    progress_callback=None,
     interval_seconds: float = 10.0,
 ):
-    """Emit storage-backed progress events while a long stage is running."""
+    """Emit logical progress separately from filesystem observations."""
+
     stop = threading.Event()
     started = time.perf_counter()
     sequence = 0
+    current_completed = 0
+    current_total = max(0, int(logical_total))
+    current_logical_bytes = 0
+    succeeded = False
 
-    def emit() -> None:
-        nonlocal sequence
+    def emit(
+        completed: int,
+        status: str,
+        eta_seconds: float | None,
+        *,
+        total: int | None = None,
+        logical_bytes: int | None = None,
+        message: str | None = None,
+    ) -> None:
+        nonlocal sequence, current_completed, current_total, current_logical_bytes
+        total_value = current_total if total is None else max(0, int(total))
+        completed_value = max(0, int(completed))
+        logical_value = completed_value if logical_bytes is None else max(0, int(logical_bytes))
+        current_total = total_value
+        current_completed = min(completed_value, total_value) if total_value else completed_value
+        current_logical_bytes = logical_value
         observed_bytes, observed_files = _storage_progress_snapshot(roots)
         elapsed = max(0.0, time.perf_counter() - started)
-        _write_event(
-            event_path,
-            "progress",
-            _stage_event_payload(
-                manifest,
-                stage,
-                {
-                    "status": "running",
-                    "heartbeat": True,
-                    "sequence": sequence,
-                    "elapsed_seconds": elapsed,
-                    "observed_bytes": observed_bytes,
-                    "observed_files": observed_files,
-                    "temporary_bytes": observed_bytes,
-                    "throughput_mib_s": (
-                        observed_bytes / max(elapsed, 1e-9) / 1024**2
-                    ),
-                },
-                checkpoint=checkpoint,
-                terminal_status="running",
-            ),
+        logical_rate = logical_value / max(elapsed, 1e-9) / 1024**2
+        observed_rate = observed_bytes / max(elapsed, 1e-9) / 1024**2
+        effective_eta = eta_seconds
+        if (
+            effective_eta is None
+            and status == "running"
+            and logical_value > 0
+            and total_value > logical_value
+            and elapsed >= 0.2
+        ):
+            effective_eta = (total_value - logical_value) / max(logical_value / elapsed, 1e-9)
+        progress_payload: dict[str, object] = {
+            "status": status,
+            "heartbeat": status == "running",
+            "sequence": sequence,
+            "elapsed_seconds": elapsed,
+            "completed": current_completed,
+            "total": total_value,
+            "logical_bytes": logical_value,
+            "temporary_bytes": int(observed_bytes),
+            "rss_bytes": _rss_bytes(),
+            "eta_seconds": effective_eta,
+            "observed_bytes": int(observed_bytes),
+            "observed_files": int(observed_files),
+            "logical_throughput_mib_s": logical_rate,
+            "observed_throughput_mib_s": observed_rate,
+            "throughput_mib_s": observed_rate,
+        }
+        if message:
+            progress_payload["message"] = message
+        payload = _stage_event_payload(
+            manifest,
+            stage,
+            progress_payload,
+            checkpoint=checkpoint,
+            terminal_status=status,
         )
+        _write_event(event_path, "progress", payload)
+        if progress_callback is not None:
+            progress_callback(stage, payload)
         sequence += 1
 
-    emit()
+    def report(
+        completed: int,
+        total: int | None = None,
+        logical_bytes: int | None = None,
+        message: str | None = None,
+    ) -> None:
+        emit(
+            completed,
+            "running",
+            None,
+            total=total,
+            logical_bytes=logical_bytes,
+            message=message,
+        )
+
+    emit(0, "running", None)
 
     def heartbeat() -> None:
         while not stop.wait(max(0.1, interval_seconds)):
-            emit()
+            emit(
+                current_completed,
+                "running",
+                None,
+                total=current_total,
+                logical_bytes=current_logical_bytes,
+            )
 
     thread = threading.Thread(
         target=heartbeat,
@@ -191,11 +275,33 @@ def _stage_progress(
     )
     thread.start()
     try:
-        yield
+        yield report
+        succeeded = True
     finally:
         stop.set()
         thread.join(timeout=2.0)
+        if succeeded:
+            emit(current_total, "completed", 0.0, total=current_total, logical_bytes=current_total)
+        else:
+            emit(
+                current_completed,
+                "failed",
+                None,
+                total=current_total,
+                logical_bytes=current_logical_bytes,
+            )
 
+def _stage_progress_callback(report, logical_total: int):
+    total_value = max(0, int(logical_total))
+
+    def callback(completed: int, total: int, logical_bytes: int | None, message: str | None = None) -> None:
+        if logical_bytes is None:
+            value = int(total_value * max(0, int(completed)) / max(1, int(total)))
+        else:
+            value = min(total_value, max(0, int(logical_bytes)))
+        report(value, total_value, value, message)
+
+    return callback
 def _apply_runtime_compression(
     manifest: dict,
     metrics: dict,
@@ -726,6 +832,7 @@ def _run_zarr_pipeline(
     *,
     cancel_event=None,
     progress: bool = True,
+    progress_callback=None,
 ) -> dict[str, object]:
     paths = _paths(config)
     preflight = _preflight_paths(
@@ -814,6 +921,12 @@ def _run_zarr_pipeline(
         "stages": {},
         "resume": {"schema_version": 1, "checkpoints": {}},
     }
+    lifecycle = ProcessLifecycle("pipeline")
+    manifest["worker_lifecycle"] = lifecycle.to_dict()
+
+    def update_lifecycle() -> None:
+        lifecycle.sample()
+        manifest["worker_lifecycle"] = lifecycle.to_dict()
     _write_manifest(paths.manifest, manifest)
     started = time.perf_counter()
     current = Path(inspection.path).expanduser().resolve()
@@ -843,7 +956,9 @@ def _run_zarr_pipeline(
                 "resampling",
                 (paths.root, resample_output),
                 checkpoint="resampled.zarr" if plan.finalization_required else "output",
-            ):
+                logical_total=_logical_output_bytes(plan),
+                progress_callback=progress_callback,
+            ) as stage_report:
                 resample_metrics = run_resample(
                     ResampleConfig(
                         input=current,
@@ -876,9 +991,14 @@ def _run_zarr_pipeline(
                             options.after_conditions, options.after_results
                         ),
                         statistics_policy=options.statistics_policy,
+                        variable_options=options.variable_options,
                     ),
                     plan.resample_plan.inspection if plan.resample_plan else None,
                     cancel_event=cancel_event,
+                    progress_callback=_stage_progress_callback(
+                        stage_report,
+                        _logical_output_bytes(plan),
+                    ),
                 )
             current = resample_output
             manifest["stages"]["resampling"] = {
@@ -891,6 +1011,7 @@ def _run_zarr_pipeline(
             manifest["selection"]["resampling"] = resample_metrics.get("tuning", {}).get("selection_reason")
             manifest["resolved_plans"]["resampling"] = resample_metrics.get("resolved_plan", {})
             _write_event(paths.events, "tuning", _stage_event_payload(manifest, "resampling", {"selection": manifest["selection"]["resampling"]}, checkpoint="resampled.zarr" if plan.finalization_required else "output", terminal_status="running"))
+            update_lifecycle()
             _write_manifest(paths.manifest, manifest)
             if resuming:
                 if plan.resample_plan is None:
@@ -904,6 +1025,8 @@ def _run_zarr_pipeline(
                     "mathematical_validation",
                     (paths.root, resample_output),
                     checkpoint="resampled.zarr" if plan.finalization_required else "output",
+                    logical_total=0,
+                    progress_callback=progress_callback,
                 ):
                     validation_metrics = validate_resample_samples(
                         Path(inspection.path),
@@ -926,6 +1049,7 @@ def _run_zarr_pipeline(
                         "dimensions": dict(plan.resample_plan.target.dimensions),
                     }
 
+                update_lifecycle()
                 _write_manifest(paths.manifest, manifest)
         if cancel_event is not None and cancel_event.is_set():
             raise PipelineExecutionError("任务已取消。")
@@ -940,7 +1064,9 @@ def _run_zarr_pipeline(
                 "finalization",
                 (paths.root, output),
                 checkpoint="output",
-            ):
+                logical_total=_logical_output_bytes(plan),
+                progress_callback=progress_callback,
+            ) as stage_report:
                 finalization_metrics = run_rechunk(
                     RechunkConfig(
                         input=current,
@@ -969,8 +1095,13 @@ def _run_zarr_pipeline(
                         },
                         compression_shuffle=config.compression.shuffle,
                         compression_objective=config.compression.objective,
+                        tune_budget_seconds=chunking.tune_budget,
                         compression_tune_budget=config.compression.tune_budget,
                         resource_budget=effective_resource_budget(resources),
+                    ),
+                    progress_callback=_stage_progress_callback(
+                        stage_report,
+                        _logical_output_bytes(plan),
                     ),
                     cancel_event=cancel_event,
                 )
@@ -989,6 +1120,7 @@ def _run_zarr_pipeline(
             if plan.needs_resample and config.general.cleanup_intermediate:
                 shutil.rmtree(current)
                 manifest["stages"]["resampling"]["status"] = "validated_and_cleaned"
+        update_lifecycle()
         if plan.finalization_required:
             manifest["candidate_trials"]["finalization"] = finalization_metrics.get("worker_tuning", {})
             manifest["selection"]["finalization"] = {
@@ -1055,6 +1187,8 @@ def _run_zarr_pipeline(
         manifest["logical_io"] = logical_io
         manifest["status"] = "succeeded"
         manifest["elapsed"] = time.perf_counter() - started
+        lifecycle.finish("completed")
+        manifest["worker_lifecycle"] = lifecycle.to_dict()
         _write_event(paths.events, "finished", _stage_event_payload(manifest, "terminal", {"status": "succeeded", "elapsed": manifest["elapsed"]}, checkpoint="output", terminal_status="succeeded"))
         _write_manifest(paths.manifest, manifest)
         return {
@@ -1073,6 +1207,10 @@ def _run_zarr_pipeline(
             "logical_io": logical_io,
         }
     except Exception as exc:
+        lifecycle.finish(
+            "cancelled" if cancel_event is not None and cancel_event.is_set() else "failed"
+        )
+        manifest["worker_lifecycle"] = lifecycle.to_dict()
         manifest["status"] = "failed"
         manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started
@@ -1092,6 +1230,7 @@ def run_pipeline(
     *,
     cancel_event=None,
     progress: bool = True,
+    progress_callback=None,
 ) -> dict[str, object]:
     plan = build_pipeline_plan(inspection, config)
     if config.backend == "rust" and not getattr(plan, "finalization_required", False):
@@ -1108,6 +1247,7 @@ def run_pipeline(
             plan,
             cancel_event=cancel_event,
             progress=progress,
+            progress_callback=progress_callback,
         )
     paths = _paths(config)
     _check_raw_storage_capacity(inspection, plan, paths)
@@ -1185,6 +1325,12 @@ def run_pipeline(
         "resume": {"schema_version": 1, "checkpoints": {}},
         "stages": {},
     }
+    lifecycle = ProcessLifecycle("pipeline")
+    manifest["worker_lifecycle"] = lifecycle.to_dict()
+
+    def update_lifecycle() -> None:
+        lifecycle.sample()
+        manifest["worker_lifecycle"] = lifecycle.to_dict()
     _write_manifest(paths.manifest, manifest)
     started = time.perf_counter()
     current = paths.converted
@@ -1251,11 +1397,17 @@ def run_pipeline(
             "conversion",
             (paths.root, conversion_output),
             checkpoint="source-crop.zarr" if not conversion_is_final else "output",
-        ):
+            logical_total=selected_logical_bytes(inspection.source_inventory, plan.source_selection),
+            progress_callback=progress_callback,
+        ) as stage_report:
             conversion_plan, conversion_metrics = run_conversion(
                 inspection,
                 conversion_config,
                 cancel_event=cancel_event,
+                progress_callback=_stage_progress_callback(
+                    stage_report,
+                    selected_logical_bytes(inspection.source_inventory, plan.source_selection),
+                ),
             )
         manifest["stages"]["conversion"] = {
             "status": "validated_staging" if conversion_is_final else "validated",
@@ -1281,6 +1433,7 @@ def run_pipeline(
                     for name in plan.source_selection.variables
                 ],
             }
+        update_lifecycle()
         _write_manifest(paths.manifest, manifest)
         if cancel_event is not None and cancel_event.is_set():
             raise PipelineExecutionError("任务已取消。")
@@ -1333,6 +1486,7 @@ def run_pipeline(
                     resampling.after_conditions, resampling.after_results
                 ),
                 statistics_policy=resampling.statistics_policy,
+                variable_options=resampling.variable_options,
             )
             if progress:
                 print(
@@ -1346,15 +1500,22 @@ def run_pipeline(
                 "resampling",
                 (paths.root, resample_output),
                 checkpoint="resampled.zarr" if not resampling_is_final else "output",
-            ):
+                logical_total=_logical_output_bytes(plan),
+                progress_callback=progress_callback,
+            ) as stage_report:
                 resample_metrics = run_resample(
                     resample_config,
                     cancel_event=cancel_event,
+                    progress_callback=_stage_progress_callback(
+                        stage_report,
+                        _logical_output_bytes(plan),
+                    ),
                 )
             manifest["stages"]["resampling"] = {
                 "status": "validating_math_samples",
                 "metrics": resample_metrics,
             }
+            update_lifecycle()
             _write_manifest(paths.manifest, manifest)
             if progress:
                 print("重采样主体完成，开始局部数学验证……", flush=True)
@@ -1365,6 +1526,8 @@ def run_pipeline(
                 "mathematical_validation",
                 (paths.root, resample_output),
                 checkpoint="resampled.zarr" if not resampling_is_final else "output",
+                logical_total=0,
+                progress_callback=progress_callback,
             ):
                 validation_metrics = validate_resample_samples(
                     paths.converted,
@@ -1400,6 +1563,7 @@ def run_pipeline(
                 manifest["stages"]["conversion"]["status"] = "validated_and_cleaned"
                 _write_manifest(paths.manifest, manifest)
 
+        update_lifecycle()
         if not plan.finalization_required:
             rechunk_metrics = {
                 "skipped": True,
@@ -1430,6 +1594,7 @@ def run_pipeline(
                     else "none"
                 ),
                 workers=chunking.workers,
+                tune_budget_seconds=chunking.tune_budget,
                 validate=config.validate,
                 backend=getattr(config, "backend", "python"),
                 recompress=config.operations.recompress,
@@ -1458,8 +1623,17 @@ def run_pipeline(
                 "finalization",
                 (paths.root, Path(config.general.output).expanduser().resolve()),
                 checkpoint="output",
-            ):
-                rechunk_metrics = run_rechunk(rechunk_config, cancel_event=cancel_event)
+                logical_total=_logical_output_bytes(plan),
+                progress_callback=progress_callback,
+            ) as stage_report:
+                rechunk_metrics = run_rechunk(
+                    rechunk_config,
+                    cancel_event=cancel_event,
+                    progress_callback=_stage_progress_callback(
+                        stage_report,
+                        _logical_output_bytes(plan),
+                    ),
+                )
             _apply_backend_metrics(manifest, rechunk_metrics, requested_backend)
             manifest["stages"]["finalization"] = {
                 "status": "published_and_validated",
@@ -1469,6 +1643,7 @@ def run_pipeline(
             if config.general.cleanup_intermediate:
                 shutil.rmtree(current, ignore_errors=False)
                 manifest["stages"]["resampling" if plan.needs_resample else "conversion"]["status"] = "validated_and_cleaned"
+            update_lifecycle()
         manifest["candidate_trials"]["finalization"] = rechunk_metrics.get("worker_tuning", {})
         manifest["selection"]["finalization"] = {
             "tuning_objective": rechunk_metrics.get("tuning_objective"),
@@ -1529,6 +1704,8 @@ def run_pipeline(
         manifest["logical_io"] = logical_io
         manifest["status"] = "succeeded"
         manifest["elapsed"] = time.perf_counter() - started
+        lifecycle.finish("completed")
+        manifest["worker_lifecycle"] = lifecycle.to_dict()
         _write_event(paths.events, "finished", _stage_event_payload(manifest, "terminal", {"status": "succeeded", "elapsed": manifest["elapsed"]}, checkpoint="output", terminal_status="succeeded"))
         _write_manifest(paths.manifest, manifest)
         if progress:
@@ -1549,6 +1726,10 @@ def run_pipeline(
             "logical_io": logical_io,
         }
     except Exception as exc:
+        lifecycle.finish(
+            "cancelled" if cancel_event is not None and cancel_event.is_set() else "failed"
+        )
+        manifest["worker_lifecycle"] = lifecycle.to_dict()
         manifest["status"] = "failed"
         manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started

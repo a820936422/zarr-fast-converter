@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import os
 import tempfile
 import time
 import io
@@ -31,6 +32,7 @@ from fast_nc_zarr.application.services import (  # noqa: E402
 from fast_nc_zarr.pipeline.engine import (  # noqa: E402
     PipelineExecutionError,
     _stage_progress,
+    _stage_progress_callback,
     preview_pipeline,
     run_pipeline,
 )
@@ -394,6 +396,11 @@ class PipelineTests(unittest.TestCase):
                     Path(result["manifest"]).read_text(encoding="utf-8")
                 )
                 self.assertEqual(manifest["schema_version"], 7)
+                lifecycle = manifest["worker_lifecycle"]
+                self.assertEqual(lifecycle["parent_pid"], os.getpid())
+                self.assertEqual(lifecycle["exit_reason"], "completed")
+                self.assertIsNotNone(lifecycle["ended_at"])
+                self.assertEqual(lifecycle["active_child_pids"], [])
                 self.assertTrue(Path(manifest["events"]).is_file())
                 event_records = [
                     json.loads(line)
@@ -446,7 +453,16 @@ class PipelineTests(unittest.TestCase):
             root = Path(temporary)
             (root / "chunk.bin").write_bytes(b"progress")
             events = root / "events.jsonl"
-            manifest = {"manifest": str(root / "manifest.json"), "backend": {}}
+            manifest = {
+                "manifest": str(root / "manifest.json"),
+                "backend": {},
+                "config": {
+                    "conversion": {"tune_budget": 11.0},
+                    "chunking": {"tune_budget": 12.0},
+                    "compression": {"tune_budget": 13.0},
+                },
+            }
+            callback_records: list[tuple[str, dict[str, object]]] = []
             with _stage_progress(
                 events,
                 manifest,
@@ -454,6 +470,8 @@ class PipelineTests(unittest.TestCase):
                 (root,),
                 checkpoint="source-crop.zarr",
                 interval_seconds=0.02,
+                logical_total=123,
+                progress_callback=lambda stage, payload: callback_records.append((stage, payload)),
             ):
                 time.sleep(0.2)
             records = [
@@ -464,8 +482,40 @@ class PipelineTests(unittest.TestCase):
             self.assertGreaterEqual(len(records), 2)
             self.assertTrue(all(record["event"] == "progress" for record in records))
             self.assertTrue(all(record["stage"] == "conversion" for record in records))
-            self.assertTrue(all(record["heartbeat"] for record in records))
+            self.assertTrue(all(record["heartbeat"] for record in records[:-1]))
+            self.assertEqual(records[-1]["status"], "completed")
+            self.assertEqual(records[-1]["completed"], records[-1]["total"])
+            self.assertEqual(records[-1]["logical_bytes"], records[-1]["total"])
+            self.assertEqual(records[-1]["eta_seconds"], 0.0)
+            self.assertIn("temporary_bytes", records[-1])
+            self.assertIn("rss_bytes", records[-1])
             self.assertGreaterEqual(records[-1]["observed_bytes"], len(b"progress"))
+            self.assertEqual(callback_records[-1][0], "conversion")
+            self.assertEqual(callback_records[-1][1]["completed"], 123)
+            self.assertEqual(callback_records[-1][1]["logical_bytes"], 123)
+            self.assertEqual(
+                records[-1]["tuning_budgets"],
+                {
+                    "tune_budget": 11.0,
+                    "rechunk_tune_budget": 12.0,
+                    "compression_tune_budget": 13.0,
+                },
+            )
+
+    def test_stage_progress_callback_maps_tile_units_to_logical_bytes(self) -> None:
+        records: list[tuple[int, int, int, str | None]] = []
+        callback = _stage_progress_callback(
+            lambda completed, total, logical_bytes, message: records.append(
+                (completed, total, logical_bytes, message)
+            ),
+            1_000,
+        )
+
+        callback(2, 4, None, "tile progress")
+        callback(1_000, 1_000, 1_000, "byte progress")
+
+        self.assertEqual(records[0], (500, 1_000, 500, "tile progress"))
+        self.assertEqual(records[-1], (1_000, 1_000, 1_000, "byte progress"))
 
     def test_pipeline_writes_canonical_target_zarr(self) -> None:
         inspection = inspect_source(

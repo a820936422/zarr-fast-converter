@@ -4,10 +4,12 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, is_dataclass
 import io
 import json
+import os
 from pathlib import Path
 import math
 import re
 import sys
+import signal
 from threading import Event as ThreadEvent, Thread
 import time
 from typing import Any, TextIO
@@ -208,7 +210,29 @@ def _variable_transforms(payload: dict[str, Any]):
         )
     return result
 
+def _variable_resampling_options(payload: dict[str, Any]):
+    from ...resampling.models import ResampleVariableOptions
 
+    raw = payload.get("variable_resampling") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("variable_resampling must be an object")
+    result = {}
+    for name, value in raw.items():
+        if not isinstance(value, dict):
+            raise ValueError(f"变量 {name} 的重采样规则必须是对象。")
+        na_thres = _numeric_value(value.get("na_thres", 1.0), f"变量 {name} 的 na_thres")
+        if not 0 <= na_thres <= 1:
+            raise ValueError(f"变量 {name} 的 na_thres 必须位于 0 到 1 之间。")
+        compute_dtype = str(value.get("compute_dtype", "source"))
+        if compute_dtype not in {"source", "float32"}:
+            raise ValueError(f"变量 {name} 的 compute_dtype 不受支持。")
+        result[str(name)] = ResampleVariableOptions(
+            method=str(value.get("method", "bilinear")),
+            skipna=bool(value.get("skipna", True)),
+            na_thres=na_thres,
+            compute_dtype=compute_dtype,
+        )
+    return result
 def _pipeline_config(payload: dict[str, Any]):
     from ...pipeline.models import (
         PipelineChunkingOptions,
@@ -274,12 +298,14 @@ def _pipeline_config(payload: dict[str, Any]):
             after_conditions=str(payload.get("after_conditions", "")),
             after_results=str(payload.get("after_results", "")),
             statistics_policy=str(payload.get("statistics_policy", "auto")),
+            variable_options=_variable_resampling_options(payload),
         ),
         chunking=PipelineChunkingOptions(
             strategy=str(payload.get("strategy", "time")),
             target_mib=float(payload.get("target_mib", 128.0)),
             custom_chunks=tuple(int(item) for item in custom_chunks) if custom_chunks else None,
             workers=payload.get("workers", "auto"),
+            tune_budget=float(payload.get("rechunk_tune_budget", 60.0)),
         ),
         compression=PipelineCompressionOptions(
             profile=compression,
@@ -342,15 +368,38 @@ class _OutputStream(io.TextIOBase):
         percentages = _PERCENT_PROGRESS.findall(text)
         fractions = _FRACTION_PROGRESS.findall(text)
         if percentages and ("进度" in text or "Completed" in text or "[" in text):
+            completed = min(1000, max(0, int(round(float(percentages[-1]) * 10))))
             self.sink.emit(
                 "progress",
-                {"completed": min(1000, max(0, int(round(float(percentages[-1]) * 10)))), "total": 1000, "message": text},
+                {
+                    "completed": completed,
+                    "total": 1000,
+                    "logical_bytes": None,
+                    "temporary_bytes": None,
+                    "rss_bytes": None,
+                    "eta_seconds": None,
+                    "progress_kind": "text_observation",
+                    "message": text,
+                },
                 stage="execution",
             )
         elif fractions:
             completed, total = map(int, fractions[-1])
             if total > 0 and 0 <= completed <= total:
-                self.sink.emit("progress", {"completed": completed, "total": total, "message": text}, stage="execution")
+                self.sink.emit(
+                    "progress",
+                    {
+                        "completed": completed,
+                        "total": total,
+                        "logical_bytes": None,
+                        "temporary_bytes": None,
+                        "rss_bytes": None,
+                        "eta_seconds": None,
+                        "progress_kind": "text_observation",
+                        "message": text,
+                    },
+                    stage="execution",
+                )
 
 
 def _monitor_cancellation(path: Path | None, cancel_event: ThreadEvent, stop: ThreadEvent) -> None:
@@ -493,7 +542,14 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
                 if cancel_event.is_set():
                     sink.emit("cancelled", {"reason": "cancellation requested"}, stage="planning")
                 else:
-                    payload = {"plan_kind": type(plan).__name__, "plan": _safe(plan)}
+                    safe_plan = _safe(plan)
+                    if isinstance(safe_plan, dict):
+                        safe_plan["tuning_budgets"] = {
+                            "tune_budget": config.conversion.tune_budget,
+                            "rechunk_tune_budget": config.chunking.tune_budget,
+                            "compression_tune_budget": config.compression.tune_budget,
+                        }
+                    payload = {"plan_kind": type(plan).__name__, "plan": safe_plan}
                     sink.emit("plan_ready", payload, stage="planning")
                     sink.emit("finished", payload, stage="planning")
             except Exception as exc:
@@ -512,7 +568,15 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
         monitor.start()
         try:
             with redirect_stdout(_OutputStream(sink, stream_name="stdout")), redirect_stderr(_OutputStream(sink, stream_name="stderr")):
-                result = run_pipeline(inspection, config, cancel_event=cancel_event, progress=False)
+                result = run_pipeline(
+                    inspection,
+                    config,
+                    cancel_event=cancel_event,
+                    progress=False,
+                    progress_callback=lambda stage, payload: sink.emit(
+                        "progress", payload, stage=stage
+                    ),
+                )
             if cancel_event.is_set():
                 sink.emit("cancelled", {"reason": "cancellation requested"}, stage="execution")
             else:
@@ -529,7 +593,34 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
     raise ProtocolError(f"command is not implemented yet: {request.command}")
 
 
+def _configure_parent_death_signal() -> None:
+    """Ensure spawned numerical workers die with this desktop worker."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        parent_pid = os.getppid()
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        prctl.restype = ctypes.c_int
+        if prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+            return
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGTERM)
+    except (ImportError, OSError, AttributeError):
+        return
+
+
 def run_worker(input_stream: TextIO = sys.stdin, output_stream: TextIO = sys.stdout) -> int:
+    _configure_parent_death_signal()
     for line in input_stream:
         if not line.strip():
             continue

@@ -104,6 +104,29 @@ class RechunkingTests(unittest.TestCase):
         self.assertEqual(shards["float_value"], (2, 8, 10))
         self.assertEqual(shards["integer_value"], (2, 8, 10))
 
+    def test_equivalent_store_reports_progress_completion(self) -> None:
+        source = ROOT / "input.zarr"
+        output = ROOT / "equivalent-progress.zarr"
+        info = inspect_store(source)
+        plan = plan_chunks(info, "custom", custom_chunks=(2, 4, 5), target_mib=32)
+        records: list[tuple[int, int, int | None, str | None]] = []
+
+        metrics = run_rechunk(
+            source,
+            output,
+            info,
+            plan,
+            make_compression_plan("none"),
+            workers=1,
+            progress=False,
+            progress_callback=lambda completed, total, logical_bytes, message: records.append(
+                (completed, total, logical_bytes, message)
+            ),
+        )
+
+        self.assertEqual(metrics["execution_path"], "copy")
+        self.assertEqual(records, [(1, 1, None, "等价复制完成")])
+
     def test_equivalent_store_uses_independent_chunk_copy(self) -> None:
         source = ROOT / "input.zarr"
         output = ROOT / "equivalent-copy.zarr"

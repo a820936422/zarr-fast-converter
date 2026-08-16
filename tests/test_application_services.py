@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import xarray as xr
@@ -26,6 +27,7 @@ from fast_nc_zarr.application.services import (  # noqa: E402
     run_rechunk,
     save_inspection_snapshot,
 )
+from fast_nc_zarr.application.desktop_worker.worker import _pipeline_config  # noqa: E402
 from fast_nc_zarr.models import VariableTransform  # noqa: E402
 
 
@@ -124,6 +126,30 @@ class ApplicationServiceTests(unittest.TestCase):
         preview = preview_rechunk(RechunkConfig(ROOT / "input.zarr", ROOT / "output.zarr", workers=1), result.zarr_info)
         self.assertEqual(result.zarr_info.zarr_format, 3)
         self.assertEqual(preview.plan.strategy, "time")
+
+    def test_rechunk_tune_budget_is_forwarded_to_engine(self) -> None:
+        result = inspect_zarr(ROOT / "input.zarr")
+        config = RechunkConfig(
+            ROOT / "input.zarr",
+            ROOT / "budget-output.zarr",
+            workers=1,
+            tune_budget_seconds=12.5,
+        )
+        with patch(
+            "fast_nc_zarr.application.services.core_run_rechunk",
+            return_value={"backend": "python"},
+        ) as core_run:
+            run_rechunk(config, result.zarr_info)
+        self.assertEqual(core_run.call_args.kwargs["tune_budget_seconds"], 12.5)
+
+    def test_desktop_payload_restores_rechunk_tune_budget(self) -> None:
+        config = _pipeline_config(
+            {
+                "output": str(ROOT / "payload-output.zarr"),
+                "rechunk_tune_budget": 17.5,
+            }
+        )
+        self.assertEqual(config.chunking.tune_budget, 17.5)
 
     @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
     def test_zarr_service_rust_backend_publishes_valid_output(self) -> None:

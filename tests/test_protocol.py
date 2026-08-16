@@ -198,6 +198,23 @@ class DesktopWorkerTests(unittest.TestCase):
         self.assertEqual(config.compression.shuffle, "noshuffle")
         self.assertEqual(config.compression.objective, "compact")
         self.assertEqual(config.compression.tune_budget, 30)
+
+    def test_pipeline_payload_parses_variable_resampling_overrides(self) -> None:
+        config = _pipeline_config(
+            {
+                "output": "/tmp/variable-resampling.zarr",
+                "variable_resampling": {
+                    "a1": {"method": "conservative", "skipna": True, "na_thres": 0.75},
+                    "a2": {"method": "bilinear", "skipna": False, "na_thres": 0.25, "compute_dtype": "float32"},
+                },
+            }
+        )
+        self.assertEqual(config.resampling.variable_options["a1"].method, "conservative")
+        self.assertTrue(config.resampling.variable_options["a1"].skipna)
+        self.assertEqual(config.resampling.variable_options["a2"].method, "bilinear")
+        self.assertFalse(config.resampling.variable_options["a2"].skipna)
+        self.assertEqual(config.resampling.variable_options["a2"].compute_dtype, "float32")
+
     def test_run_pipeline_publishes_output_after_worker_launch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="desktop-pipeline-") as raw:
             root = Path(raw)
@@ -275,6 +292,12 @@ class DesktopWorkerTests(unittest.TestCase):
             )
             run_events = [json.loads(line) for line in run.stdout.splitlines() if line.strip()]
             self.assertEqual(run_events[-1]["event"], "finished")
+            progress_events = [event for event in run_events if event["event"] == "progress"]
+            self.assertTrue(progress_events)
+            completed = [event for event in progress_events if event["payload"].get("status") == "completed"]
+            self.assertTrue(completed)
+            self.assertTrue(all("logical_bytes" in event["payload"] for event in progress_events))
+            self.assertTrue(all("temporary_bytes" in event["payload"] for event in progress_events))
             self.assertTrue((output / "zarr.json").is_file())
 
     def test_invalid_request_returns_structured_failure(self) -> None:

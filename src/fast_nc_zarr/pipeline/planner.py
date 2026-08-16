@@ -18,7 +18,7 @@ from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo, Variabl
 from ..rechunking.planning import plan_chunks
 from ..resampling.engine import plan_resample
 from ..resampling.inspection import inspect_resample_input
-from ..resampling.models import ResampleConfig
+from ..resampling.models import ResampleConfig, ResampleVariableOptions
 from ..resampling.replacements import parse_replacement_rules
 from .models import (
     OperationDecision,
@@ -28,6 +28,17 @@ from .models import (
     ZarrPipelinePlan,
 )
 from ..selection import make_selection
+
+def _resampling_options(config: PipelineConfig, name: str) -> ResampleVariableOptions:
+    return config.resampling.variable_options.get(
+        name,
+        ResampleVariableOptions(
+            method=config.resampling.method,
+            skipna=config.resampling.skipna,
+            na_thres=config.resampling.na_thres,
+            compute_dtype=config.resampling.compute_dtype,
+        ),
+    )
 
 
 def _grid_info(inventory: Inventory) -> GridInfo:
@@ -332,7 +343,7 @@ def _final_layout(
         if needs_resample:
             if not np.issubdtype(dtype, np.floating):
                 dtype = np.dtype("float64")
-            elif config.resampling.compute_dtype == "float32":
+            elif _resampling_options(config, name).compute_dtype == "float32":
                 dtype = np.dtype("float32")
         shape = tuple(dimensions[dim] for dim in ("time", "lat", "lon"))
         variables.append(
@@ -508,7 +519,7 @@ def _output_layout(
         if needs_resample:
             if not np.issubdtype(dtype, np.floating):
                 dtype = np.dtype("float64")
-            elif config.resampling.compute_dtype == "float32":
+            elif _resampling_options(config, name).compute_dtype == "float32":
                 dtype = np.dtype("float32")
         output_name = config.conversion.variable_names.get(name, name)
         layouts.append(
@@ -668,7 +679,7 @@ def _zarr_target_info(info: DatasetInfo, resample_plan) -> DatasetInfo:
         if not item.is_coord and {"lat", "lon"}.issubset(item.dims):
             if not np.issubdtype(dtype, np.floating):
                 dtype = np.dtype("float64")
-            elif resample_plan.compute_dtype == "float32":
+            elif resample_plan.options_for(item.name).compute_dtype == "float32":
                 dtype = np.dtype("float32")
         variables.append(
             VariableInfo(
@@ -774,6 +785,7 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
                 before_replacements=before_replacements,
                 after_replacements=after_replacements,
                 statistics_policy=options.statistics_policy,
+                variable_options=options.variable_options,
             ),
             resample_inspection,
         )
@@ -1020,7 +1032,7 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
         lon_stop=lon_stop,
         lat_bounds=lat_bounds,
         lon_bounds=lon_bounds,
-        method=config.resampling.method if operations.resample else "none",
+        method=("per-variable" if operations.resample and options.variable_options else config.resampling.method if operations.resample else "none"),
         halo_description=halo_description,
     )
 

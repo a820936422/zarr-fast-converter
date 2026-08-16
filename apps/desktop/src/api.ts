@@ -158,6 +158,7 @@ export const inspectPipelineRecovery = (path: string) => invoke<InspectionResult
 export const getTask = (taskId: string) => invoke<TaskSummary | null>("get_task", { taskId });
 export const startNativeTask = (request: NativeTaskRequest) => invoke<string>("start_native_task", { request });
 export const listTasks = () => invoke<TaskSummary[]>("list_tasks");
+export const clearTaskHistory = () => invoke<number>("clear_task_history");
 export const cancelTask = (taskId: string) => invoke<void>("cancel_task", { taskId });
 export const pickDirectory = () => open({ directory: true, multiple: false });
 export const pickInputFile = () => open({ multiple: false, filters: [{ name: "遥感数据", extensions: ["nc", "hdf", "h5", "tif", "tiff", "zarr"] }] });

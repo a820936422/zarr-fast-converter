@@ -56,6 +56,7 @@ def _dask_write(
     cancel_event=None,
     *,
     progress: bool = True,
+    progress_callback=None,
 ) -> dict:
     import dask
     import xarray as xr
@@ -239,6 +240,8 @@ def _dask_write(
                 dask.compute(delayed)
         elapsed = time.perf_counter() - started
         logical = selected_logical_bytes(inventory, selection)
+        if progress_callback is not None:
+            progress_callback(logical, logical, logical, "Dask 转换写入完成")
         return {
             "elapsed": elapsed,
             "logical_bytes": logical,
@@ -259,14 +262,15 @@ def convert(
     resource_budget: EffectiveResourceBudget | None = None,
     max_workers: int | None = None,
     reserve_gib: float = 2.0,
-    overwrite: bool = False,
-    validate: bool = True,
-    progress: bool = True,
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
     chunks: tuple[int, int, int] | None = None,
+    overwrite: bool = False,
+    validate: bool = True,
+    progress: bool = True,
     output_layout: OutputLayout | None = None,
     cancel_event=None,
+    progress_callback=None,
 ) -> tuple[ConversionPlan, dict]:
     output = validate_publish_target(
         output,
@@ -383,6 +387,7 @@ def convert(
                 output_layout=output_layout,
                 cancel_event=cancel_event,
                 progress=progress,
+                progress_callback=progress_callback,
             )
         else:
             metrics = direct_write(
@@ -395,6 +400,7 @@ def convert(
                 output_layout=output_layout,
                 cancel_event=cancel_event,
                 progress=progress,
+                progress_callback=progress_callback,
             )
         if validate:
             validate_output(

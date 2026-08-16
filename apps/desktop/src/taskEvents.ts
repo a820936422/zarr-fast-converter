@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { cancelTask, getTask, listTasks, type TaskEvent, type TaskSummary } from "./api";
+import { cancelTask, clearTaskHistory, getTask, listTasks, type TaskEvent, type TaskSummary } from "./api";
 
 export function useTaskEvents() {
   const [events, setEvents] = useState<TaskEvent[]>([]);
@@ -33,5 +33,12 @@ export function useTaskEvents() {
     };
   }, []);
 
-  return { events, tasks, cancel: cancelTask };
+  const clearHistory = async () => {
+    const removed = await clearTaskHistory();
+    setEvents([]);
+    setTasks(await listTasks());
+    return removed;
+  };
+
+  return { events, tasks, cancel: cancelTask, clearHistory };
 }

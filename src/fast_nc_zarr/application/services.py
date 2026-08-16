@@ -301,6 +301,7 @@ class RechunkConfig:
     rechunk: bool = True
     recompress: bool | None = None
     temporary_dir: Path | None = None
+    tune_budget_seconds: float = 60.0
     compression_codec: str | None = None
     compression_level: int | None = None
     compression_shuffle: str = "auto"
@@ -739,6 +740,7 @@ def run_conversion(
     config: ConversionConfig,
     *,
     cancel_event=None,
+    progress_callback=None,
 ) -> tuple[Any, dict[str, Any]]:
     preview = preview_conversion(inspection, config)
     _assert_source_inventory_stable(preview.inventory)
@@ -762,6 +764,7 @@ def run_conversion(
             overwrite=config.overwrite,
             validate=config.validate,
             progress=True,
+            progress_callback=progress_callback,
             cancel_event=cancel_event,
         )
     else:
@@ -783,6 +786,7 @@ def run_conversion(
             chunks=config.chunks,
             output_layout=config.output_layout,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
     _assert_source_inventory_stable(preview.inventory)
     return result
@@ -834,6 +838,7 @@ def run_rechunk(
     info: DatasetInfo | None = None,
     *,
     cancel_event=None,
+    progress_callback=None,
 ) -> dict[str, Any]:
     preview = preview_rechunk(config, info)
     if config.backend in {"auto", "rust"}:
@@ -863,10 +868,11 @@ def run_rechunk(
                 cancel_event=cancel_event,
                 temporary_dir=config.temporary_dir,
                 compression_objective=config.compression_objective,
+                tune_budget_seconds=config.tune_budget_seconds,
                 compression_tune_budget_seconds=config.compression_tune_budget,
                 tuning_objective=config.tuning_objective,
                 resource_budget=config.resource_budget,
-                storage_overrides=config.storage_overrides,
+                progress_callback=progress_callback,
             )
             fallback_metrics = dict(fallback_metrics)
             fallback_metrics.update(
@@ -891,10 +897,11 @@ def run_rechunk(
         cancel_event=cancel_event,
         temporary_dir=config.temporary_dir,
         compression_objective=config.compression_objective,
+        tune_budget_seconds=config.tune_budget_seconds,
         compression_tune_budget_seconds=config.compression_tune_budget,
         tuning_objective=config.tuning_objective,
+        progress_callback=progress_callback,
         resource_budget=config.resource_budget,
-        storage_overrides=config.storage_overrides,
     )
     metrics = dict(metrics)
     metrics.setdefault("backend", "python")
@@ -918,6 +925,7 @@ def run_resample(
     inspection: ResampleInspection | None = None,
     *,
     cancel_event=None,
+    progress_callback=None,
 ) -> dict[str, Any]:
     preview = preview_resample(config, inspection)
     return core_run_resample(
@@ -925,6 +933,7 @@ def run_resample(
         preview.plan,
         cancel_event=cancel_event,
         progress=True,
+        progress_callback=progress_callback,
     )
 
 
@@ -942,7 +951,8 @@ def run_pipeline(
     *,
     cancel_event=None,
     progress: bool = True,
-):
+    progress_callback=None,
+) -> dict[str, Any]:
     from ..pipeline.engine import run_pipeline as core_run_pipeline
 
     result = core_run_pipeline(
@@ -950,6 +960,7 @@ def run_pipeline(
         config,
         cancel_event=cancel_event,
         progress=progress,
+        progress_callback=progress_callback,
     )
     if inspection.kind == "temporary" and inspection.recovery is not None:
         mark_recovery_succeeded(

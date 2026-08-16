@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "fast-nc-zarr-desktop"
-version = "1.7.5"
+version = "1.7.6"
 dependencies = [
  "fast-nc-zarr-model",
  "fast-nc-zarr-zarr",
@@ -983,14 +983,14 @@ dependencies = [
 
 [[package]]
 name = "fast-nc-zarr-model"
-version = "1.7.5"
+version = "1.7.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "fast-nc-zarr-python"
-version = "1.7.5"
+version = "1.7.6"
 dependencies = [
  "fast-nc-zarr-model",
  "fast-nc-zarr-zarr",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "fast-nc-zarr-zarr"
-version = "1.7.5"
+version = "1.7.6"
 dependencies = [
  "fast-nc-zarr-model",
  "ndarray 0.17.2",

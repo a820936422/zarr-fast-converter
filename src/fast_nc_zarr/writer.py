@@ -19,6 +19,7 @@ from .models import (
     Selection,
     VariableTransform,
 )
+from .selection import selected_logical_bytes
 from .runtime import bounded_process_map
 
 _OUTPUT_GROUP = None
@@ -867,6 +868,7 @@ def direct_write(
     output_layout: OutputLayout | None = None,
     cancel_event=None,
     progress: bool = True,
+    progress_callback=None,
 ) -> dict[str, float | int]:
     initialize_zarr(
         inventory,
@@ -889,6 +891,7 @@ def direct_write(
         raise ValueError(f"direct_write 不支持策略 {plan.strategy}")
     total_tasks = _task_count(selection, plan)
     total_batches = _batch_count(inventory, selection, plan, output_layout)
+    total_logical = selected_logical_bytes(inventory, selection)
     total_chunks = _physical_chunk_count(inventory, selection, plan, output_layout)
     effective_batch = _effective_task_batch(plan.task_batch)
     worker_count = max(1, min(plan.workers, total_batches))
@@ -930,6 +933,13 @@ def direct_write(
             chunks_written += result.chunks
             source_opens += result.source_opens
             source_cache_hits += result.source_cache_hits
+            if progress_callback is not None:
+                progress_callback(
+                    min(total_logical, logical_bytes),
+                    total_logical,
+                    logical_bytes,
+                    f"转换写入：{completed}/{total_batches}",
+                )
             if progress and (
                 completed == total_batches or completed % report_every == 0
             ):

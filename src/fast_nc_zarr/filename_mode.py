@@ -1840,6 +1840,7 @@ def filename_direct_write(
     cancel_event=None,
     validate: bool = False,
     progress: bool = True,
+    progress_callback=None,
 ) -> dict[str, float | int]:
     """Parallel writer for files that contribute one reconstructed time slice."""
     transforms = transforms or {}
@@ -1867,6 +1868,7 @@ def filename_direct_write(
     batch_size = plan.task_batch if plan.strategy == "file" else plan.chunk_time
     batch_size = max(1, batch_size)
     total_tasks = ceil(nt / batch_size)
+    total_logical = filename_logical_bytes(inventory, selection, transforms)
     if total_tasks == 0:
         raise ValueError("没有可写入的时间点。")
 
@@ -1926,6 +1928,13 @@ def filename_direct_write(
         )
         for completed, amount in enumerate(results, 1):
             logical_bytes += amount
+            if progress_callback is not None:
+                progress_callback(
+                    min(total_logical, logical_bytes),
+                    total_logical,
+                    logical_bytes,
+                    f"文件名时间写入：{completed}/{total_tasks}",
+                )
             if progress and (completed == total_tasks or completed % report_every == 0):
                 elapsed = max(time.perf_counter() - started, 1e-9)
                 cpu, rss = samples[-1] if samples else (None, None)
@@ -1990,6 +1999,7 @@ def convert_filename(
     overwrite: bool = False,
     validate: bool = True,
     progress: bool = True,
+    progress_callback=None,
 ) -> tuple[ConversionPlan, dict[str, float | int]]:
     """Tune and write one 2-D source file per reconstructed time coordinate."""
     output = validate_publish_target(
@@ -2120,6 +2130,7 @@ def convert_filename(
             cancel_event=cancel_event,
             validate=validate,
             progress=progress,
+            progress_callback=progress_callback,
         )
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("任务已取消，未发布输出。")

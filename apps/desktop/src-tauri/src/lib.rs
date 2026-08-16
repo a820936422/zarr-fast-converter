@@ -20,7 +20,7 @@ struct BackendInfo {
 fn get_backend_info() -> BackendInfo {
     BackendInfo {
         app: "fast-nc-zarr",
-        version: "1.7.5",
+        version: "1.7.6",
         runtime: "tauri-rust",
     }
 }
@@ -39,6 +39,7 @@ pub fn run() {
             commands::save_inspection_snapshot,
             tasks::get_task,
             tasks::list_tasks,
+            tasks::clear_task_history,
             tasks::cancel_task,
             native::start_native_task,
             pipeline::preview_pipeline,

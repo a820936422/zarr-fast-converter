@@ -17,8 +17,10 @@ from fast_nc_zarr.publication import (
     validate_publish_target,
 )
 from fast_nc_zarr.runtime import (
+    ProcessLifecycle,
     bounded_process_map,
     configure_process_runtime,
+    shutdown_process_executor,
     spawn_context,
 )
 
@@ -33,6 +35,10 @@ def _zarr_marker(path: Path) -> None:
         encoding="utf-8",
     )
 
+
+
+def _raise_from_worker(value):
+    raise RuntimeError(f"worker failure: {value}")
 
 class RuntimePublicationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -73,7 +79,52 @@ class RuntimePublicationTests(unittest.TestCase):
         self.assertEqual(state, ["ready"])
         self.assertEqual(results, [0, 2, 4, 6])
 
+
+    def test_process_lifecycle_records_terminal_state(self) -> None:
+        lifecycle = ProcessLifecycle("test")
+        lifecycle.finish("completed")
+        payload = lifecycle.to_dict()
+
+        self.assertEqual(payload["label"], "test")
+        self.assertEqual(payload["parent_pid"], os.getpid())
+        self.assertEqual(payload["exit_reason"], "completed")
+        self.assertIsNotNone(payload["ended_at"])
+        self.assertLessEqual(payload["started_at"], payload["ended_at"])
+        self.assertIsInstance(payload["child_pids"], list)
+        self.assertIsInstance(payload["active_child_pids"], list)
+
+    def test_bounded_process_map_terminates_failed_workers(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "worker failure"):
+            list(
+                bounded_process_map(
+                    _raise_from_worker,
+                    range(4),
+                    workers=2,
+                )
+            )
+    def test_executor_fallback_terminates_private_processes(self) -> None:
+        class Process:
+            def __init__(self) -> None:
+                self.terminated = False
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+        class Executor:
+            def __init__(self) -> None:
+                self.process = Process()
+                self._processes = {1: self.process}
+                self.shutdown_called = False
+
+            def shutdown(self, *, wait, cancel_futures) -> None:
+                self.shutdown_called = bool(wait and cancel_futures)
+
+        executor = Executor()
+        shutdown_process_executor(executor, terminate=True)
+        self.assertTrue(executor.process.terminated)
+        self.assertTrue(executor.shutdown_called)
     def test_publish_replaces_validated_target_and_removes_backup(self) -> None:
+
         target = ROOT / "output.zarr"
         staging = ROOT / ".output.zarr.test.tmp"
         _zarr_marker(target)

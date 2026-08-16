@@ -108,6 +108,30 @@ type VariableTransformDraft = {
   outputFill: string;
 };
 
+type VariableResamplingDraft = {
+  inherit: boolean;
+  method: string;
+  skipna: boolean;
+  naThres: number;
+  computeDtype: string;
+};
+
+const DEFAULT_VARIABLE_RESAMPLING: VariableResamplingDraft = {
+  inherit: true,
+  method: "bilinear",
+  skipna: true,
+  naThres: 1,
+  computeDtype: "source",
+};
+
+const RESAMPLING_METHODS = [
+  ["bilinear", "双线性插值"],
+  ["conservative", "保守重采样"],
+  ["conservative_normed", "归一化保守重采样"],
+  ["nearest_s2d", "最近邻（源到目标）"],
+  ["nearest_d2s", "最近邻（目标到源）"],
+  ["patch", "Patch 插值"],
+] as const;
 const EMPTY_VARIABLE_TRANSFORM: VariableTransformDraft = {
   fillValues: "",
   scaleFactor: "",
@@ -148,6 +172,12 @@ function parsePositiveInteger(value: string, label: string): number {
     throw new Error(`${label}必须是正整数。`);
   }
   return result;
+}
+function parseNonNegativeNumber(value: number, label: string): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${label}必须是有限非负数。`);
+  }
+  return value;
 }
 function validateDateBoundary(value: string, label: string): string {
   const text = value.trim();
@@ -318,6 +348,10 @@ function planValueText(value: unknown, fallback = "—"): string {
   return String(value);
 }
 
+function planSeconds(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? `${value.toLocaleString()} s` : "—";
+}
+
 function planTuple(value: unknown): string {
   return Array.isArray(value) ? value.map((item) => planValueText(item)).join(" × ") : planValueText(value);
 }
@@ -365,6 +399,7 @@ function StructuredPipelinePlan({ plan, target }: { plan: Record<string, unknown
   const inputInfo = asRecord(plan.input_info);
   const chunkPlan = asRecord(plan.final_chunk_plan);
   const compression = asRecord(plan.final_compression);
+  const tuningBudgets = asRecord(plan.tuning_budgets);
   const outputLayout = asRecord(plan.output_layout);
   const variables = Array.isArray(outputLayout?.variables)
     ? outputLayout.variables.flatMap((item) => {
@@ -465,6 +500,17 @@ function StructuredPipelinePlan({ plan, target }: { plan: Record<string, unknown
         </div>
         {variables.length ? <div className="plan-variable-list">{variables.map((variable) => <div className="plan-variable-card" key={planValueText(variable.output_name)}><div className="plan-variable-head"><strong>{planValueText(variable.output_name)}</strong><span>{variable.is_coord ? "坐标" : "数据"}</span></div><div><span>{planValueText(variable.dtype)}</span><span>维度 {planValueText(variable.dims)}</span><span>形状 {planTuple(variable.shape)}</span></div><small>chunks {planTuple(variable.chunks)}{asRecord(variable.codec) ? ` · ${planValueText(asRecord(variable.codec)?.kind)}` : ""}</small></div>)}</div> : <p className="report-empty">暂无变量布局详情。</p>}
       </section>
+
+      {tuningBudgets && (
+        <section className="report-section">
+          <div className="report-section-heading"><strong>实际调参上限</strong><span>由当前 IPC payload 生效</span></div>
+          <div className="report-detail-grid">
+            <div><span>转换 / 重采样</span><strong>{planSeconds(tuningBudgets.tune_budget)}</strong></div>
+            <div><span>重分块 worker</span><strong>{planSeconds(tuningBudgets.rechunk_tune_budget)}</strong></div>
+            <div><span>压缩候选</span><strong>{planSeconds(tuningBudgets.compression_tune_budget)}</strong></div>
+          </div>
+        </section>
+      )}
 
       {warning && <div className="plan-warning"><Icon name="activity" size={14} /><span>{warning}</span></div>}
       <details className="raw-plan-report"><summary>查看原始计划 JSON</summary><pre>{JSON.stringify(plan, null, 2)}</pre></details>
@@ -570,9 +616,17 @@ function eventText(event: TaskEvent): string {
   if (event.event === "progress") {
     const completed = event.payload.completed;
     const total = event.payload.total;
+    const temporary = event.payload.temporary_bytes;
+    const eta = event.payload.eta_seconds;
+    const parts: string[] = [];
     if (typeof completed === "number" && typeof total === "number" && total > 0) {
-      return `${Math.round((completed / total) * 100)}%`;
+      parts.push(`业务 ${Math.round((completed / total) * 100)}%`);
     }
+    if (typeof temporary === "number") parts.push(`临时观测 ${formatBytes(temporary)}`);
+    if (typeof eta === "number" && Number.isFinite(eta) && eta > 0) {
+      parts.push(`预计 ${Math.ceil(eta)}s`);
+    }
+    if (parts.length) return parts.join(" · ");
   }
   return event.stage || "任务事件";
 }
@@ -613,6 +667,10 @@ function App() {
   const [selectedVariables, setSelectedVariables] = useState<string[]>([]);
   const [variableNames, setVariableNames] = useState<Record<string, string>>({});
   const [variableTransforms, setVariableTransforms] = useState<Record<string, VariableTransformDraft>>({});
+  const [variableResampling, setVariableResampling] = useState<Record<string, VariableResamplingDraft>>({});
+  const [variableResamplingModal, setVariableResamplingModal] = useState<string | null>(null);
+  const [variableResamplingDraft, setVariableResamplingDraft] = useState<VariableResamplingDraft>(DEFAULT_VARIABLE_RESAMPLING);
+  const [variableResamplingError, setVariableResamplingError] = useState<string | null>(null);
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [temporaryDir, setTemporaryDir] = useState("");
@@ -661,6 +719,8 @@ function App() {
   const [customChunkTime, setCustomChunkTime] = useState("");
   const [customChunkLat, setCustomChunkLat] = useState("");
   const [customChunkLon, setCustomChunkLon] = useState("");
+  const [tuneBudget, setTuneBudget] = useState(60);
+  const [rechunkTuneBudget, setRechunkTuneBudget] = useState(60);
   const [recompress, setRecompress] = useState(false);
   const [compression, setCompression] = useState("auto");
   const [compressionCodec, setCompressionCodec] = useState("");
@@ -671,7 +731,7 @@ function App() {
   const [backendMode, setBackendMode] = useState<BackendMode>("auto");
   const [favorites, setFavorites] = useState<string[]>([]);
   const [recentPaths, setRecentPaths] = useState<string[]>([]);
-  const { events, tasks, cancel } = useTaskEvents();
+  const { events, tasks, cancel, clearHistory } = useTaskEvents();
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) {
@@ -1069,6 +1129,25 @@ function App() {
         return Object.keys(transform).length ? [[name, transform] as const] : [];
       }),
     );
+    const variableResamplingPayload = Object.fromEntries(
+      selectedVariables.flatMap((name) => {
+        const draft = variableResampling[name];
+        if (!draft || draft.inherit) return [];
+        if (!effectiveResample) throw new Error(`变量 ${name} 的重采样覆盖仅在启用重采样时有效。`);
+        if (!RESAMPLING_METHODS.some(([method]) => method === draft.method)) throw new Error(`变量 ${name} 的重采样方法无效。`);
+        const variableNaThres = parseNonNegativeNumber(draft.naThres, `变量 ${name} 的 na_thres`);
+        if (variableNaThres > 1) throw new Error(`变量 ${name} 的 na_thres 必须位于 0 到 1 之间。`);
+        return [[name, {
+          method: draft.method,
+          skipna: draft.skipna,
+          na_thres: variableNaThres,
+          compute_dtype: draft.computeDtype,
+        }] as const];
+      }),
+    );
+    const effectiveTuneBudget = parseNonNegativeNumber(tuneBudget, "转换/重采样自动调参上限");
+    const effectiveRechunkTuneBudget = parseNonNegativeNumber(rechunkTuneBudget, "重分块自动调参上限");
+    const effectiveCompressionTuneBudget = parseNonNegativeNumber(compressionTuneBudget, "压缩候选调参上限");
     return {
       output: outputPath || defaultOutputPath(inputPath, inputKind),
       temporary_dir: temporaryDir || null,
@@ -1091,11 +1170,13 @@ function App() {
       variables: selectedVariables,
       variable_names: outputNames,
       variable_transforms: transforms,
+      variable_resampling: variableResamplingPayload,
       compression_codec: recompress && compressionCodec ? compressionCodec : null,
       compression_level: recompress && compressionLevel !== "" ? compressionLevel : null,
       compression_shuffle: compressionShuffle,
       compression_objective: compressionObjective,
-      compression_tune_budget: compressionTuneBudget,
+      compression_tune_budget: effectiveCompressionTuneBudget,
+      tune_budget: effectiveTuneBudget,
       resample: effectiveResample,
       method: resampleMethod,
       resolution,
@@ -1110,6 +1191,7 @@ function App() {
       strategy: chunkStrategy,
       custom_chunks: customChunks,
       target_mib: targetMib,
+      rechunk_tune_budget: effectiveRechunkTuneBudget,
       recompress,
       compression: recompress ? compression : "none",
       backend: backendMode,
@@ -1186,6 +1268,16 @@ function App() {
     }
   };
 
+  const clearTaskHistory = async () => {
+    if (!tasks.some((task) => task.status === "finished" || task.status === "failed" || task.status === "cancelled")) return;
+    if (!window.confirm("清理已完成、失败和已取消的执行记录？最终输出数据不会被删除。")) return;
+    try {
+      await clearHistory();
+    } catch (reason) {
+      setError(reasonText(reason));
+    }
+  };
+
   const stageIndex = stage === "input" ? 1 : stage === "time" ? 2 : 3;
   const automaticResample = targetSpatialEnabled;
   const effectiveResample = resample || automaticResample;
@@ -1230,6 +1322,10 @@ function App() {
   useEffect(() => {
     setVariableNames((current) => Object.fromEntries(variableDetails.map((item) => [item.name, current[item.name] || item.name])));
     setVariableTransforms((current) => Object.fromEntries(variableDetails.map((item) => [item.name, current[item.name] || { ...EMPTY_VARIABLE_TRANSFORM }])));
+    setVariableResampling((current) => Object.fromEntries(variableDetails.map((item) => [
+      item.name,
+      current[item.name] || { ...DEFAULT_VARIABLE_RESAMPLING, method: resampleMethod, skipna, naThres, computeDtype },
+    ])));
   }, [variableDetails]);
 
   const updateVariableTransform = (name: string, patch: Partial<VariableTransformDraft>) => {
@@ -1237,6 +1333,33 @@ function App() {
       ...current,
       [name]: { ...EMPTY_VARIABLE_TRANSFORM, ...(current[name] || {}), ...patch },
     }));
+  };
+
+  const openVariableResampling = (name: string) => {
+    const current = variableResampling[name] || DEFAULT_VARIABLE_RESAMPLING;
+    setVariableResamplingDraft({ ...current });
+    setVariableResamplingError(null);
+    setVariableResamplingModal(name);
+  };
+
+  const updateVariableResamplingDraft = (patch: Partial<VariableResamplingDraft>) => {
+    setVariableResamplingDraft((current) => ({ ...current, ...patch }));
+  };
+
+  const confirmVariableResampling = () => {
+    if (!RESAMPLING_METHODS.some(([method]) => method === variableResamplingDraft.method)) {
+      setVariableResamplingError("请选择有效的重采样方法。");
+      return;
+    }
+    if (!Number.isFinite(variableResamplingDraft.naThres) || variableResamplingDraft.naThres < 0 || variableResamplingDraft.naThres > 1) {
+      setVariableResamplingError("na_thres 必须位于 0 到 1 之间。");
+      return;
+    }
+    if (variableResamplingModal) {
+      setVariableResampling((current) => ({ ...current, [variableResamplingModal]: { ...variableResamplingDraft } }));
+    }
+    setVariableResamplingModal(null);
+    setVariableResamplingError(null);
   };
 
   const capabilityItems = nativeCapability?.capabilities || [];
@@ -1401,6 +1524,14 @@ function App() {
                       </div>
                     )}
                   </div>
+                  <div className="advanced-panel">
+                    <div className="panel-label"><Icon name="clock" size={15} />自动调参预算</div>
+                    <p className="target-range-help">转换和重采样共享一个自动调参上限；重分块 worker 调参单独控制。默认值均为 60 秒，压缩候选预算在重压缩参数中设置。</p>
+                    <div className="advanced-fields tuning-budget-fields">
+                      <label>转换/重采样上限(s)<input type="number" min="0" step="1" value={tuneBudget} onChange={(event) => setTuneBudget(Number(event.target.value))} /></label>
+                      {rechunk && <label>重分块 worker 上限(s)<input type="number" min="0" step="1" value={rechunkTuneBudget} onChange={(event) => setRechunkTuneBudget(Number(event.target.value))} /></label>}
+                    </div>
+                  </div>
                   {effectiveResample && (
                     <div className="advanced-panel">
                       <div className="panel-label"><Icon name="grid" size={15} />重采样参数</div>
@@ -1444,7 +1575,7 @@ function App() {
                         <label>压缩等级<input type="number" min={compressionCodec === "zstd" ? -7 : 0} max={compressionCodec === "zstd" ? 22 : 9} step="1" value={compressionLevel} onChange={(event) => setCompressionLevel(event.target.value === "" ? "" : Number(event.target.value))} placeholder="按方案" /></label>
                         <label>Shuffle<select value={compressionShuffle} onChange={(event) => setCompressionShuffle(event.target.value)}><option value="auto">按 dtype 自动</option><option value="noshuffle">不使用</option><option value="shuffle" disabled={compressionCodec === "zstd" || compressionCodec === "gzip"}>字节 shuffle</option><option value="bitshuffle" disabled={compressionCodec === "zstd" || compressionCodec === "gzip"}>bitshuffle</option></select></label>
                         <label>优化目标<select value={compressionObjective} onChange={(event) => setCompressionObjective(event.target.value)}><option value="speed">速度优先</option><option value="balanced">平衡</option><option value="compact">体积优先</option></select></label>
-                        <label>调参预算(s)<input type="number" min="0" step="1" value={compressionTuneBudget} onChange={(event) => setCompressionTuneBudget(Number(event.target.value))} /></label>
+                        <label>压缩候选上限(s)<input type="number" min="0" step="1" value={compressionTuneBudget} onChange={(event) => setCompressionTuneBudget(Number(event.target.value))} /></label>
                       </div>
                     </div>
                   )}
@@ -1453,9 +1584,10 @@ function App() {
                       <div className="panel-label"><Icon name="layers" size={15} />变量选择与处理参数</div>
                       <p className="variable-settings-help">可选择变量、重命名输出变量，并覆盖源文件中的缺失值、缩放因子和偏移量。留空表示沿用源元数据或默认行为。</p>
                       <div className="variable-settings-table">
-                        <div className="variable-settings-head"><span>处理</span><span>源变量</span><span>输出变量名</span><span>缺失值</span><span>缩放因子</span><span>偏移量</span><span>输出填充值</span></div>
+                        <div className="variable-settings-head"><span>处理</span><span>源变量</span><span>输出变量名</span><span>缺失值</span><span>缩放因子</span><span>偏移量</span><span>输出填充值</span><span>重采样</span></div>
                         {variableDetails.map((detail) => {
                           const draft = variableTransforms[detail.name] || EMPTY_VARIABLE_TRANSFORM;
+                          const resampleDraft = variableResampling[detail.name] || DEFAULT_VARIABLE_RESAMPLING;
                           const sourceFill = attributeText(detail.attrs, "_FillValue") || attributeText(detail.attrs, "missing_value");
                           const sourceScale = attributeText(detail.attrs, "scale_factor");
                           const sourceOffset = attributeText(detail.attrs, "add_offset");
@@ -1468,6 +1600,7 @@ function App() {
                               <input aria-label={`${detail.name} 缩放因子`} value={draft.scaleFactor} onChange={(event) => updateVariableTransform(detail.name, { scaleFactor: event.target.value })} placeholder={sourceScale ? `源: ${sourceScale}` : "不额外缩放"} />
                               <input aria-label={`${detail.name} 偏移量`} value={draft.addOffset} onChange={(event) => updateVariableTransform(detail.name, { addOffset: event.target.value })} placeholder={sourceOffset ? `源: ${sourceOffset}` : "不额外偏移"} />
                               <input aria-label={`${detail.name} 输出填充值`} value={draft.outputFill} onChange={(event) => updateVariableTransform(detail.name, { outputFill: event.target.value })} placeholder="浮点默认 NaN" />
+                              <button className="table-action" type="button" disabled={!effectiveResample} onClick={() => openVariableResampling(detail.name)}>{resampleDraft.inherit ? "继承全局" : resampleDraft.method}</button>
                             </div>
                           );
                         })}
@@ -1496,7 +1629,7 @@ function App() {
           {view === "tasks" && (
             <>
               <div className="page-heading"><div><span className="section-kicker">OBSERVABILITY</span><h1>任务中心</h1><p>所有任务、进度、资源和恢复点都集中在这里。</p></div><div className="task-summary"><strong>{tasks.length}</strong><span>历史任务</span></div></div>
-              <div className="tasks-layout"><section className="surface tasks-surface"><div className="surface-title"><div><span className="section-kicker">RUN HISTORY</span><h2>执行记录</h2></div><span className="live-label"><span />LIVE</span></div>{tasks.length === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="activity" size={24} /></div><strong>还没有任务</strong><p>完成一次数据检查后，可以从处理流程启动任务。</p><button className="primary-button" type="button" onClick={() => setView("inspection")}>开始检查</button></div> : <div className="task-table"><div className="task-table-head"><span>任务</span><span>状态</span><span>资源</span><span>操作</span></div>{tasks.map((task) => <div className="task-table-row" key={task.taskId}><div className="task-name"><span className={`task-icon ${task.status}`}><Icon name={task.command === "native_task" ? "spark" : "layers"} size={15} /></span><div><strong>{formatCommand(task.command)}</strong><small>{task.taskId}</small>{task.manifest && <small className="manifest-path"><Icon name="archive" size={11} />{task.manifest}</small>}</div></div><span className={`task-state ${task.status}`}>{formatTaskStatus(task.status)}</span><span className="task-resource">{task.resource ? `${task.resource.logicalCpus} CPU · ${formatBytes(task.resource.memoryAvailableBytes)}` : "—"}</span><div>{(task.status === "running" || task.status === "cancelling") && <button className="table-action" type="button" onClick={() => void cancel(task.taskId)}><Icon name="refresh" size={14} />取消</button>}</div></div>)}</div>}</section><aside className="tasks-side"><section className="surface recovery-card"><div className="surface-title compact"><div><span className="section-kicker">CHECKPOINT RECOVERY</span><h2>恢复任务</h2></div><Icon name="refresh" size={18} /></div><p className="surface-description">输入保留的临时目录，检查 checkpoint 后恢复到新的输出位置。</p><label className="field-label" htmlFor="recovery-path">临时任务目录</label><div className="input-with-action"><Icon name="folder" size={16} /><input id="recovery-path" value={recoveryPath} onChange={(event) => setRecoveryPath(event.target.value)} placeholder="/tmp/.../pipeline-..." /><button className="field-action" type="button" disabled={!recoveryPath || busy} onClick={() => void inspectRecovery()}>检查</button></div>{recoveryInspection && <div className="recovery-result"><span className="result-icon"><Icon name="spark" size={14} /></span><div><strong>恢复点可读取</strong><p>{recoveryInspection.report}</p></div></div>}<button className="primary-button full-button" type="button" disabled={!recoveryInspection || busy} onClick={() => void resumeRecovery()}><Icon name="refresh" size={15} />恢复到新输出</button></section><section className="surface event-card"><div className="surface-title compact"><div><span className="section-kicker">EVENT STREAM</span><h2>实时事件</h2></div><span className="event-count">{events.length}</span></div><div className="event-stream">{events.length ? events.slice(-8).reverse().map((event) => <div className="event-item" key={`${event.request_id}-${event.sequence}`}><span className={`event-dot ${event.event}`} /><div><strong>{event.event}</strong><small>{eventText(event)}</small></div><time>{event.sequence.toString().padStart(2, "0")}</time></div>) : <p className="empty-event">暂无事件流</p>}</div></section></aside></div>
+              <div className="tasks-layout"><section className="surface tasks-surface"><div className="surface-title"><div><span className="section-kicker">RUN HISTORY</span><h2>执行记录</h2></div><div className="surface-actions"><span className="live-label"><span />LIVE</span><button className="quiet-button" type="button" disabled={!tasks.some((task) => task.status === "finished" || task.status === "failed" || task.status === "cancelled")} onClick={() => void clearTaskHistory()}>清理记录</button></div></div>{tasks.length === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="activity" size={24} /></div><strong>还没有任务</strong><p>完成一次数据检查后，可以从处理流程启动任务。</p><button className="primary-button" type="button" onClick={() => setView("inspection")}>开始检查</button></div> : <div className="task-table"><div className="task-table-head"><span>任务</span><span>状态</span><span>资源</span><span>操作</span></div>{tasks.map((task) => <div className="task-table-row" key={task.taskId}><div className="task-name"><span className={`task-icon ${task.status}`}><Icon name={task.command === "native_task" ? "spark" : "layers"} size={15} /></span><div><strong>{formatCommand(task.command)}</strong><small>{task.taskId}</small>{task.manifest && <small className="manifest-path"><Icon name="archive" size={11} />{task.manifest}</small>}</div></div><span className={`task-state ${task.status}`}>{formatTaskStatus(task.status)}</span><span className="task-resource">{task.resource ? `${task.resource.logicalCpus} CPU · ${formatBytes(task.resource.memoryAvailableBytes)}` : "—"}</span><div>{(task.status === "running" || task.status === "cancelling") && <button className="table-action" type="button" onClick={() => void cancel(task.taskId)}><Icon name="refresh" size={14} />取消</button>}</div></div>)}</div>}</section><aside className="tasks-side"><section className="surface recovery-card"><div className="surface-title compact"><div><span className="section-kicker">CHECKPOINT RECOVERY</span><h2>恢复任务</h2></div><Icon name="refresh" size={18} /></div><p className="surface-description">输入保留的临时目录，检查 checkpoint 后恢复到新的输出位置。</p><label className="field-label" htmlFor="recovery-path">临时任务目录</label><div className="input-with-action"><Icon name="folder" size={16} /><input id="recovery-path" value={recoveryPath} onChange={(event) => setRecoveryPath(event.target.value)} placeholder="/tmp/.../pipeline-..." /><button className="field-action" type="button" disabled={!recoveryPath || busy} onClick={() => void inspectRecovery()}>检查</button></div>{recoveryInspection && <div className="recovery-result"><span className="result-icon"><Icon name="spark" size={14} /></span><div><strong>恢复点可读取</strong><p>{recoveryInspection.report}</p></div></div>}<button className="primary-button full-button" type="button" disabled={!recoveryInspection || busy} onClick={() => void resumeRecovery()}><Icon name="refresh" size={15} />恢复到新输出</button></section><section className="surface event-card"><div className="surface-title compact"><div><span className="section-kicker">EVENT STREAM</span><h2>实时事件</h2></div><span className="event-count">{events.length}</span></div><div className="event-stream">{events.length ? events.slice(-8).reverse().map((event) => <div className="event-item" key={`${event.request_id}-${event.sequence}`}><span className={`event-dot ${event.event}`} /><div><strong>{event.event}</strong><small>{eventText(event)}</small></div><time>{event.sequence.toString().padStart(2, "0")}</time></div>) : <p className="empty-event">暂无事件流</p>}</div></section></aside></div>
             </>
           )}
 
@@ -1579,6 +1712,31 @@ function App() {
                 <button className="quiet-button" type="button" onClick={() => setTimeRuleModalOpen(false)}>取消</button>
                 <button className="primary-button" type="button" onClick={confirmTimeRule}>确认规则</button>
               </div>
+            </section>
+          </div>
+        )}
+        {variableResamplingModal && (
+          <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setVariableResamplingModal(null); }}>
+            <section className="time-rule-modal" role="dialog" aria-modal="true" aria-labelledby="variable-resampling-title">
+              <div className="modal-heading">
+                <div>
+                  <span className="section-kicker">VARIABLE RESAMPLING</span>
+                  <h2 id="variable-resampling-title">设置 {variableResamplingModal} 的重采样参数</h2>
+                </div>
+                <button className="icon-button" type="button" aria-label="关闭" onClick={() => setVariableResamplingModal(null)}>×</button>
+              </div>
+              <p className="modal-description">目标网格、空间范围和发布 layout 仍由 pipeline 统一控制；以下参数可以对当前变量覆盖全局重采样设置。</p>
+              <label className="check-control"><input type="checkbox" checked={variableResamplingDraft.inherit} onChange={(event) => updateVariableResamplingDraft({ inherit: event.target.checked })} /><span className="fake-check" />继承全局重采样参数</label>
+              {!variableResamplingDraft.inherit && (
+                <div className="time-rule-fields">
+                  <label className="time-rule-field"><span>策略</span><select value={variableResamplingDraft.method} onChange={(event) => updateVariableResamplingDraft({ method: event.target.value })}>{RESAMPLING_METHODS.map(([method, label]) => <option key={method} value={method}>{label}</option>)}</select></label>
+                  <label className="time-rule-field"><span>na_thres</span><input type="number" min="0" max="1" step="0.01" value={variableResamplingDraft.naThres} onChange={(event) => updateVariableResamplingDraft({ naThres: Number(event.target.value) })} /></label>
+                  <label className="time-rule-field"><span>计算 dtype</span><select value={variableResamplingDraft.computeDtype} onChange={(event) => updateVariableResamplingDraft({ computeDtype: event.target.value })}><option value="source">保持源 dtype</option><option value="float32">浮点转 float32</option></select></label>
+                  <label className="check-control"><input type="checkbox" checked={variableResamplingDraft.skipna} onChange={(event) => updateVariableResamplingDraft({ skipna: event.target.checked })} /><span className="fake-check" />忽略缺测值（skipna）</label>
+                </div>
+              )}
+              {variableResamplingError && <div className="modal-error" role="alert">{variableResamplingError}</div>}
+              <div className="modal-actions"><button className="quiet-button" type="button" onClick={() => setVariableResamplingModal(null)}>取消</button><button className="primary-button" type="button" onClick={confirmVariableResampling}>保存当前变量设置</button></div>
             </section>
           </div>
         )}

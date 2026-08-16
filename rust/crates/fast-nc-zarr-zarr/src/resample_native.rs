@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+fn default_skipna() -> bool {
+    false
+}
+
+fn default_na_thres() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResampleF32Request {
     pub values: Vec<f32>,
@@ -9,6 +17,10 @@ pub struct ResampleF32Request {
     pub target_lat: Vec<f32>,
     pub target_lon: Vec<f32>,
     pub method: String,
+    #[serde(default = "default_skipna")]
+    pub skipna: bool,
+    #[serde(default = "default_na_thres")]
+    pub na_thres: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +102,49 @@ fn source_offset(time: usize, lat: usize, lon: usize, shape: [usize; 3]) -> usiz
     (time * shape[1] + lat) * shape[2] + lon
 }
 
+fn validate_na_thres(na_thres: f32) -> Result<(), String> {
+    if na_thres.is_finite() && (0.0..=1.0).contains(&na_thres) {
+        Ok(())
+    } else {
+        Err("native na_thres must be finite and within [0, 1]".to_owned())
+    }
+}
+
+fn weighted_value(
+    values: &[f32],
+    offsets: [usize; 4],
+    weights: [f32; 4],
+    count: usize,
+    skipna: bool,
+    na_thres: f32,
+) -> f32 {
+    let mut weighted = 0.0_f32;
+    let mut valid_weight = 0.0_f32;
+    let mut missing = false;
+    for index in 0..count {
+        let weight = weights[index];
+        if weight == 0.0 {
+            continue;
+        }
+        let value = values[offsets[index]];
+        if value.is_nan() {
+            missing = true;
+        } else {
+            weighted += value * weight;
+            valid_weight += weight;
+        }
+    }
+    if !skipna {
+        return if missing { f32::NAN } else { weighted };
+    }
+    let minimum_valid_weight = (1.0 - na_thres).clamp(1.0e-6, 1.0 - 1.0e-6);
+    if valid_weight < minimum_valid_weight {
+        f32::NAN
+    } else {
+        weighted / valid_weight
+    }
+}
+
 pub fn resample_f32_values(
     values: &[f32],
     shape: [usize; 3],
@@ -99,12 +154,29 @@ pub fn resample_f32_values(
     target_lon: &[f32],
     method: &str,
 ) -> Result<Vec<f32>, String> {
+    resample_f32_values_with_options(
+        values, shape, source_lat, source_lon, target_lat, target_lon, method, false, 1.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resample_f32_values_with_options(
+    values: &[f32],
+    shape: [usize; 3],
+    source_lat: &[f32],
+    source_lon: &[f32],
+    target_lat: &[f32],
+    target_lon: &[f32],
+    method: &str,
+    skipna: bool,
+    na_thres: f32,
+) -> Result<Vec<f32>, String> {
     let output_values = shape[0]
         .checked_mul(target_lat.len())
         .and_then(|value| value.checked_mul(target_lon.len()))
         .ok_or_else(|| "target shape element count overflows usize".to_owned())?;
     let mut output = vec![0.0; output_values];
-    resample_f32_values_into(
+    resample_f32_values_into_with_options(
         values,
         shape,
         source_lat,
@@ -112,6 +184,8 @@ pub fn resample_f32_values(
         target_lat,
         target_lon,
         method,
+        skipna,
+        na_thres,
         &mut output,
     )?;
     Ok(output)
@@ -128,6 +202,24 @@ pub fn resample_f32_values_into(
     method: &str,
     output: &mut [f32],
 ) -> Result<(), String> {
+    resample_f32_values_into_with_options(
+        values, shape, source_lat, source_lon, target_lat, target_lon, method, false, 1.0, output,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resample_f32_values_into_with_options(
+    values: &[f32],
+    shape: [usize; 3],
+    source_lat: &[f32],
+    source_lon: &[f32],
+    target_lat: &[f32],
+    target_lon: &[f32],
+    method: &str,
+    skipna: bool,
+    na_thres: f32,
+    output: &mut [f32],
+) -> Result<(), String> {
     let expected_values = shape[0]
         .checked_mul(shape[1])
         .and_then(|value| value.checked_mul(shape[2]))
@@ -141,6 +233,7 @@ pub fn resample_f32_values_into(
     }
     validate_axis(source_lat, "source latitude")?;
     validate_axis(source_lon, "source longitude")?;
+    validate_na_thres(na_thres)?;
     if method != "nearest" && method != "bilinear" {
         return Err(format!("unsupported native resampling method: {method}"));
     }
@@ -161,21 +254,30 @@ pub fn resample_f32_values_into(
                     (Some(lat), Some(lon), "nearest") => {
                         let source_lat = if lat.weight <= 0.5 { lat.low } else { lat.high };
                         let source_lon = if lon.weight <= 0.5 { lon.low } else { lon.high };
-                        values[source_offset(time, source_lat, source_lon, shape)]
+                        let offset = source_offset(time, source_lat, source_lon, shape);
+                        weighted_value(
+                            values,
+                            [offset, offset, offset, offset],
+                            [1.0, 0.0, 0.0, 0.0],
+                            1,
+                            skipna,
+                            na_thres,
+                        )
                     }
                     (Some(lat), Some(lon), "bilinear") => {
-                        let a = values[source_offset(time, lat.low, lon.low, shape)];
-                        let b = values[source_offset(time, lat.low, lon.high, shape)];
-                        let c = values[source_offset(time, lat.high, lon.low, shape)];
-                        let d = values[source_offset(time, lat.high, lon.high, shape)];
-                        if [a, b, c, d].iter().any(|value| value.is_nan()) {
-                            f32::NAN
-                        } else {
-                            a * (1.0 - lon.weight) * (1.0 - lat.weight)
-                                + b * lon.weight * (1.0 - lat.weight)
-                                + c * (1.0 - lon.weight) * lat.weight
-                                + d * lon.weight * lat.weight
-                        }
+                        let offsets = [
+                            source_offset(time, lat.low, lon.low, shape),
+                            source_offset(time, lat.low, lon.high, shape),
+                            source_offset(time, lat.high, lon.low, shape),
+                            source_offset(time, lat.high, lon.high, shape),
+                        ];
+                        let weights = [
+                            (1.0 - lon.weight) * (1.0 - lat.weight),
+                            lon.weight * (1.0 - lat.weight),
+                            (1.0 - lon.weight) * lat.weight,
+                            lon.weight * lat.weight,
+                        ];
+                        weighted_value(values, offsets, weights, 4, skipna, na_thres)
                     }
                     _ => f32::NAN,
                 };
@@ -188,7 +290,7 @@ pub fn resample_f32_values_into(
 }
 
 pub fn resample_f32(request: &ResampleF32Request) -> Result<ResampleF32Response, String> {
-    let values = resample_f32_values(
+    let values = resample_f32_values_with_options(
         &request.values,
         request.shape,
         &request.source_lat,
@@ -196,6 +298,8 @@ pub fn resample_f32(request: &ResampleF32Request) -> Result<ResampleF32Response,
         &request.target_lat,
         &request.target_lon,
         &request.method,
+        request.skipna,
+        request.na_thres,
     )?;
     Ok(ResampleF32Response {
         shape: [
@@ -222,6 +326,8 @@ mod tests {
             target_lat: vec![0.1],
             target_lon: vec![0.9],
             method: "nearest".into(),
+            skipna: false,
+            na_thres: 1.0,
         })
         .unwrap();
         assert_eq!(response.values, vec![4.0]);
@@ -237,6 +343,8 @@ mod tests {
             target_lat: vec![0.5],
             target_lon: vec![0.5],
             method: "bilinear".into(),
+            skipna: false,
+            na_thres: 1.0,
         })
         .unwrap();
         assert_eq!(response.values, vec![1.5]);
@@ -251,6 +359,8 @@ mod tests {
             target_lat: vec![0.25, 0.75],
             target_lon: vec![0.25, 0.75],
             method: "bilinear".into(),
+            skipna: false,
+            na_thres: 1.0,
         };
         let expected = resample_f32(&request).unwrap().values;
         let mut output = vec![0.0; expected.len()];
@@ -278,6 +388,8 @@ mod tests {
             target_lat: vec![2.0],
             target_lon: vec![2.0],
             method: "nearest".into(),
+            skipna: false,
+            na_thres: 1.0,
         })
         .unwrap();
         assert!(response.values[0].is_nan());
@@ -292,6 +404,8 @@ mod tests {
             target_lat: vec![0.5],
             target_lon: vec![2.0],
             method: "nearest".into(),
+            skipna: false,
+            na_thres: 1.0,
         })
         .unwrap();
         assert!(response.values[0].is_nan());
@@ -307,8 +421,59 @@ mod tests {
             target_lat: vec![0.5],
             target_lon: vec![0.5],
             method: "nearest".into(),
+            skipna: false,
+            na_thres: 1.0,
         })
         .expect_err("non-monotonic axes must be rejected");
         assert!(error.contains("strictly monotonic"));
+    }
+
+    #[test]
+    fn bilinear_skipna_renormalizes_valid_weights() {
+        let values = [f32::NAN, 2.0, 4.0, 6.0];
+        let result = resample_f32_values_with_options(
+            &values,
+            [1, 2, 2],
+            &[0.0, 1.0],
+            &[0.0, 1.0],
+            &[0.5],
+            &[0.5],
+            "bilinear",
+            true,
+            1.0,
+        )
+        .expect("skipna result");
+        assert_eq!(result, vec![4.0]);
+
+        let strict = resample_f32_values_with_options(
+            &values,
+            [1, 2, 2],
+            &[0.0, 1.0],
+            &[0.0, 1.0],
+            &[0.5],
+            &[0.5],
+            "bilinear",
+            true,
+            0.0,
+        )
+        .expect("strict result");
+        assert!(strict[0].is_nan());
+    }
+
+    #[test]
+    fn skipna_returns_missing_for_all_missing_source_window() {
+        let result = resample_f32_values_with_options(
+            &[f32::NAN, f32::NAN, f32::NAN, f32::NAN],
+            [1, 2, 2],
+            &[0.0, 1.0],
+            &[0.0, 1.0],
+            &[0.5],
+            &[0.5],
+            "bilinear",
+            true,
+            1.0,
+        )
+        .expect("all missing result");
+        assert!(result[0].is_nan());
     }
 }

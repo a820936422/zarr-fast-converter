@@ -1,8 +1,8 @@
-# Fast NC Zarr v1.7.5 模块与运行指南
+# Fast NC Zarr v1.7.6 模块与运行指南
 
 本文档合并项目各模块的入口、核心约束和验证方式。项目总览、环境安装和快速示例见根目录 [README](../README.md)。IPC 定义见 [contracts/README.md](../contracts/README.md)；历史基线审查见 [全面代码审查报告](comprehensive-code-audit-2026-08-15.md)。
 
-下一版本优化路线图见：[v1.7.6 优化路线图](v1.7.6-optimization-roadmap.md)。
+下一版本优化路线图见：[v1.7.7 优化路线图](v1.7.7-optimization-roadmap.md)。
 
 ## 共通约定
 
@@ -154,9 +154,9 @@ cargo test -p fast-nc-zarr-desktop
 
 前端通过 Tauri commands 调用 Rust runtime；runtime 负责 worker、任务 registry、取消、资源快照、事件流、native capability 和恢复。主要 command 包括 `inspect_source`、`inspect_zarr`、`inspect_time_metadata`、`preview_pipeline`、`start_pipeline`、`resume_pipeline`、`start_native_task`、`list_tasks`、`get_task` 和 `cancel_task`。worker stdout 只承载 JSONL，诊断进入结构化事件或 stderr。
 
-## v1.7.5 Linux 发布范围
+## v1.7.6 Linux 发布范围
 
-v1.7.5 以 Linux `x86_64-unknown-linux-gnu` 为阻塞发布平台。发布前至少执行：
+v1.7.6 以 Linux `x86_64-unknown-linux-gnu` 为阻塞发布平台。发布前至少执行：
 
 ```bash
 pixi run version-check

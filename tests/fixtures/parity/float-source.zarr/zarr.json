@@ -1,0 +1,8 @@
+{
+  "attributes": {
+    "fixture": "parity-v1",
+    "description": "descending latitude compressed Zarr v3"
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}

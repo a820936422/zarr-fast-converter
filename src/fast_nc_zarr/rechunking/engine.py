@@ -2292,6 +2292,7 @@ def run_rechunk(
     tuning_objective: str = "balanced",
     resource_budget: EffectiveResourceBudget | None = None,
     storage_overrides: Mapping[str, str] | None = None,
+    progress_callback=None,
 ) -> dict[str, object]:
     """Rechunk and optionally recompress a complete Zarr v3 store."""
 
@@ -2441,6 +2442,8 @@ def run_rechunk(
                 staging,
                 cancel_event=cancel_event,
             )
+            if progress_callback is not None:
+                progress_callback(1, 1, None, "等价复制完成")
             worker_tuning["stage1"] = skipped_worker_report(
                 "stage1", "等价复制路径不需要 worker", objective=tuning_objective
             ).to_dict()
@@ -2510,6 +2513,8 @@ def run_rechunk(
                 parallel=parallel_direct,
                 cancel_event=cancel_event,
             )
+            if progress_callback is not None:
+                progress_callback(1, 1, None, "单阶段重分块完成")
             dataset.close()
             dataset = None
         else:
@@ -2649,6 +2654,8 @@ def run_rechunk(
             )
             if cancel_event is not None and cancel_event.is_set():
                 raise RechunkExecutionError("任务已取消。")
+            if progress_callback is not None:
+                progress_callback(1, 2, None, "重分块阶段 1/2 完成")
             if progress:
                 print(
                     f"阶段 1/2 完成，耗时 "
@@ -2736,6 +2743,8 @@ def run_rechunk(
                 )
                 intermediate_dataset.close()
                 intermediate_dataset = None
+            if progress_callback is not None:
+                progress_callback(2, 2, None, "重分块阶段 2/2 完成")
             if cancel_event is not None and cancel_event.is_set():
                 raise RechunkExecutionError("任务已取消。")
             if progress:

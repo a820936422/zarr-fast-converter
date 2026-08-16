@@ -1,7 +1,8 @@
 mod resample_native;
 
 pub use resample_native::{
-    resample_f32, resample_f32_values, resample_f32_values_into, ResampleF32Request,
+    resample_f32, resample_f32_values, resample_f32_values_into,
+    resample_f32_values_into_with_options, resample_f32_values_with_options, ResampleF32Request,
     ResampleF32Response,
 };
 

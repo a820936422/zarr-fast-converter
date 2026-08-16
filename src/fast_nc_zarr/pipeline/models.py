@@ -6,7 +6,7 @@ from typing import Literal
 
 from ..models import OutputLayout, Selection, VariableTransform
 from ..rechunking.models import ChunkPlan, CompressionPlan, DatasetInfo
-from ..resampling.models import ResamplePlan, TargetGrid
+from ..resampling.models import ResamplePlan, ResampleVariableOptions, TargetGrid
 
 
 MANIFEST_SCHEMA_VERSION = 7
@@ -67,6 +67,7 @@ class PipelineResamplingOptions:
     after_conditions: str = ""
     after_results: str = ""
     statistics_policy: Literal["auto", "sample", "exact"] = "auto"
+    variable_options: dict[str, ResampleVariableOptions] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,7 @@ class PipelineChunkingOptions:
     target_mib: float = 128.0
     custom_chunks: tuple[int, int, int] | None = None
     workers: int | Literal["auto"] = "auto"
+    tune_budget: float = 60.0
 
 
 @dataclass(frozen=True)

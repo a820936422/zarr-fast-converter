@@ -255,6 +255,108 @@ class RustZarrCrossBackendTests(unittest.TestCase):
         region = self.native.read_region_f32(root, "/value", [1, 1, 0], [2, 2, 2])
         np.testing.assert_array_equal(region, values[1:3, 1:3, :].ravel())
         np.testing.assert_array_equal(chunk, [0.0, 2.0, 6.0, 8.0])
+
+    def test_compressed_python_zarr_region_is_decoded_by_rust(self) -> None:
+        from zarr.codecs import BloscCodec, GzipCodec, ZstdCodec
+
+        values = np.arange(4 * 5 * 6, dtype="float32").reshape(4, 5, 6)
+        expected = values[1:3, 1:4, 1:5].ravel()
+        for label, codec in (
+            ("zstd", ZstdCodec(level=1)),
+            ("blosc-zstd", BloscCodec(cname="zstd", clevel=1, shuffle="shuffle")),
+            ("blosc-lz4", BloscCodec(cname="lz4", clevel=1, shuffle="shuffle")),
+            ("gzip", GzipCodec(level=1)),
+        ):
+            with self.subTest(codec=label):
+                root = Path(self.tempdir.name) / f"compressed-{label}.zarr"
+                xr.Dataset({"value": (("time", "lat", "lon"), values)}).to_zarr(
+                    root,
+                    mode="w",
+                    consolidated=False,
+                    zarr_format=3,
+                    encoding={
+                        "value": {
+                            "chunks": (2, 3, 4),
+                            "compressors": [codec],
+                        }
+                    },
+                )
+                region = self.native.read_region_f32(
+                    str(root), "/value", [1, 1, 1], [2, 3, 4]
+                )
+                np.testing.assert_array_equal(region, expected)
+
+
+    def test_committed_parity_fixtures_cover_codec_fill_and_layout(self) -> None:
+        from fast_nc_zarr.resampling.engine import run_resample
+        from fast_nc_zarr.resampling.models import ResampleConfig
+
+        fixture_root = Path(__file__).resolve().parent / "fixtures" / "parity"
+        float_source = fixture_root / "float-source.zarr"
+        mixed_source = fixture_root / "mixed-source.zarr"
+        with xr.open_zarr(
+            float_source, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+        ) as dataset:
+            self.assertEqual(dataset["value"].encoding["chunks"], (1, 2, 3))
+            self.assertEqual(dataset["temperature"].encoding["chunks"], (1, 2, 3))
+            np.testing.assert_array_equal(dataset["lat"].values, [3.5, 2.5, 1.5, 0.5])
+            self.assertTrue(np.isnan(dataset["value"].values).any())
+        value_summary = json.loads(self.native.inspect_array_json(str(float_source), "/value"))
+        temperature_summary = json.loads(
+            self.native.inspect_array_json(str(float_source), "/temperature")
+        )
+        self.assertEqual(value_summary["data_type"], "float32")
+        self.assertEqual(value_summary["codecs"][1]["name"], "blosc")
+        self.assertEqual(temperature_summary["codecs"][1]["name"], "zstd")
+        region = self.native.read_region_f32(str(float_source), "/value", [0, 1, 1], [2, 2, 3])
+        with xr.open_zarr(
+            float_source, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+        ) as dataset:
+            np.testing.assert_array_equal(region, dataset["value"].values[0:2, 1:3, 1:4].ravel())
+
+        mixed_target = Path(self.tempdir.name) / "mixed-fixture-rechunk.zarr"
+        metrics = run_rust_multi_rechunk(
+            RustMultiRechunkPlan(
+                source=mixed_source,
+                target=mixed_target,
+                variables=(
+                    RustMultiRechunkVariablePlan(
+                        "/value", (2, 4, 5), "float32", dimension_names=("time", "lat", "lon")
+                    ),
+                    RustMultiRechunkVariablePlan(
+                        "/quality", (1, 4, 5), "int16", dimension_names=("time", "lat", "lon")
+                    ),
+                ),
+                requested_workers=1,
+                worker_ceiling=1,
+                memory_budget_bytes=1024 * 1024,
+            )
+        )
+        self.assertEqual(metrics["backend"], "rust")
+        with xr.open_zarr(
+            mixed_target, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+        ) as dataset:
+            self.assertEqual(dataset["quality"].dtype, np.dtype("int16"))
+            self.assertEqual(dataset["quality"].values[0, 2, 3], -9999)
+            self.assertTrue(np.isnan(dataset["value"].values).any())
+
+        resampled = Path(self.tempdir.name) / "float-fixture-resampled.zarr"
+        resample_metrics = run_resample(
+            ResampleConfig(
+                float_source,
+                resampled,
+                resolution=2.0,
+                method="bilinear",
+                skipna=True,
+                space_workers=1,
+            ),
+            progress=False,
+        )
+        self.assertEqual(resample_metrics["backend"], "rust")
+        with xr.open_zarr(resampled, consolidated=False, chunks=None, mask_and_scale=False) as dataset:
+            self.assertEqual(dataset["value"].dtype, np.dtype("float32"))
+            self.assertEqual(dataset["value"].encoding["chunks"], (1, 2, 3))
+
     def test_float64_rust_write_is_readable_by_python_and_rust(self) -> None:
         root = f"{self.tempdir.name}/rust-float64-output.zarr"
         values = (np.arange(4 * 3 * 2, dtype="float64") / 10).reshape(4, 3, 2)
@@ -664,6 +766,26 @@ class RustResamplingTests(unittest.TestCase):
         request["method"] = "nearest"
         nearest = json.loads(native.resample_f32_json(json.dumps(request)))
         self.assertEqual(nearest["values"], [0.0])
+
+    def test_typed_buffer_missing_values_respect_skipna_threshold(self) -> None:
+        native = importlib.import_module("fast_nc_zarr._native")
+        values = np.asarray([np.nan, 2.0, 4.0, 6.0], dtype="float32").reshape(1, 2, 2)
+        kwargs = (
+            values,
+            list(values.shape),
+            np.asarray([0.0, 1.0], dtype="float32"),
+            np.asarray([0.0, 1.0], dtype="float32"),
+            np.asarray([0.5], dtype="float32"),
+            np.asarray([0.5], dtype="float32"),
+            "bilinear",
+        )
+        raw_values, shape = native.resample_f32_buffer_options(*kwargs, True, 1.0)
+        result = np.frombuffer(raw_values, dtype="float32").reshape(shape)
+        self.assertAlmostEqual(float(result[0, 0, 0]), 4.0)
+        raw_values, shape = native.resample_f32_buffer_options(*kwargs, True, 0.0)
+        strict = np.frombuffer(raw_values, dtype="float32").reshape(shape)
+        self.assertTrue(np.isnan(strict[0, 0, 0]))
+
     def test_typed_buffer_resampling_matches_json_contract(self) -> None:
         native = importlib.import_module("fast_nc_zarr._native")
         values = np.asarray([0.0, 1.0, 2.0, 3.0], dtype="float32").reshape(1, 2, 2)

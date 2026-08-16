@@ -1,4 +1,4 @@
-# v1.7.5 IPC contract
+# v1.7.6 IPC contract
 
 Protocol version: `1`.
 
@@ -93,7 +93,7 @@ Error kinds are `invalid_request`, `path_not_found`, `permission_denied`,
 `validation_failed`, `publication_failed`, and `unknown`.
 ## Backend capability report
 
-The v1.7.5 native-first migration keeps protocol version `1` and adds a structured
+The v1.7.6 native-first migration keeps protocol version `1` and adds a structured
 capability report. Its canonical schema is
 [`capability-v1.schema.json`](capability-v1.schema.json).
 

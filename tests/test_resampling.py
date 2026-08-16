@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import replace
 from threading import Event
@@ -41,7 +42,7 @@ from fast_nc_zarr.resampling.environment import (  # noqa: E402
     validate_resampling_environment,
 )
 from fast_nc_zarr.resampling.inspection import inspect_resample_input  # noqa: E402
-from fast_nc_zarr.resampling.models import GridInfo, ResampleConfig  # noqa: E402
+from fast_nc_zarr.resampling.models import GridInfo, ResampleConfig, ResampleVariableOptions  # noqa: E402
 from fast_nc_zarr.resampling.replacements import (  # noqa: E402
     apply_replacement_rules,
     evaluate_expression,
@@ -157,6 +158,43 @@ class ResamplingTests(unittest.TestCase):
             self.assertEqual(result["value"].attrs.get("missing_value"), None)
             self.assertEqual(result["value"].attrs["resampling_method"], "bilinear")
 
+
+    def test_progress_callback_reports_completed_tiles(self) -> None:
+        output = ROOT / "progress-output.zarr"
+        records: list[tuple[int, int, int | None, str | None]] = []
+        metrics = run_resample(
+            ResampleConfig(ROOT / "input.zarr", output, resolution=2.0, method="bilinear"),
+            progress=False,
+            progress_callback=lambda completed, total, logical_bytes, message: records.append(
+                (completed, total, logical_bytes, message)
+            ),
+        )
+
+        self.assertGreater(metrics["physical_bytes"], 0)
+        self.assertTrue(records)
+        self.assertEqual(records[-1][0], records[-1][1])
+        self.assertTrue(all(0 <= completed <= total for completed, total, _, _ in records))
+        self.assertTrue(all(logical_bytes is None for _, _, logical_bytes, _ in records))
+
+    def test_variables_can_use_distinct_resampling_methods(self) -> None:
+        output = ROOT / "variable-methods-output.zarr"
+        metrics = run_resample(
+            ResampleConfig(
+                ROOT / "input.zarr",
+                output,
+                resolution=2.0,
+                method="bilinear",
+                variable_options={
+                    "value": ResampleVariableOptions(method="conservative"),
+                    "reordered": ResampleVariableOptions(method="bilinear"),
+                },
+            ),
+            progress=False,
+        )
+        self.assertGreater(metrics["logical_bytes"], 0)
+        with xr.open_zarr(output, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False) as result:
+            self.assertEqual(result["value"].attrs["resampling_method"], "conservative")
+            self.assertEqual(result["reordered"].attrs["resampling_method"], "bilinear")
     def test_packed_source_is_decoded_and_output_metadata_is_canonical(self) -> None:
         source = ROOT / "packed-source.zarr"
         output = ROOT / "packed-output.zarr"
@@ -430,7 +468,7 @@ class ResamplingTests(unittest.TestCase):
         with xr.open_zarr(native_output, consolidated=False, chunks=None) as result:
             np.testing.assert_allclose(result["quality"].values, result["value"].values + 100.0)
 
-    def test_native_route_falls_back_for_nonfinite_typed_buffer_inputs(self) -> None:
+    def test_native_route_handles_nonfinite_typed_buffer_inputs(self) -> None:
         source = ROOT / "input.zarr"
         native_source = ROOT / "native-nan-source.zarr"
         output = ROOT / "native-nan-output.zarr"
@@ -445,10 +483,11 @@ class ResamplingTests(unittest.TestCase):
                 encoding={"value": {"compressors": []}},
             )
             nan_dataset.close()
-        run_resample(
+        metrics = run_resample(
             ResampleConfig(native_source, output, resolution=2.0, method="bilinear"),
             progress=False,
         )
+        self.assertEqual(metrics["backend"], "rust")
         self.assertTrue(output.is_dir())
         with xr.open_zarr(output, consolidated=False, chunks=None) as dataset:
             self.assertTrue(np.isnan(dataset["value"].values).any())
@@ -658,6 +697,11 @@ class ResamplingTests(unittest.TestCase):
             int(metrics["tile_timing"]["time_batches"]),
             int(metrics["tile_timing"]["total_time_batches"]),
         )
+        lifecycle = metrics["tile_timing"]["worker_lifecycle"]
+        self.assertEqual(lifecycle["parent_pid"], os.getpid())
+        self.assertGreaterEqual(len(lifecycle["child_pids"]), 1)
+        self.assertEqual(lifecycle["active_child_pids"], [])
+        self.assertEqual(lifecycle["exit_reason"], "completed")
         self.assertFalse(metrics["used_intermediate"])
         with xr.open_zarr(output, consolidated=False, chunks=None) as result:
             self.assertEqual(result.value.encoding["chunks"], (2, 2, 2))

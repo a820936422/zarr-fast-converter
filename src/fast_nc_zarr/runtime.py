@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from multiprocessing.context import BaseContext
 from typing import Callable, Iterable, Iterator, TypeVar
@@ -9,6 +10,94 @@ from typing import Callable, Iterable, Iterator, TypeVar
 
 _Task = TypeVar("_Task")
 _Result = TypeVar("_Result")
+
+
+class ProcessLifecycle:
+    """Track only descendants of the current process for diagnostics."""
+
+    def __init__(self, label: str) -> None:
+        self.label = str(label)
+        self.parent_pid = os.getpid()
+        self.started_at = time.time()
+        self.ended_at: float | None = None
+        self.exit_reason = "running"
+        self._observed_child_pids: set[int] = set()
+        self.sample()
+
+    def _current_child_pids(self) -> set[int]:
+        try:
+            import psutil
+
+            root = psutil.Process(self.parent_pid)
+            pids: set[int] = set()
+            for child in root.children(recursive=True):
+                try:
+                    identity = " ".join((child.name(), *child.cmdline()))
+                    if "resource_tracker" in identity or "forkserver" in identity:
+                        continue
+                    if child.is_running():
+                        pids.add(int(child.pid))
+                except Exception:  # noqa: BLE001 - child may exit during sampling
+                    continue
+            return pids
+        except Exception:  # noqa: BLE001 - diagnostics must not fail a task
+            return set()
+
+    def sample(self) -> None:
+        self._observed_child_pids.update(self._current_child_pids())
+
+    def finish(self, reason: str) -> None:
+        self.sample()
+        self.exit_reason = str(reason)
+        self.ended_at = time.time()
+
+    def to_dict(self) -> dict[str, object]:
+        current = self._current_child_pids()
+        return {
+            "label": self.label,
+            "parent_pid": self.parent_pid,
+            "child_pids": sorted(self._observed_child_pids),
+            "active_child_pids": sorted(current),
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "exit_reason": self.exit_reason,
+        }
+
+
+def shutdown_process_executor(
+    executor: ProcessPoolExecutor,
+    *,
+    terminate: bool,
+    pending: Iterable[object] = (),
+) -> None:
+    """Stop a process pool without waiting on failed or cancelled work."""
+
+    if not terminate:
+        executor.shutdown(wait=True, cancel_futures=True)
+        return
+    for future in pending:
+        cancel = getattr(future, "cancel", None)
+        if cancel is not None:
+            cancel()
+    terminate_workers = getattr(executor, "terminate_workers", None)
+    if terminate_workers is not None:
+        terminate_workers()
+        executor.shutdown(wait=True, cancel_futures=True)
+        return
+    kill_workers = getattr(executor, "kill_workers", None)
+    if kill_workers is not None:
+        kill_workers()
+        executor.shutdown(wait=True, cancel_futures=True)
+        return
+    processes = tuple((getattr(executor, "_processes", None) or {}).values())
+    for process in processes:
+        terminate = getattr(process, "terminate", None)
+        if terminate is not None:
+            try:
+                terminate()
+            except OSError:
+                continue
+    executor.shutdown(wait=True, cancel_futures=True)
 
 
 _THREAD_ENVIRONMENT = (
@@ -20,6 +109,8 @@ _THREAD_ENVIRONMENT = (
     "VECLIB_MAXIMUM_THREADS",
     "BLIS_NUM_THREADS",
 )
+
+
 
 
 def configure_process_runtime(threads_per_worker: int | None = None) -> int:
@@ -118,15 +209,9 @@ def bounded_process_map(
                     raise RuntimeError("任务已取消。")
                 yield future.result()
     except BaseException:
-        terminate = getattr(executor, "terminate_workers", None)
-        if terminate is not None:
-            terminate()
-        else:
-            for future in pending:
-                future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+        shutdown_process_executor(executor, terminate=True, pending=pending)
         terminated = True
         raise
     finally:
         if not terminated:
-            executor.shutdown(wait=True)
+            shutdown_process_executor(executor, terminate=False)

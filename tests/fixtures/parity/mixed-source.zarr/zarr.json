@@ -1,0 +1,7 @@
+{
+  "attributes": {
+    "fixture": "parity-v1-mixed"
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}

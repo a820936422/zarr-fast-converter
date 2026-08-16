@@ -22,7 +22,12 @@ from ..metadata import sanitize_cf_references
 from ..rechunking.models import DatasetInfo, VariableInfo
 from ..publication import preflight_writable, publish_staging
 from ..writer import compressor_from_spec
-from ..runtime import configure_process_runtime, spawn_context
+from ..runtime import (
+    ProcessLifecycle,
+    configure_process_runtime,
+    shutdown_process_executor,
+    spawn_context,
+)
 from ..system import effective_resource_budget
 from .autotune import (
     resolve_auto_space_workers,
@@ -36,6 +41,7 @@ from .inspection import inspect_resample_input
 from .models import (
     ComputeDType,
     ResampleConfig,
+    ResampleVariableOptions,
     ResampleInspection,
     ResamplePlan,
     TargetGrid,
@@ -586,6 +592,7 @@ def _build_output_skeleton(
     output_variables: dict[str, xr.DataArray] = {}
     spatial_names: set[str] = set()
     for item in info.data_variables:
+        options = plan.options_for(item.name)
         source_variable = source[item.name]
         if item.ndim and {"lat", "lon"}.issubset(source_variable.dims):
             shape = tuple(
@@ -595,9 +602,10 @@ def _build_output_skeleton(
             attrs = dict(source_variable.attrs)
             attrs.update(
                 {
-                    "resampling_method": plan.method,
-                    "resampling_skipna": bool(plan.skipna),
-                    "resampling_compute_dtype": plan.compute_dtype,
+                    "resampling_method": options.method,
+                    "resampling_skipna": bool(options.skipna),
+                    "resampling_na_thres": float(options.na_thres),
+                    "resampling_compute_dtype": options.compute_dtype,
                 }
             )
             output_variables[item.name] = xr.DataArray(
@@ -606,7 +614,7 @@ def _build_output_skeleton(
                     chunks=plan.output_chunks[item.name],
                     dtype=_resampled_output_dtype(
                         source_variable,
-                        plan.compute_dtype,
+                        options.compute_dtype,
                     ),
                 ),
                 dims=source_variable.dims,
@@ -640,10 +648,22 @@ def _build_output_skeleton(
     output = xr.Dataset(output_variables, coords=coords, attrs=dict(source.attrs))
     output.attrs.update(
         {
-            "resampling_method": plan.method,
+            "resampling_method": "per-variable" if plan.variable_options else plan.method,
             "resampling_skipna": bool(plan.skipna),
             "resampling_na_thres": float(plan.na_thres),
             "resampling_compute_dtype": plan.compute_dtype,
+            "resampling_variable_options": json.dumps(
+                {
+                    name: {
+                        "method": value.method,
+                        "skipna": bool(value.skipna),
+                        "na_thres": float(value.na_thres),
+                        "compute_dtype": value.compute_dtype,
+                    }
+                    for name, value in plan.variable_options.items()
+                },
+                ensure_ascii=False,
+            ),
             "resampling_lat_resolution": float(target.lat_resolution),
             "resampling_lon_resolution": float(target.lon_resolution),
             "source_spatial_extent": tuple(
@@ -901,10 +921,11 @@ def _fill_missing_tile(
     owner_buffer_peak_bytes = 0
     owner_memmap_bytes = 0
     for item in spatial_items:
+        options = plan.options_for(item.name)
         dtype = np.dtype(item.dtype)
         if not np.issubdtype(dtype, np.floating):
             dtype = np.dtype("float64")
-        elif plan.compute_dtype == "float32":
+        elif options.compute_dtype == "float32":
             dtype = np.dtype("float32")
         time_axis = item.dims.index("time")
         time_size = int(item.shape[time_axis])
@@ -1283,6 +1304,151 @@ def _process_space_tile(task: _OwnerTask) -> _TileMetrics:
                 pass
 
 
+def _execute_serial_tile_variable_overrides(
+    source: xr.Dataset,
+    output_group,
+    plan: ResamplePlan,
+    task: _OwnerTask,
+    workdir: Path,
+    spatial_items: tuple[VariableInfo, ...],
+) -> _TileMetrics:
+    started = time.perf_counter()
+    lat_start, lat_stop, lon_start, lon_stop = task.region
+    grid = plan.inspection.grid
+    timing = _empty_timing()
+    weight_seconds = 0.0
+    time_batches = 0
+    owner_chunks = 0
+    owner_buffer_bytes = 0
+    owner_buffer_peak_bytes = 0
+    owner_memmap_bytes = 0
+    full_regridders: dict[str, object] = {}
+    weight_paths: list[Path] = []
+    try:
+        for item in spatial_items:
+            options = plan.options_for(item.name)
+            tile = _tile_target(plan.target, lat_start, lat_stop, lon_start, lon_stop)
+            if options.method == "nearest_d2s":
+                target_tile = tile
+                source_lat_slice = slice(0, grid.lat.size)
+                source_lon_slice = slice(0, grid.lon.size)
+                regridder = full_regridders.get(options.method)
+                if regridder is None:
+                    weights_started = time.perf_counter()
+                    regridder, weight_path = _build_regridder(
+                        grid.lat,
+                        grid.lon,
+                        grid.lat_bounds,
+                        grid.lon_bounds,
+                        plan.target,
+                        options.method,
+                        workdir,
+                        lat_attrs=dict(source.lat.attrs),
+                        lon_attrs=dict(source.lon.attrs),
+                        periodic=bool(grid.periodic),
+                    )
+                    weight_seconds += time.perf_counter() - weights_started
+                    full_regridders[options.method] = regridder
+                    if weight_path is not None:
+                        weight_paths.append(weight_path)
+                regridder = _FullGridTileRegridder(
+                    regridder,
+                    slice(lat_start, lat_stop),
+                    slice(lon_start, lon_stop),
+                )
+            else:
+                target_tile, source_lat_slice, source_lon_slice = _resolve_local_source_window(
+                    grid,
+                    tile,
+                    options.method,
+                )
+                if source_lat_slice is None or source_lon_slice is None:
+                    missing = _fill_missing_tile(output_group, (item,), plan, task, workdir)
+                    timing["write"] += float(missing["write"])
+                    time_batches += int(missing["time_batches"])
+                    owner_chunks += int(missing["owner_chunks"])
+                    owner_buffer_bytes += int(missing["owner_buffer_bytes"])
+                    owner_buffer_peak_bytes = max(
+                        owner_buffer_peak_bytes,
+                        int(missing["owner_buffer_peak_bytes"]),
+                    )
+                    owner_memmap_bytes += int(missing["owner_memmap_bytes"])
+                    continue
+                weights_started = time.perf_counter()
+                regridder, weight_path = _build_regridder(
+                    grid.lat[int(source_lat_slice.start) : int(source_lat_slice.stop)],
+                    grid.lon[int(source_lon_slice.start) : int(source_lon_slice.stop)],
+                    grid.lat_bounds[int(source_lat_slice.start) : int(source_lat_slice.stop) + 1],
+                    grid.lon_bounds[int(source_lon_slice.start) : int(source_lon_slice.stop) + 1],
+                    target_tile,
+                    options.method,
+                    workdir,
+                    lat_attrs=dict(source.lat.attrs),
+                    lon_attrs=dict(source.lon.attrs),
+                    periodic=bool(
+                        grid.periodic
+                        and source_lat_slice.start == 0
+                        and source_lon_slice.start == 0
+                        and source_lon_slice.stop == grid.lon.size
+                    ),
+                )
+                weight_seconds += time.perf_counter() - weights_started
+                if weight_path is not None:
+                    weight_paths.append(weight_path)
+            variable_metrics = _resample_tile_variable(
+                source,
+                item,
+                regridder,
+                output_group,
+                plan.target,
+                lat_start,
+                lat_stop,
+                lon_start,
+                lon_stop,
+                source_lat_slice,
+                source_lon_slice,
+                target_tile,
+                options.skipna,
+                options.na_thres,
+                plan.time_block,
+                plan.compute_workers,
+                options.compute_dtype,
+                plan.before_replacements,
+                plan.after_replacements,
+                plan.statistics.get(item.name, {}),
+                workdir,
+                plan.owner_buffer_budget_bytes,
+            )
+            _add_timing(timing, variable_metrics)
+            time_batches += int(variable_metrics["time_batches"])
+            owner_chunks += int(variable_metrics["owner_chunks"])
+            owner_buffer_bytes += int(variable_metrics["owner_buffer_bytes"])
+            owner_buffer_peak_bytes = max(
+                owner_buffer_peak_bytes,
+                int(variable_metrics["owner_buffer_peak_bytes"]),
+            )
+            owner_memmap_bytes += int(variable_metrics["owner_memmap_bytes"])
+        return _TileMetrics(
+            task=task,
+            covered=True,
+            elapsed=time.perf_counter() - started,
+            weight_seconds=weight_seconds,
+            read_seconds=timing["read"],
+            regrid_seconds=timing["regrid"],
+            write_seconds=timing["write"],
+            time_batches=time_batches,
+            owner_chunks=owner_chunks,
+            owner_buffer_bytes=owner_buffer_bytes,
+            owner_buffer_peak_bytes=owner_buffer_peak_bytes,
+            owner_memmap_bytes=owner_memmap_bytes,
+        )
+    finally:
+        for weight_path in weight_paths:
+            try:
+                weight_path.unlink()
+            except OSError:
+                pass
+
 def _execute_serial_tile(
     source: xr.Dataset,
     output_group,
@@ -1293,6 +1459,16 @@ def _execute_serial_tile(
     full_regridder=None,
 ) -> _TileMetrics:
     """Execute one exclusive owner task in the caller."""
+    if plan.variable_options:
+        items_by_name = {item.name: item for item in spatial_items}
+        return _execute_serial_tile_variable_overrides(
+            source,
+            output_group,
+            plan,
+            task,
+            workdir,
+            tuple(items_by_name[name] for name in task.item_names),
+        )
 
     items_by_name = {item.name: item for item in spatial_items}
     task_items = tuple(items_by_name[name] for name in task.item_names)
@@ -1427,9 +1603,13 @@ def _run_parallel_tiles(
     *,
     cancel_event=None,
     progress: bool,
-) -> dict[str, float | int]:
+    progress_callback=None,
+) -> dict[str, object]:
     """Run bounded owner tasks and aggregate progress once per completed task."""
 
+    lifecycle = ProcessLifecycle("resampling-space-workers")
+    exit_reason = "completed"
+    terminated = False
     context = spawn_context()
     completed_batches = 0
     report_interval = max(1, total_batches // 20) if total_batches else 1
@@ -1472,6 +1652,7 @@ def _run_parallel_tiles(
                 except StopIteration:
                     break
                 pending.add(executor.submit(_process_space_tile, task))
+                lifecycle.sample()
 
             if not pending:
                 if cancelled:
@@ -1496,6 +1677,13 @@ def _run_parallel_tiles(
                         f"空间并行 worker 失败：{exc}"
                     ) from exc
                 completed += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        completed,
+                        total_tasks,
+                        None,
+                        f"重采样空间块：{completed}/{total_tasks}",
+                    )
                 completed_batches += metrics.time_batches
                 tile_elapsed += metrics.elapsed
                 weight_seconds += metrics.weight_seconds
@@ -1533,8 +1721,19 @@ def _run_parallel_tiles(
                     print(_format_tile_progress(completed, total_tasks, metrics), flush=True)
             if cancelled:
                 raise ResampleExecutionError("任务已取消，未生成输出。")
+    except BaseException:
+        exit_reason = (
+            "cancelled"
+            if cancel_event is not None and cancel_event.is_set()
+            else "failed"
+        )
+        shutdown_process_executor(executor, terminate=True, pending=pending)
+        terminated = True
+        raise
     finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+        if not terminated:
+            shutdown_process_executor(executor, terminate=False)
+        lifecycle.finish(exit_reason)
     return {
         "tiles": completed,
         "tile_elapsed_seconds": tile_elapsed,
@@ -1548,6 +1747,7 @@ def _run_parallel_tiles(
         "owner_buffer_bytes": owner_buffer_bytes,
         "owner_buffer_peak_bytes": owner_buffer_peak_bytes,
         "owner_memmap_bytes": owner_memmap_bytes,
+        "worker_lifecycle": lifecycle.to_dict(),
     }
 
 
@@ -1580,6 +1780,24 @@ def plan_resample(
         raise ValueError("重采样调优预算不能为负数。")
     if not np.isfinite(float(config.na_thres)) or not 0 <= float(config.na_thres) <= 1:
         raise ValueError("na_thres 必须位于 0 到 1 之间。")
+    variable_options: dict[str, ResampleVariableOptions] = {}
+    spatial_names = {
+        item.name
+        for item in inspection.info.data_variables
+        if {"lat", "lon"}.issubset(item.dims)
+    }
+    for name, options in config.variable_options.items():
+        if name not in spatial_names:
+            raise ValueError(f"变量 {name} 不存在或不包含 lat/lon 维度。")
+        if options.method not in RESAMPLING_METHODS:
+            raise ValueError(
+                f"变量 {name} 的重采样方法必须是：" + ", ".join(RESAMPLING_METHODS)
+            )
+        if options.compute_dtype not in COMPUTE_DTYPES:
+            raise ValueError(f"变量 {name} 的计算 dtype 不受支持。")
+        if not np.isfinite(float(options.na_thres)) or not 0 <= float(options.na_thres) <= 1:
+            raise ValueError(f"变量 {name} 的 na_thres 必须位于 0 到 1 之间。")
+        variable_options[name] = options
     if config.tile_size != "auto":
         try:
             manual_tile_size = int(config.tile_size)
@@ -1712,9 +1930,18 @@ def plan_resample(
             if not item.is_coord:
                 expected_dtype = np.dtype(item.dtype)
                 if {"lat", "lon"}.issubset(item.dims):
+                    options = variable_options.get(
+                        item.name,
+                        ResampleVariableOptions(
+                            method=config.method,
+                            skipna=config.skipna,
+                            na_thres=config.na_thres,
+                            compute_dtype=config.compute_dtype,
+                        ),
+                    )
                     if not np.issubdtype(expected_dtype, np.floating):
                         expected_dtype = np.dtype("float64")
-                    elif config.compute_dtype == "float32":
+                    elif options.compute_dtype == "float32":
                         expected_dtype = np.dtype("float32")
                 if np.dtype(layout_item.dtype) != expected_dtype:
                     raise ValueError(f"变量 {item.name} 与最终输出布局的 dtype 不一致。")
@@ -1740,6 +1967,7 @@ def plan_resample(
         target=target,
         tune_budget=float(config.tune_budget),
         method=config.method,
+        variable_options=variable_options,
         skipna=config.skipna,
         na_thres=float(config.na_thres),
         output_chunks=planned_output_chunks,
@@ -1890,7 +2118,7 @@ def _validate_output(
             if {"lat", "lon"}.issubset(source[item.name].dims):
                 expected_dtype = _resampled_output_dtype(
                     source[item.name],
-                    plan.compute_dtype,
+                    plan.options_for(item.name).compute_dtype,
                 )
                 if np.dtype(actual.dtype) != expected_dtype:
                     raise ResampleExecutionError(
@@ -1949,9 +2177,10 @@ def _statistics_limit(plan: ResamplePlan) -> tuple[int | None, str]:
         )
         dtype = np.dtype(item.dtype)
         if {"lat", "lon"}.issubset(item.dims):
+            options = plan.options_for(item.name)
             if not np.issubdtype(dtype, np.floating):
                 dtype = np.dtype("float64")
-            elif plan.compute_dtype == "float32":
+            elif options.compute_dtype == "float32":
                 dtype = np.dtype("float32")
         output_logical_bytes += int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
     if max(plan.inspection.info.logical_bytes, output_logical_bytes) <= 128 * 1024**2:
@@ -2038,18 +2267,12 @@ def _apply_data_dependent_post_replacements(
     return statistics, mode
 def _native_source_has_direct_values(path: Path, plan: ResamplePlan) -> bool:
     try:
-        group = zarr.open_group(path, mode="r")
+        zarr.open_group(path, mode="r")
         for item in plan.inspection.info.variables:
             attrs = item.attrs
             if "scale_factor" in attrs or "add_offset" in attrs:
                 return False
-            for marker in ("_FillValue", "missing_value"):
-                if marker in attrs and not _is_nan_scalar(attrs[marker]):
-                    return False
-        return all(
-            not tuple(group[item.name].compressors)
-            for item in plan.inspection.info.data_variables
-        )
+        return True
     except (KeyError, OSError, ValueError, TypeError):
         return False
 
@@ -2064,15 +2287,20 @@ def _native_read_block(
     source_lat_slice: slice,
     source_lon_slice: slice,
 ) -> np.ndarray:
-    values = source[name].isel(
-        time=slice(time_start, time_stop),
-        lat=source_lat_slice,
-        lon=source_lon_slice,
-    ).values
-    values = np.ascontiguousarray(values, dtype="float32")
-    if values.ndim != 3 or not np.isfinite(values).all():
+    try:
+        values = source[name].isel(
+            time=slice(time_start, time_stop),
+            lat=source_lat_slice,
+            lon=source_lon_slice,
+        ).values
+        values = np.ascontiguousarray(values, dtype="float32")
+    except Exception as exc:
         raise _NativeResampleFallback(
-            "native regular resampling requires finite three-dimensional float32 blocks"
+            f"native source region decode failed for {name}: {exc}"
+        ) from exc
+    if values.ndim != 3 or np.isinf(values).any():
+        raise _NativeResampleFallback(
+            "native regular resampling requires three-dimensional float32 blocks without infinity"
         )
     return values
 
@@ -2085,6 +2313,8 @@ def _native_call_batch(
     target_lat: np.ndarray,
     target_lon: np.ndarray,
     method: str,
+    skipna: bool,
+    na_thres: float,
 ) -> np.ndarray:
     first_shape = blocks[0].shape
     if any(block.shape != first_shape for block in blocks):
@@ -2094,6 +2324,24 @@ def _native_call_batch(
         (values.shape[0], target_lat.size, target_lon.size),
         dtype="float32",
     )
+    if hasattr(native, "resample_f32_buffer_into_options"):
+        result_shape = native.resample_f32_buffer_into_options(
+            values,
+            list(values.shape),
+            source_lat,
+            source_lon,
+            target_lat,
+            target_lon,
+            method,
+            bool(skipna),
+            float(na_thres),
+            output,
+        )
+        return output.reshape(tuple(int(value) for value in result_shape))
+    if skipna or float(na_thres) != 1.0:
+        raise _NativeResampleFallback(
+            "native extension lacks missing-value resampling options"
+        )
     if hasattr(native, "resample_f32_buffer_into"):
         result_shape = native.resample_f32_buffer_into(
             values,
@@ -2292,6 +2540,8 @@ def _native_process_tile(
                         target_lat_local,
                         target_lon_local,
                         method,
+                        plan.skipna,
+                        plan.na_thres,
                     )
                     metrics["resample"] += time.perf_counter() - resample_started
                     block_length = block_stop - block_start
@@ -2350,7 +2600,6 @@ def _native_process_tile(
                     lat_stop - lat_start,
                     lon_stop - lon_start,
                 )
-                metrics["owner_chunks"] += 1
                 if not use_owner_buffer:
                     metrics["owner_buffer_bytes"] += int(
                         np.prod(chunk_shape, dtype=np.int64) * np.dtype("float32").itemsize
@@ -2359,6 +2608,7 @@ def _native_process_tile(
                         int(metrics["owner_buffer_peak_bytes"]),
                         int(np.prod(chunk_shape, dtype=np.int64) * np.dtype("float32").itemsize),
                     )
+                metrics["owner_chunks"] += 1
     metrics["elapsed"] = time.perf_counter() - started
     return metrics
 
@@ -2368,6 +2618,7 @@ def _run_native_regular_resample(
     plan: ResamplePlan,
     *,
     cancel_event=None,
+    progress_callback=None,
 ) -> dict[str, object]:
     source_path = Path(config.input).expanduser().resolve()
     target_path = Path(config.output).expanduser().resolve()
@@ -2385,6 +2636,12 @@ def _run_native_regular_resample(
         mask_and_scale=True,
     )
     staging = target_path.parent / f".{target_path.name}.native-resample-{uuid4().hex}.tmp"
+    temporary_root = (
+        Path(config.temporary_dir).expanduser().resolve()
+        if config.temporary_dir is not None
+        else target_path.parent
+    )
+    preflight_writable(temporary_root, "重采样临时")
     started = time.perf_counter()
     try:
         if cancel_event is not None and cancel_event.is_set():
@@ -2450,6 +2707,13 @@ def _run_native_regular_resample(
                 int(metrics["owner_buffer_peak_bytes"]),
             )
             timing["owner_memmap_bytes"] += int(metrics["owner_memmap_bytes"])
+            if progress_callback is not None:
+                progress_callback(
+                    int(timing["tiles"]),
+                    total_tiles,
+                    None,
+                    f"native 重采样空间块：{int(timing['tiles'])}/{total_tiles}",
+                )
 
         if workers == 1:
             for task in tasks:
@@ -2498,6 +2762,8 @@ def _run_native_regular_resample(
             "throughput_mib_s": logical_bytes / 1024**2 / max(elapsed, 1e-9),
             "physical_throughput_mib_s": physical_bytes / 1024**2 / max(elapsed, 1e-9),
             "used_intermediate": False,
+            "intermediate_logical_bytes": 0,
+            "merge_timing": None,
             "logical_write_amplification": 1.0,
             "avoided_intermediate_bytes": logical_bytes,
             "space_workers": workers,
@@ -2510,6 +2776,7 @@ def _run_native_regular_resample(
                 "physical_chunks": int(timing["owner_chunks"]),
             },
             "tile_timing": timing,
+            "temporary_dir": str(temporary_root),
         }
     except _NativeResampleFallback:
         raise
@@ -2532,8 +2799,8 @@ def run_resample(
     *,
     cancel_event=None,
     progress: bool = True,
+    progress_callback=None,
 ) -> dict[str, object]:
-    validate_resampling_environment()
     plan = plan or plan_resample(config)
     requested_plan = plan
     source_path = Path(config.input).expanduser().resolve()
@@ -2545,6 +2812,7 @@ def run_resample(
     native_operation = "resample.nearest" if plan.method.startswith("nearest") else "resample.bilinear"
     if (
         plan.method in {"nearest_s2d", "bilinear"}
+        and not plan.variable_options
         and resolve_backend("auto", native_operation) == "rust"
         and not config.before_replacements.rules
         and not config.after_replacements.rules
@@ -2552,7 +2820,12 @@ def run_resample(
         and _native_source_has_direct_values(Path(config.input), plan)
     ):
         try:
-            return _run_native_regular_resample(config, plan, cancel_event=cancel_event)
+            return _run_native_regular_resample(
+                config,
+                plan,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
         except _NativeResampleFallback:
             pass
     _prepare_target(target_path, config.overwrite)
@@ -2674,6 +2947,7 @@ def run_resample(
                 full_regridder is not None
                 or total_tiles <= 1
                 or runtime_plan.space_workers <= 1
+                or bool(runtime_plan.variable_options)
             ):
                 for index, task in enumerate(tile_tasks(), start=1):
                     if cancel_event is not None and cancel_event.is_set():
@@ -2701,6 +2975,13 @@ def run_resample(
                         metrics.owner_buffer_peak_bytes,
                     )
                     tile_timing["owner_memmap_bytes"] += metrics.owner_memmap_bytes
+                    if progress_callback is not None:
+                        progress_callback(
+                            index,
+                            total_tiles,
+                            None,
+                            f"重采样空间块：{index}/{total_tiles}",
+                        )
                     if progress and (
                         index == 1
                         or index == total_tiles
@@ -2726,6 +3007,7 @@ def run_resample(
                     total_batches,
                     cancel_event=cancel_event,
                     progress=progress,
+                    progress_callback=progress_callback,
                 )
         finally:
             if full_regridder is not None:
@@ -2782,7 +3064,7 @@ def run_resample(
             )
             * _resampled_output_dtype(
                 source[variable.name],
-                runtime_plan.compute_dtype,
+                runtime_plan.options_for(variable.name).compute_dtype,
             ).itemsize
             for variable in runtime_plan.inspection.info.data_variables
         )

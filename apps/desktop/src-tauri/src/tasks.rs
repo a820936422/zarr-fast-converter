@@ -148,6 +148,28 @@ impl TaskRegistry {
         Ok(tasks)
     }
 
+    pub fn clear_history(&self) -> Result<usize, AppError> {
+        let mut removed = 0usize;
+        let mut cancellation_files = Vec::new();
+        self.update(|tasks| {
+            tasks.retain(|_, task| {
+                let active = matches!(task.status, TaskStatus::Running | TaskStatus::Cancelling);
+                if !active {
+                    removed += 1;
+                    if let Some(path) = task.cancellation_file.as_deref() {
+                        cancellation_files.push(PathBuf::from(path));
+                    }
+                }
+                active
+            });
+            Ok(())
+        })?;
+        for path in cancellation_files {
+            let _ = fs::remove_file(path);
+        }
+        Ok(removed)
+    }
+
     pub fn request_cancellation(&self, task_id: &str) -> Result<(), AppError> {
         let path = cancellation_path(task_id);
         self.update(|tasks| {
@@ -574,6 +596,11 @@ pub fn list_tasks(registry: State<'_, TaskRegistry>) -> Result<Vec<TaskSummary>,
 }
 
 #[tauri::command]
+pub fn clear_task_history(registry: State<'_, TaskRegistry>) -> Result<usize, AppError> {
+    registry.clear_history()
+}
+
+#[tauri::command]
 pub fn cancel_task(
     task_id: String,
     app: AppHandle,
@@ -731,6 +758,35 @@ mod tests {
         assert_eq!(stored["schema_version"], 1);
         assert_eq!(stored["tasks"][0]["taskId"], task_id);
         assert!(!path.exists());
+        let _ = fs::remove_file(state);
+    }
+
+    #[test]
+    fn clear_history_removes_terminal_tasks_but_preserves_active_tasks() {
+        let state = temp_path("clear-history");
+        let registry = TaskRegistry::with_state_path(state.clone());
+        registry
+            .insert(task("active-task", "/tmp/active.cancel"))
+            .expect("insert active task");
+        registry
+            .insert(task("finished-task", "/tmp/finished.cancel"))
+            .expect("insert finished task");
+        registry
+            .update_terminal("finished-task", Some(&finished_event("finished-task")))
+            .expect("finish task");
+
+        assert_eq!(registry.clear_history().expect("clear history"), 1);
+        assert!(registry
+            .get("finished-task")
+            .expect("get finished")
+            .is_none());
+        assert_eq!(
+            registry
+                .get("active-task")
+                .expect("get active")
+                .map(|item| item.status),
+            Some(TaskStatus::Running)
+        );
         let _ = fs::remove_file(state);
     }
 
