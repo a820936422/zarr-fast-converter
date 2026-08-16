@@ -1,7 +1,8 @@
 mod resample_native;
 
 pub use resample_native::{
-    resample_f32, resample_f32_values, ResampleF32Request, ResampleF32Response,
+    resample_f32, resample_f32_values, resample_f32_values_into, ResampleF32Request,
+    ResampleF32Response,
 };
 
 mod netcdf_native;

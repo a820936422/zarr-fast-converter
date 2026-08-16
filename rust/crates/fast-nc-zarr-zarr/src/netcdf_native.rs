@@ -1,5 +1,5 @@
 use netcdf::types::{FloatType, IntType, NcVariableType};
-use netcdf::{Attribute, AttributeValue};
+use netcdf::{Attribute, AttributeValue, Extent};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::path::Path;
@@ -292,47 +292,87 @@ fn native_values_budget_bytes() -> u64 {
         .unwrap_or(512 * 1024 * 1024)
 }
 
+fn dtype_item_size(dtype: &str) -> Result<u64, String> {
+    match dtype {
+        "float32" | "int32" | "uint32" => Ok(4),
+        "float64" | "int64" | "uint64" => Ok(8),
+        "int8" | "uint8" => Ok(1),
+        "int16" | "uint16" => Ok(2),
+        _ => Err(format!("unsupported NetCDF dtype for budget: {dtype}")),
+    }
+}
+
 fn ensure_native_values_budget(shape: &[u64], dtype: &str) -> Result<(), String> {
-    let itemsize = match dtype {
-        "float32" | "int32" | "uint32" => 4,
-        "float64" | "int64" | "uint64" => 8,
-        "int8" | "uint8" => 1,
-        "int16" | "uint16" => 2,
-        _ => return Err(format!("unsupported NetCDF dtype for budget: {dtype}")),
-    };
-    let elements = shape.iter().try_fold(1_u64, |total, value| {
+    let itemsize = dtype_item_size(dtype)?;
+    let chunk_elements = shape.iter().try_fold(1_u64, |total, value| {
         total
-            .checked_mul(*value)
-            .ok_or("array element count overflows u64")
+            .checked_mul((*value).min(64))
+            .ok_or("native NetCDF chunk element count overflows u64")
     })?;
-    let bytes = elements
+    let working_bytes = chunk_elements
         .checked_mul(itemsize)
-        .ok_or("native NetCDF working set overflows u64")?;
-    if bytes > native_values_budget_bytes() {
+        .and_then(|value| value.checked_mul(3))
+        .ok_or("native NetCDF chunk working set overflows u64")?;
+    if working_bytes > native_values_budget_bytes() {
         return Err(format!(
-            "resource_budget_exceeded: variable requires {bytes} bytes"
+            "resource_budget_exceeded: native NetCDF chunk requires {working_bytes} bytes"
         ));
     }
     Ok(())
 }
 
+fn logical_bytes(shape: &[u64], dtype: &str) -> Result<u64, String> {
+    let elements = u64::try_from(super::checked_product(shape).map_err(|error| error.to_string())?)
+        .map_err(|_| "native NetCDF logical element count exceeds u64")?;
+    elements
+        .checked_mul(dtype_item_size(dtype)?)
+        .ok_or_else(|| "native NetCDF logical byte count overflows u64".to_owned())
+}
+
+fn chunk_element_count(shape: &[usize]) -> Result<usize, String> {
+    shape
+        .iter()
+        .try_fold(1_usize, |total, value| total.checked_mul(*value))
+        .ok_or_else(|| "native NetCDF chunk element count overflows usize".to_owned())
+}
+
+fn chunk_extents(origin: &[u64], shape: &[usize]) -> Result<Vec<Extent>, String> {
+    if origin.len() != shape.len() {
+        return Err("NetCDF chunk origin and shape dimensionality mismatch".into());
+    }
+    origin
+        .iter()
+        .zip(shape)
+        .map(|(start, count)| {
+            Ok(Extent::SliceCount {
+                start: usize::try_from(*start).map_err(|_| "NetCDF chunk origin exceeds usize")?,
+                count: *count,
+                stride: 1,
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn store_f32_array(
     store: std::sync::Arc<zarrs_filesystem::FilesystemStore>,
     name: &str,
     shape: &[u64],
     dimensions: &[String],
-    values: &[f32],
+    variable: &netcdf::Variable<'_>,
     attrs: &Map<String, Value>,
     cancellation_file: Option<&Path>,
 ) -> Result<u64, String> {
     if cancellation_requested(cancellation_file) {
         return Err("任务已取消".into());
     }
+    let total_bytes = logical_bytes(shape, "float32")?;
+    let output_attrs = decoded_float_attributes(attrs);
     let chunks = shape
         .iter()
         .map(|value| (*value).clamp(1, 64))
         .collect::<Vec<_>>();
-    let fill_value = numeric_attribute(attrs, "_FillValue")
+    let fill_value = numeric_attribute(&output_attrs, "_FillValue")
         .map(|value| value as f32)
         .unwrap_or(f32::NAN);
     let mut builder = zarrs::array::ArrayBuilder::new(
@@ -345,7 +385,7 @@ fn store_f32_array(
     let mut array = builder
         .build(store, &format!("/{name}"))
         .map_err(|error| error.to_string())?;
-    for (key, value) in attrs {
+    for (key, value) in &output_attrs {
         array.attributes_mut().insert(key.clone(), value.clone());
     }
     array
@@ -367,34 +407,48 @@ fn store_f32_array(
         let chunk_shape = array
             .chunk_shape_usize(&index_u64)
             .map_err(|error| error.to_string())?;
-        let chunk = super::chunk_values(values, shape, &chunk_shape, &index_u64)
+        let origin = array
+            .chunk_origin(&index_u64)
             .map_err(|error| error.to_string())?;
+        let values = variable
+            .get_values::<f32, _>(chunk_extents(&origin, &chunk_shape)?)
+            .map_err(|error| error.to_string())?;
+        let decoded = decode_f32_values(&values, attrs)?;
+        if decoded.len() != chunk_element_count(&chunk_shape)? {
+            return Err(format!(
+                "NetCDF chunk for {name} has an unexpected element count"
+            ));
+        }
         array
-            .store_chunk(&index_u64, chunk.as_slice())
+            .store_chunk(&index_u64, decoded.as_slice())
             .map_err(|error| error.to_string())?;
         if !super::increment_index(&mut index, &grid) {
             break;
         }
     }
-    Ok(std::mem::size_of_val(values) as u64)
+    Ok(total_bytes)
 }
+
+#[allow(clippy::too_many_arguments)]
 fn store_f64_array(
     store: std::sync::Arc<zarrs_filesystem::FilesystemStore>,
     name: &str,
     shape: &[u64],
     dimensions: &[String],
-    values: &[f64],
+    variable: &netcdf::Variable<'_>,
     attrs: &Map<String, Value>,
     cancellation_file: Option<&Path>,
 ) -> Result<u64, String> {
     if cancellation_requested(cancellation_file) {
         return Err("任务已取消".into());
     }
+    let total_bytes = logical_bytes(shape, "float64")?;
+    let output_attrs = decoded_float_attributes(attrs);
     let chunks = shape
         .iter()
         .map(|value| (*value).clamp(1, 64))
         .collect::<Vec<_>>();
-    let fill_value = numeric_attribute(attrs, "_FillValue").unwrap_or(f64::NAN);
+    let fill_value = numeric_attribute(&output_attrs, "_FillValue").unwrap_or(f64::NAN);
     let mut builder = zarrs::array::ArrayBuilder::new(
         shape.to_vec(),
         chunks,
@@ -405,7 +459,7 @@ fn store_f64_array(
     let mut array = builder
         .build(store, &format!("/{name}"))
         .map_err(|error| error.to_string())?;
-    for (key, value) in attrs {
+    for (key, value) in &output_attrs {
         array.attributes_mut().insert(key.clone(), value.clone());
     }
     array
@@ -427,85 +481,41 @@ fn store_f64_array(
         let chunk_shape = array
             .chunk_shape_usize(&index_u64)
             .map_err(|error| error.to_string())?;
-        let chunk = super::chunk_values_f64(values, shape, &chunk_shape, &index_u64)
+        let origin = array
+            .chunk_origin(&index_u64)
             .map_err(|error| error.to_string())?;
+        let values = variable
+            .get_values::<f64, _>(chunk_extents(&origin, &chunk_shape)?)
+            .map_err(|error| error.to_string())?;
+        let decoded = decode_f64_values(&values, attrs)?;
+        if decoded.len() != chunk_element_count(&chunk_shape)? {
+            return Err(format!(
+                "NetCDF chunk for {name} has an unexpected element count"
+            ));
+        }
         array
-            .store_chunk(&index_u64, chunk.as_slice())
+            .store_chunk(&index_u64, decoded.as_slice())
             .map_err(|error| error.to_string())?;
         if !super::increment_index(&mut index, &grid) {
             break;
         }
     }
-    Ok(std::mem::size_of_val(values) as u64)
-}
-
-fn integer_chunk_values<T: Copy + Default>(
-    values: &[T],
-    shape: &[u64],
-    chunk_shape: &[usize],
-    chunk_indices: &[u64],
-) -> Result<Vec<T>, String> {
-    let expected = super::checked_product(shape).map_err(|error| error.to_string())?;
-    if values.len() != expected {
-        return Err(format!(
-            "values length {} does not match array element count {}",
-            values.len(),
-            expected
-        ));
-    }
-    let strides = super::row_major_strides(shape).map_err(|error| error.to_string())?;
-    let capacity = chunk_shape
-        .iter()
-        .try_fold(1_usize, |total, value| total.checked_mul(*value))
-        .ok_or_else(|| "chunk element count overflows usize".to_owned())?;
-    let mut output = Vec::with_capacity(capacity);
-    let mut local = vec![0_usize; chunk_shape.len()];
-    loop {
-        let mut source_offset = 0_usize;
-        let mut in_bounds = true;
-        for axis in 0..chunk_shape.len() {
-            let origin = usize::try_from(chunk_indices[axis])
-                .ok()
-                .and_then(|index| index.checked_mul(chunk_shape[axis]))
-                .ok_or_else(|| "chunk origin overflows usize".to_owned())?;
-            let coordinate = origin
-                .checked_add(local[axis])
-                .ok_or_else(|| "chunk coordinate overflows usize".to_owned())?;
-            let axis_size =
-                usize::try_from(shape[axis]).map_err(|_| "array shape exceeds usize".to_owned())?;
-            if coordinate >= axis_size {
-                in_bounds = false;
-                break;
-            }
-            source_offset = source_offset
-                .checked_add(
-                    coordinate
-                        .checked_mul(strides[axis])
-                        .ok_or_else(|| "source offset overflows usize".to_owned())?,
-                )
-                .ok_or_else(|| "source offset overflows usize".to_owned())?;
-        }
-        output.push(if in_bounds {
-            values[source_offset]
-        } else {
-            T::default()
-        });
-        if !super::increment_index(&mut local, chunk_shape) {
-            break;
-        }
-    }
-    Ok(output)
+    Ok(total_bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn store_integer_array<
-    T: Copy + Default + zarrs::array::Element + Into<zarrs::array::builder::ArrayBuilderFillValue>,
+    T: Copy
+        + Default
+        + netcdf::NcTypeDescriptor
+        + zarrs::array::Element
+        + Into<zarrs::array::builder::ArrayBuilderFillValue>,
 >(
     store: std::sync::Arc<zarrs_filesystem::FilesystemStore>,
     name: &str,
     shape: &[u64],
     dimensions: &[String],
-    values: &[T],
+    variable: &netcdf::Variable<'_>,
     attrs: &Map<String, Value>,
     data_type_and_fill_value: (zarrs::array::builder::ArrayBuilderDataType, T),
     cancellation_file: Option<&Path>,
@@ -513,6 +523,11 @@ fn store_integer_array<
     if cancellation_requested(cancellation_file) {
         return Err("任务已取消".into());
     }
+    let elements = u64::try_from(super::checked_product(shape).map_err(|error| error.to_string())?)
+        .map_err(|_| "native NetCDF logical element count exceeds u64")?;
+    let total_bytes = elements
+        .checked_mul(std::mem::size_of::<T>() as u64)
+        .ok_or_else(|| "native NetCDF logical byte count overflows u64".to_owned())?;
     let (data_type, fill_value) = data_type_and_fill_value;
     let chunks = shape
         .iter()
@@ -546,15 +561,25 @@ fn store_integer_array<
         let chunk_shape = array
             .chunk_shape_usize(&index_u64)
             .map_err(|error| error.to_string())?;
-        let chunk = integer_chunk_values(values, shape, &chunk_shape, &index_u64)?;
+        let origin = array
+            .chunk_origin(&index_u64)
+            .map_err(|error| error.to_string())?;
+        let values = variable
+            .get_values::<T, _>(chunk_extents(&origin, &chunk_shape)?)
+            .map_err(|error| error.to_string())?;
+        if values.len() != chunk_element_count(&chunk_shape)? {
+            return Err(format!(
+                "NetCDF chunk for {name} has an unexpected element count"
+            ));
+        }
         array
-            .store_chunk(&index_u64, chunk.as_slice())
+            .store_chunk(&index_u64, values.as_slice())
             .map_err(|error| error.to_string())?;
         if !super::increment_index(&mut index, &grid) {
             break;
         }
     }
-    Ok(std::mem::size_of_val(values) as u64)
+    Ok(total_bytes)
 }
 
 fn path_entry_exists(path: &Path) -> bool {
@@ -854,46 +879,30 @@ fn convert_netcdf_to_zarr_inner(
         let attrs = variable_summary.attributes.clone();
         ensure_native_values_budget(&shape, &variable_summary.dtype)?;
         let bytes = match variable_summary.dtype.as_str() {
-            "float32" => {
-                let values = variable
-                    .get_values::<f32, _>(..)
-                    .map_err(|error| error.to_string())?;
-                let values = decode_f32_values(&values, &attrs)?;
-                let decoded_attrs = decoded_float_attributes(&attrs);
-                store_f32_array(
-                    store.clone(),
-                    &variable_summary.name,
-                    &shape,
-                    &variable_summary.dimensions,
-                    &values,
-                    &decoded_attrs,
-                    cancellation_file,
-                )?
-            }
-            "float64" => {
-                let values = variable
-                    .get_values::<f64, _>(..)
-                    .map_err(|error| error.to_string())?;
-                let values = decode_f64_values(&values, &attrs)?;
-                let decoded_attrs = decoded_float_attributes(&attrs);
-                store_f64_array(
-                    store.clone(),
-                    &variable_summary.name,
-                    &shape,
-                    &variable_summary.dimensions,
-                    &values,
-                    &decoded_attrs,
-                    cancellation_file,
-                )?
-            }
+            "float32" => store_f32_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable,
+                &attrs,
+                cancellation_file,
+            )?,
+            "float64" => store_f64_array(
+                store.clone(),
+                &variable_summary.name,
+                &shape,
+                &variable_summary.dimensions,
+                &variable,
+                &attrs,
+                cancellation_file,
+            )?,
             "int8" => store_integer_array(
                 store.clone(),
                 &variable_summary.name,
                 &shape,
                 &variable_summary.dimensions,
-                &variable
-                    .get_values::<i8, _>(..)
-                    .map_err(|error| error.to_string())?,
+                &variable,
                 &attrs,
                 (zarrs::array::data_type::int8().into(), 0_i8),
                 cancellation_file,
@@ -903,9 +912,7 @@ fn convert_netcdf_to_zarr_inner(
                 &variable_summary.name,
                 &shape,
                 &variable_summary.dimensions,
-                &variable
-                    .get_values::<i16, _>(..)
-                    .map_err(|error| error.to_string())?,
+                &variable,
                 &attrs,
                 (zarrs::array::data_type::int16().into(), 0_i16),
                 cancellation_file,
@@ -915,9 +922,7 @@ fn convert_netcdf_to_zarr_inner(
                 &variable_summary.name,
                 &shape,
                 &variable_summary.dimensions,
-                &variable
-                    .get_values::<i32, _>(..)
-                    .map_err(|error| error.to_string())?,
+                &variable,
                 &attrs,
                 (zarrs::array::data_type::int32().into(), 0_i32),
                 cancellation_file,
@@ -927,9 +932,7 @@ fn convert_netcdf_to_zarr_inner(
                 &variable_summary.name,
                 &shape,
                 &variable_summary.dimensions,
-                &variable
-                    .get_values::<i64, _>(..)
-                    .map_err(|error| error.to_string())?,
+                &variable,
                 &attrs,
                 (zarrs::array::data_type::int64().into(), 0_i64),
                 cancellation_file,
@@ -939,9 +942,7 @@ fn convert_netcdf_to_zarr_inner(
                 &variable_summary.name,
                 &shape,
                 &variable_summary.dimensions,
-                &variable
-                    .get_values::<u8, _>(..)
-                    .map_err(|error| error.to_string())?,
+                &variable,
                 &attrs,
                 (zarrs::array::data_type::uint8().into(), 0_u8),
                 cancellation_file,
@@ -951,9 +952,7 @@ fn convert_netcdf_to_zarr_inner(
                 &variable_summary.name,
                 &shape,
                 &variable_summary.dimensions,
-                &variable
-                    .get_values::<u16, _>(..)
-                    .map_err(|error| error.to_string())?,
+                &variable,
                 &attrs,
                 (zarrs::array::data_type::uint16().into(), 0_u16),
                 cancellation_file,
@@ -963,9 +962,7 @@ fn convert_netcdf_to_zarr_inner(
                 &variable_summary.name,
                 &shape,
                 &variable_summary.dimensions,
-                &variable
-                    .get_values::<u32, _>(..)
-                    .map_err(|error| error.to_string())?,
+                &variable,
                 &attrs,
                 (zarrs::array::data_type::uint32().into(), 0_u32),
                 cancellation_file,
@@ -975,9 +972,7 @@ fn convert_netcdf_to_zarr_inner(
                 &variable_summary.name,
                 &shape,
                 &variable_summary.dimensions,
-                &variable
-                    .get_values::<u64, _>(..)
-                    .map_err(|error| error.to_string())?,
+                &variable,
                 &attrs,
                 (zarrs::array::data_type::uint64().into(), 0_u64),
                 cancellation_file,
@@ -1015,18 +1010,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_budget_rejects_oversized_float64_variable() {
-        let result = ensure_native_values_budget(&[512 * 1024 * 1024], "float64");
-        assert!(result
-            .expect_err("default native budget must reject a 4 GiB variable")
-            .contains("resource_budget_exceeded"));
+    fn native_budget_accepts_large_variable_when_chunk_fits() {
+        assert!(ensure_native_values_budget(&[512 * 1024 * 1024], "float64").is_ok());
     }
 
     #[test]
-    fn native_budget_detects_element_count_overflow() {
-        let result = ensure_native_values_budget(&[u64::MAX, 2], "float32");
-        assert!(result
-            .expect_err("element multiplication must be checked")
-            .contains("overflows u64"));
+    fn native_logical_bytes_detects_element_count_overflow() {
+        let result = logical_bytes(&[u64::MAX, 2], "float32");
+        assert!(
+            result.is_err(),
+            "logical byte multiplication must be checked"
+        );
     }
 }

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import ExitStack, contextmanager
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 import itertools
 from pathlib import Path
@@ -2056,83 +2056,463 @@ def _native_source_has_direct_values(path: Path, plan: ResamplePlan) -> bool:
 
 
 
-def _run_native_regular_resample(config: ResampleConfig, plan: ResamplePlan, *, cancel_event=None) -> dict[str, object]:
+def _native_read_block(
+    source: xr.Dataset,
+    name: str,
+    time_start: int,
+    time_stop: int,
+    source_lat_slice: slice,
+    source_lon_slice: slice,
+) -> np.ndarray:
+    values = source[name].isel(
+        time=slice(time_start, time_stop),
+        lat=source_lat_slice,
+        lon=source_lon_slice,
+    ).values
+    values = np.ascontiguousarray(values, dtype="float32")
+    if values.ndim != 3 or not np.isfinite(values).all():
+        raise _NativeResampleFallback(
+            "native regular resampling requires finite three-dimensional float32 blocks"
+        )
+    return values
+
+
+def _native_call_batch(
+    native,
+    blocks: list[np.ndarray],
+    source_lat: np.ndarray,
+    source_lon: np.ndarray,
+    target_lat: np.ndarray,
+    target_lon: np.ndarray,
+    method: str,
+) -> np.ndarray:
+    first_shape = blocks[0].shape
+    if any(block.shape != first_shape for block in blocks):
+        raise ResampleExecutionError("native batch blocks have inconsistent shapes")
+    values = blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=0)
+    output = np.empty(
+        (values.shape[0], target_lat.size, target_lon.size),
+        dtype="float32",
+    )
+    if hasattr(native, "resample_f32_buffer_into"):
+        result_shape = native.resample_f32_buffer_into(
+            values,
+            list(values.shape),
+            source_lat,
+            source_lon,
+            target_lat,
+            target_lon,
+            method,
+            output,
+        )
+        return output.reshape(tuple(int(value) for value in result_shape))
+    raw_values, result_shape = native.resample_f32_buffer(
+        values,
+        list(values.shape),
+        source_lat,
+        source_lon,
+        target_lat,
+        target_lon,
+        method,
+    )
+    return np.frombuffer(raw_values, dtype="float32").reshape(
+        tuple(int(value) for value in result_shape)
+    )
+
+
+def _native_process_tile(
+    source: xr.Dataset,
+    output_group,
+    native,
+    plan: ResamplePlan,
+    task: _OwnerTask,
+    items_by_name: dict[str, VariableInfo],
+    source_lat: np.ndarray,
+    source_lon: np.ndarray,
+    target_lat: np.ndarray,
+    target_lon: np.ndarray,
+    workdir: Path,
+    cancel_event=None,
+) -> dict[str, float | int]:
+    started = time.perf_counter()
+    lat_start, lat_stop, lon_start, lon_stop = task.region
+    tile = _tile_target(plan.target, lat_start, lat_stop, lon_start, lon_stop)
+    target_tile, source_lat_slice, source_lon_slice = _resolve_local_source_window(
+        plan.inspection.grid,
+        tile,
+        plan.method,
+    )
+    metrics: dict[str, float | int] = {
+        "elapsed": 0.0,
+        "read": 0.0,
+        "resample": 0.0,
+        "write": 0.0,
+        "time_batches": 0,
+        "owner_chunks": 0,
+        "owner_buffer_bytes": 0,
+        "owner_buffer_peak_bytes": 0,
+        "owner_memmap_bytes": 0,
+    }
+    item_names = task.item_names
+    if source_lat_slice is None or source_lon_slice is None:
+        for name in item_names:
+            item = items_by_name[name]
+            output_array = output_group[name]
+            time_axis = item.dims.index("time")
+            time_size = int(item.shape[time_axis])
+            time_chunk = int(output_array.chunks[time_axis])
+            for time_start in range(0, time_size, time_chunk):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ResampleExecutionError("任务已取消，未生成输出。")
+                time_stop = min(time_start + time_chunk, time_size)
+                shape = (time_stop - time_start, lat_stop - lat_start, lon_stop - lon_start)
+                with _owner_buffer(
+                    shape,
+                    np.dtype("float32"),
+                    workdir,
+                    plan.owner_buffer_budget_bytes,
+                ) as (values, nbytes, used_memmap):
+                    values[...] = np.nan
+                    write_started = time.perf_counter()
+                    _write_region(
+                        output_group,
+                        name,
+                        values,
+                        item.dims,
+                        {
+                            "time": slice(time_start, time_stop),
+                            "lat": slice(lat_start, lat_stop),
+                            "lon": slice(lon_start, lon_stop),
+                        },
+                    )
+                    metrics["write"] += time.perf_counter() - write_started
+                metrics["owner_chunks"] += 1
+                metrics["owner_buffer_bytes"] += nbytes
+                metrics["owner_buffer_peak_bytes"] = max(
+                    int(metrics["owner_buffer_peak_bytes"]), nbytes
+                )
+                if used_memmap:
+                    metrics["owner_memmap_bytes"] += nbytes
+                metrics["time_batches"] += 1
+        metrics["elapsed"] = time.perf_counter() - started
+        return metrics
+
+    source_lat_local = np.ascontiguousarray(
+        source_lat[source_lat_slice], dtype="float32"
+    )
+    source_lon_local = np.ascontiguousarray(
+        source_lon[source_lon_slice], dtype="float32"
+    )
+    target_lat_local = np.ascontiguousarray(target_tile.lat, dtype="float32")
+    target_lon_local = np.ascontiguousarray(target_tile.lon, dtype="float32")
+    source_area = int(source_lat_local.size) * int(source_lon_local.size)
+    target_area = int(target_lat_local.size) * int(target_lon_local.size)
+    if source_area <= 0 or target_area <= 0:
+        raise ResampleExecutionError("native resampling region has an empty spatial axis")
+    method = "nearest" if plan.method.startswith("nearest") else "bilinear"
+
+    grouped: dict[tuple[int, int], list[VariableInfo]] = {}
+    for name in item_names:
+        item = items_by_name[name]
+        output_array = output_group[name]
+        time_axis = item.dims.index("time")
+        grouped.setdefault(
+            (int(item.shape[time_axis]), int(output_array.chunks[time_axis])), []
+        ).append(item)
+
+    for group_items in grouped.values():
+        batch_count = len(group_items)
+        max_input_time = MAX_NATIVE_RESAMPLE_VALUES // (source_area * batch_count)
+        max_output_time = MAX_NATIVE_RESAMPLE_VALUES // (target_area * batch_count)
+        native_time_block = min(
+            max(1, int(plan.time_block)),
+            max_input_time,
+            max_output_time,
+        )
+        if native_time_block < 1:
+            raise _NativeResampleFallback(
+                "native regular resampling region exceeds the bounded typed buffer bridge"
+            )
+        time_size = int(group_items[0].shape[group_items[0].dims.index("time")])
+        time_chunk = int(
+            output_group[group_items[0].name].chunks[group_items[0].dims.index("time")]
+        )
+        for chunk_start in range(0, time_size, time_chunk):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ResampleExecutionError("任务已取消，未生成输出。")
+            chunk_stop = min(chunk_start + time_chunk, time_size)
+            chunk_length = chunk_stop - chunk_start
+            use_owner_buffer = native_time_block < chunk_length
+            stack = ExitStack()
+            buffers: dict[str, np.ndarray] = {}
+            try:
+                if use_owner_buffer:
+                    for item in group_items:
+                        shape = (
+                            chunk_length,
+                            lat_stop - lat_start,
+                            lon_stop - lon_start,
+                        )
+                        values, nbytes, used_memmap = stack.enter_context(
+                            _owner_buffer(
+                                shape,
+                                np.dtype("float32"),
+                                workdir,
+                                plan.owner_buffer_budget_bytes,
+                            )
+                        )
+                        buffers[item.name] = values
+                        metrics["owner_buffer_bytes"] += nbytes
+                        metrics["owner_buffer_peak_bytes"] += nbytes
+                        if used_memmap:
+                            metrics["owner_memmap_bytes"] += nbytes
+                for block_start in range(chunk_start, chunk_stop, native_time_block):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ResampleExecutionError("任务已取消，未生成输出。")
+                    block_stop = min(block_start + native_time_block, chunk_stop)
+                    read_started = time.perf_counter()
+                    blocks = [
+                        _native_read_block(
+                            source,
+                            item.name,
+                            block_start,
+                            block_stop,
+                            source_lat_slice,
+                            source_lon_slice,
+                        )
+                        for item in group_items
+                    ]
+                    metrics["read"] += time.perf_counter() - read_started
+                    resample_started = time.perf_counter()
+                    result = _native_call_batch(
+                        native,
+                        blocks,
+                        source_lat_local,
+                        source_lon_local,
+                        target_lat_local,
+                        target_lon_local,
+                        method,
+                    )
+                    metrics["resample"] += time.perf_counter() - resample_started
+                    block_length = block_stop - block_start
+                    expected_shape = (
+                        block_length * len(group_items),
+                        lat_stop - lat_start,
+                        lon_stop - lon_start,
+                    )
+                    if tuple(result.shape) != expected_shape:
+                        raise ResampleExecutionError(
+                            f"native result shape mismatch: expected {expected_shape}, got {result.shape}"
+                        )
+                    for index, item in enumerate(group_items):
+                        values = result[
+                            index * block_length : (index + 1) * block_length
+                        ]
+                        if use_owner_buffer:
+                            buffers[item.name][
+                                block_start - chunk_start : block_stop - chunk_start
+                            ] = values
+                        else:
+                            write_started = time.perf_counter()
+                            _write_region(
+                                output_group,
+                                item.name,
+                                values,
+                                item.dims,
+                                {
+                                    "time": slice(block_start, block_stop),
+                                    "lat": slice(lat_start, lat_stop),
+                                    "lon": slice(lon_start, lon_stop),
+                                },
+                            )
+                            metrics["write"] += time.perf_counter() - write_started
+                    metrics["time_batches"] += 1
+                if use_owner_buffer:
+                    for item in group_items:
+                        write_started = time.perf_counter()
+                        _write_region(
+                            output_group,
+                            item.name,
+                            buffers[item.name],
+                            item.dims,
+                            {
+                                "time": slice(chunk_start, chunk_stop),
+                                "lat": slice(lat_start, lat_stop),
+                                "lon": slice(lon_start, lon_stop),
+                            },
+                        )
+                        metrics["write"] += time.perf_counter() - write_started
+            finally:
+                stack.close()
+            for item in group_items:
+                chunk_shape = (
+                    chunk_length,
+                    lat_stop - lat_start,
+                    lon_stop - lon_start,
+                )
+                metrics["owner_chunks"] += 1
+                if not use_owner_buffer:
+                    metrics["owner_buffer_bytes"] += int(
+                        np.prod(chunk_shape, dtype=np.int64) * np.dtype("float32").itemsize
+                    )
+                    metrics["owner_buffer_peak_bytes"] = max(
+                        int(metrics["owner_buffer_peak_bytes"]),
+                        int(np.prod(chunk_shape, dtype=np.int64) * np.dtype("float32").itemsize),
+                    )
+    metrics["elapsed"] = time.perf_counter() - started
+    return metrics
+
+
+def _run_native_regular_resample(
+    config: ResampleConfig,
+    plan: ResamplePlan,
+    *,
+    cancel_event=None,
+) -> dict[str, object]:
     source_path = Path(config.input).expanduser().resolve()
     target_path = Path(config.output).expanduser().resolve()
     if config.before_replacements.data_dependent or config.after_replacements.data_dependent:
-        raise ResampleExecutionError("native regular resampling does not support data-dependent replacements")
-    output_values = int(plan.target.dimensions["lat"]) * int(plan.target.dimensions["lon"])
-    for item in plan.inspection.info.data_variables:
-        source_values = 1
-        for size in item.shape:
-            source_values *= int(size)
-        variable_output_values = int(item.shape[0]) * output_values
-        if (
-            source_values > MAX_NATIVE_RESAMPLE_VALUES
-            or variable_output_values > MAX_NATIVE_RESAMPLE_VALUES
-        ):
-            raise ResampleExecutionError(
-                "native regular resampling exceeds the bounded typed buffer bridge limit "
-                f"of {MAX_NATIVE_RESAMPLE_VALUES:,} values for {item.name}"
-            )
-    source = xr.open_zarr(source_path, consolidated=False, chunks=None, decode_times=False, mask_and_scale=True)
+        raise ResampleExecutionError(
+            "native regular resampling does not support data-dependent replacements"
+        )
+    _prepare_target(target_path, config.overwrite)
+    preflight_writable(target_path.parent, "重采样输出")
+    source = xr.open_zarr(
+        source_path,
+        consolidated=False,
+        chunks=None,
+        decode_times=False,
+        mask_and_scale=True,
+    )
     staging = target_path.parent / f".{target_path.name}.native-resample-{uuid4().hex}.tmp"
+    started = time.perf_counter()
     try:
         if cancel_event is not None and cancel_event.is_set():
             raise ResampleExecutionError("任务已取消，未生成输出。")
-        lat = np.ascontiguousarray(source["lat"].values, dtype="float32")
-        lon = np.ascontiguousarray(source["lon"].values, dtype="float32")
+        for item in plan.inspection.info.data_variables:
+            if item.dims != ("time", "lat", "lon") or str(item.dtype) != "float32":
+                raise ResampleExecutionError(
+                    "native regular resampling requires float32 (time, lat, lon) variables"
+                )
+        _initialize_output_store(source, plan.inspection.info, plan, staging)
+        output_group = zarr.open_group(staging, mode="r+")
+        source_lat = np.ascontiguousarray(source["lat"].values, dtype="float32")
+        source_lon = np.ascontiguousarray(source["lon"].values, dtype="float32")
         target_lat = np.ascontiguousarray(plan.target.lat, dtype="float32")
         target_lon = np.ascontiguousarray(plan.target.lon, dtype="float32")
         native = __import__("fast_nc_zarr._native", fromlist=["resample_f32_buffer"])
-        variables = {}
-        for item in plan.inspection.info.data_variables:
-            if item.dims != ("time", "lat", "lon") or str(item.dtype) != "float32":
-                raise ResampleExecutionError("native regular resampling requires float32 (time, lat, lon) variables")
-            values = np.ascontiguousarray(source[item.name].values, dtype="float32")
-            if not np.isfinite(values).all():
-                raise _NativeResampleFallback(
-                    "native regular resampling requires finite input values for the typed buffer bridge"
-                )
-            raw_values, result_shape = native.resample_f32_buffer(
-                values,
-                list(values.shape),
-                lat,
-                lon,
+        spatial_items = tuple(plan.inspection.info.data_variables)
+        items_by_name = {item.name: item for item in spatial_items}
+        owner_groups = _owner_task_groups(spatial_items, plan)
+        total_tiles = _owner_task_count(owner_groups, plan.target)
+        tasks = iter(_owner_tasks(owner_groups, plan.target))
+        workers = max(1, min(int(plan.space_workers), total_tiles)) if total_tiles else 1
+        timing: dict[str, float | int] = {
+            "tiles": 0,
+            "tile_elapsed_seconds": 0.0,
+            "read_seconds": 0.0,
+            "resample_seconds": 0.0,
+            "write_seconds": 0.0,
+            "time_batches": 0,
+            "owner_chunks": 0,
+            "owner_buffer_bytes": 0,
+            "owner_buffer_peak_bytes": 0,
+            "owner_memmap_bytes": 0,
+        }
+
+        def run_task(task: _OwnerTask):
+            return _native_process_tile(
+                source,
+                output_group,
+                native,
+                plan,
+                task,
+                items_by_name,
+                source_lat,
+                source_lon,
                 target_lat,
                 target_lon,
-                "nearest" if plan.method.startswith("nearest") else "bilinear",
+                staging,
+                cancel_event,
             )
-            output_values = np.frombuffer(raw_values, dtype="float32").reshape(
-                tuple(int(value) for value in result_shape)
+
+        def add_metrics(metrics: dict[str, float | int]) -> None:
+            timing["tiles"] += 1
+            timing["tile_elapsed_seconds"] += float(metrics["elapsed"])
+            timing["read_seconds"] += float(metrics["read"])
+            timing["resample_seconds"] += float(metrics["resample"])
+            timing["write_seconds"] += float(metrics["write"])
+            timing["time_batches"] += int(metrics["time_batches"])
+            timing["owner_chunks"] += int(metrics["owner_chunks"])
+            timing["owner_buffer_bytes"] += int(metrics["owner_buffer_bytes"])
+            timing["owner_buffer_peak_bytes"] = max(
+                int(timing["owner_buffer_peak_bytes"]),
+                int(metrics["owner_buffer_peak_bytes"]),
             )
-            output_variable = xr.DataArray(
-                output_values,
-                dims=("time", "lat", "lon"),
-                attrs=dict(source[item.name].attrs),
-            )
-            source_fill = source[item.name].encoding.get("_FillValue")
-            if source_fill is not None:
-                output_variable.encoding["_FillValue"] = source_fill
-            variables[item.name] = output_variable
-        output = xr.Dataset(
-            variables,
-            coords={"time": source["time"].values, "lat": plan.target.lat, "lon": plan.target.lon},
-            attrs=dict(source.attrs),
-        )
-        for name, chunks in plan.output_chunks.items():
-            if name in output:
-                output[name].encoding["chunks"] = tuple(int(value) for value in chunks)
-        staging.mkdir(parents=False, exist_ok=False)
-        output.to_zarr(staging, mode="w", consolidated=False, zarr_format=3)
-        output.close()
+            timing["owner_memmap_bytes"] += int(metrics["owner_memmap_bytes"])
+
+        if workers == 1:
+            for task in tasks:
+                add_metrics(run_task(task))
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                pending = set()
+                for _ in range(min(workers * 2, total_tiles)):
+                    pending.add(executor.submit(run_task, next(tasks)))
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        add_metrics(future.result())
+                        try:
+                            pending.add(executor.submit(run_task, next(tasks)))
+                        except StopIteration:
+                            pass
         if cancel_event is not None and cancel_event.is_set():
-            raise ResampleExecutionError("任务已取消，未发布输出。")
+            raise ResampleExecutionError("任务已取消，未生成输出。")
         if config.validate:
             _validate_output(source, staging, plan)
-        publish_staging(staging, target_path, "resample-native", overwrite=config.overwrite, require_zarr_v3=True)
-        logical_bytes = sum(int(source[item.name].size) * 4 for item in plan.inspection.info.data_variables)
-        return {"backend": "rust", "backend_fallback": False, "output": str(target_path), "logical_bytes": logical_bytes, "physical_bytes": _directory_size(target_path), "method": plan.method}
+        logical_bytes = sum(
+            int(item.shape[0])
+            * int(plan.target.dimensions["lat"])
+            * int(plan.target.dimensions["lon"])
+            * np.dtype("float32").itemsize
+            for item in spatial_items
+        )
+        publish_staging(
+            staging,
+            target_path,
+            "resample-native",
+            overwrite=config.overwrite,
+            require_zarr_v3=True,
+        )
+        elapsed = time.perf_counter() - started
+        physical_bytes = _directory_size(target_path)
+        return {
+            "backend": "rust",
+            "backend_fallback": False,
+            "output": str(target_path),
+            "logical_bytes": logical_bytes,
+            "physical_bytes": physical_bytes,
+            "method": plan.method,
+            "wall_seconds": elapsed,
+            "throughput_mib_s": logical_bytes / 1024**2 / max(elapsed, 1e-9),
+            "physical_throughput_mib_s": physical_bytes / 1024**2 / max(elapsed, 1e-9),
+            "used_intermediate": False,
+            "logical_write_amplification": 1.0,
+            "avoided_intermediate_bytes": logical_bytes,
+            "space_workers": workers,
+            "tiles": int(timing["tiles"]),
+            "time_batches": int(timing["time_batches"]),
+            "owner_buffer": {
+                "logical_bytes": int(timing["owner_buffer_bytes"]),
+                "peak_bytes": int(timing["owner_buffer_peak_bytes"]),
+                "memmap_bytes": int(timing["owner_memmap_bytes"]),
+                "physical_chunks": int(timing["owner_chunks"]),
+            },
+            "tile_timing": timing,
+        }
+    except _NativeResampleFallback:
+        raise
     except Exception as exc:
         if cancel_event is not None and cancel_event.is_set():
             raise ResampleExecutionError("任务已取消，未生成输出。") from exc
@@ -2156,6 +2536,12 @@ def run_resample(
     validate_resampling_environment()
     plan = plan or plan_resample(config)
     requested_plan = plan
+    source_path = Path(config.input).expanduser().resolve()
+    target_path = Path(config.output).expanduser().resolve()
+    if source_path == target_path:
+        raise ResampleExecutionError("输入和输出不能是同一个目录。")
+    if source_path != plan.inspection.info.path:
+        raise ResampleExecutionError("输入检查结果与执行输入路径不一致。")
     native_operation = "resample.nearest" if plan.method.startswith("nearest") else "resample.bilinear"
     if (
         plan.method in {"nearest_s2d", "bilinear"}
@@ -2169,12 +2555,6 @@ def run_resample(
             return _run_native_regular_resample(config, plan, cancel_event=cancel_event)
         except _NativeResampleFallback:
             pass
-    source_path = Path(config.input).expanduser().resolve()
-    target_path = Path(config.output).expanduser().resolve()
-    if source_path == target_path:
-        raise ResampleExecutionError("输入和输出不能是同一个目录。")
-    if source_path != plan.inspection.info.path:
-        raise ResampleExecutionError("输入检查结果与执行输入路径不一致。")
     _prepare_target(target_path, config.overwrite)
     preflight_writable(target_path.parent, "重采样输出")
     temporary_root = _resolve_temporary_root(

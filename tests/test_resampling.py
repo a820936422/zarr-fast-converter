@@ -386,6 +386,50 @@ class ResamplingTests(unittest.TestCase):
             run_resample(ResampleConfig(native_source, cancelled, resolution=2.0, method="nearest_s2d"), cancel_event=event, progress=False)
         self.assertFalse(cancelled.exists())
 
+    def test_native_stream_batches_variables_and_spatial_regions(self) -> None:
+        native_source = ROOT / "native-batch.zarr"
+        native_output = ROOT / "native-batch-output.zarr"
+        with xr.open_zarr(ROOT / "input.zarr", consolidated=False, chunks=None) as dataset:
+            value = dataset["value"].fillna(0).astype("float32")
+            native_dataset = xr.Dataset(
+                {
+                    "value": value,
+                    "quality": value + np.float32(100.0),
+                },
+                coords={name: coordinate.copy(deep=False) for name, coordinate in dataset.coords.items()},
+                attrs=dict(dataset.attrs),
+            )
+            native_dataset.to_zarr(
+                native_source,
+                mode="w",
+                consolidated=False,
+                zarr_format=3,
+                encoding={
+                    "value": {"compressors": [], "chunks": (1, 2, 2)},
+                    "quality": {"compressors": [], "chunks": (1, 2, 2)},
+                },
+            )
+            native_dataset.close()
+        metrics = run_resample(
+            ResampleConfig(
+                native_source,
+                native_output,
+                resolution=1.0,
+                method="bilinear",
+                time_block=1,
+                space_workers=2,
+            ),
+            progress=False,
+        )
+        self.assertEqual(metrics["backend"], "rust")
+        self.assertEqual(metrics["tiles"], 4)
+        self.assertEqual(metrics["time_batches"], 8)
+        self.assertFalse(metrics["used_intermediate"])
+        self.assertEqual(metrics["logical_write_amplification"], 1.0)
+        self.assertEqual(metrics["owner_buffer"]["physical_chunks"], 16)
+        with xr.open_zarr(native_output, consolidated=False, chunks=None) as result:
+            np.testing.assert_allclose(result["quality"].values, result["value"].values + 100.0)
+
     def test_native_route_falls_back_for_nonfinite_typed_buffer_inputs(self) -> None:
         source = ROOT / "input.zarr"
         native_source = ROOT / "native-nan-source.zarr"

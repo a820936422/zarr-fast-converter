@@ -680,6 +680,22 @@ class RustResamplingTests(unittest.TestCase):
         self.assertEqual(tuple(shape), (1, 1, 1))
         self.assertFalse(result.flags.writeable)
         self.assertAlmostEqual(float(result[0, 0, 0]), 1.5)
+    def test_writable_typed_buffer_resampling_fills_output(self) -> None:
+        native = importlib.import_module("fast_nc_zarr._native")
+        values = np.asarray([0.0, 1.0, 2.0, 3.0], dtype="float32").reshape(1, 2, 2)
+        output = np.empty((1, 1, 1), dtype="float32")
+        shape = native.resample_f32_buffer_into(
+            values,
+            list(values.shape),
+            np.asarray([0.0, 1.0], dtype="float32"),
+            np.asarray([0.0, 1.0], dtype="float32"),
+            np.asarray([0.5], dtype="float32"),
+            np.asarray([0.5], dtype="float32"),
+            "bilinear",
+            output,
+        )
+        self.assertEqual(tuple(shape), (1, 1, 1))
+        self.assertAlmostEqual(float(output[0, 0, 0]), 1.5)
 
 if __name__ == "__main__":
     unittest.main()

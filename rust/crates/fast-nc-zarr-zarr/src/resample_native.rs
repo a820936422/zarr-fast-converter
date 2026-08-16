@@ -99,6 +99,35 @@ pub fn resample_f32_values(
     target_lon: &[f32],
     method: &str,
 ) -> Result<Vec<f32>, String> {
+    let output_values = shape[0]
+        .checked_mul(target_lat.len())
+        .and_then(|value| value.checked_mul(target_lon.len()))
+        .ok_or_else(|| "target shape element count overflows usize".to_owned())?;
+    let mut output = vec![0.0; output_values];
+    resample_f32_values_into(
+        values,
+        shape,
+        source_lat,
+        source_lon,
+        target_lat,
+        target_lon,
+        method,
+        &mut output,
+    )?;
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resample_f32_values_into(
+    values: &[f32],
+    shape: [usize; 3],
+    source_lat: &[f32],
+    source_lon: &[f32],
+    target_lat: &[f32],
+    target_lon: &[f32],
+    method: &str,
+    output: &mut [f32],
+) -> Result<(), String> {
     let expected_values = shape[0]
         .checked_mul(shape[1])
         .and_then(|value| value.checked_mul(shape[2]))
@@ -121,7 +150,10 @@ pub fn resample_f32_values(
         .checked_mul(target_lat.len())
         .and_then(|value| value.checked_mul(target_lon.len()))
         .ok_or_else(|| "target shape element count overflows usize".to_owned())?;
-    let mut output = Vec::with_capacity(output_values);
+    if output.len() != output_values {
+        return Err("native output buffer has an inconsistent element count".into());
+    }
+    let mut output_index = 0;
     for time in 0..shape[0] {
         for lat in &lat_brackets {
             for lon in &lon_brackets {
@@ -147,11 +179,12 @@ pub fn resample_f32_values(
                     }
                     _ => f32::NAN,
                 };
-                output.push(value);
+                output[output_index] = value;
+                output_index += 1;
             }
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 pub fn resample_f32(request: &ResampleF32Request) -> Result<ResampleF32Response, String> {
@@ -207,6 +240,32 @@ mod tests {
         })
         .unwrap();
         assert_eq!(response.values, vec![1.5]);
+    }
+    #[test]
+    fn writable_kernel_matches_allocating_kernel() {
+        let request = ResampleF32Request {
+            values: vec![0.0, 1.0, 2.0, 3.0],
+            shape: [1, 2, 2],
+            source_lat: vec![0.0, 1.0],
+            source_lon: vec![0.0, 1.0],
+            target_lat: vec![0.25, 0.75],
+            target_lon: vec![0.25, 0.75],
+            method: "bilinear".into(),
+        };
+        let expected = resample_f32(&request).unwrap().values;
+        let mut output = vec![0.0; expected.len()];
+        resample_f32_values_into(
+            &request.values,
+            request.shape,
+            &request.source_lat,
+            &request.source_lon,
+            &request.target_lat,
+            &request.target_lon,
+            &request.method,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output, expected);
     }
 
     #[test]
