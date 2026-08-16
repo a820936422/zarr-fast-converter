@@ -19,10 +19,11 @@ Rust desktop runtime
 - Zarr v3 结构检查；
 - Float32/Float64 chunk、region 和数组写入；
 - 单变量和多变量 Float32/Float64/标准整数重分块；
-- fill_value、scale_factor、add_offset 和 CF attrs 保持；
+- 单变量和多变量重分块保留 `fill_value`、`scale_factor`、`add_offset` 和 CF attrs；
 - zstd、Blosc 系列和 gzip 显式无损 codec；
 - 标准 NetCDF-4/classic 的 `time/lat/lon` 数值变量 metadata inspect 和 float32/float64 → Zarr v3 conversion；
-- float32 规则经纬度网格的 native nearest/bilinear，支持 latitude 方向和越界 NaN；
+- native NetCDF 转换将 float32/float64 的 CF packed 值解码为物理值，源 `_FillValue`、`scale_factor`、`add_offset` 等记录为 `source_*` 元数据；
+- float32 规则经纬度网格的 native nearest/bilinear 仅处理有限输入；含 CF packing 或非有限值时自动回退兼容路径，支持 latitude 方向和越界 NaN；
 - 有界并行、取消、进度、staging 校验和原子发布；
 - capability matrix、manifest 和事件证据。
 

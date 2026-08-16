@@ -109,6 +109,103 @@ class ResamplingTests(unittest.TestCase):
         masked = _mask_missing(variable, None)
         self.assertEqual(float(masked.values[0, 0]), 1.0)
         self.assertTrue(np.isnan(masked.values[0, 1]))
+    def test_nan_missing_value_is_normalized_during_output_validation(self) -> None:
+        source = ROOT / "nan-missing.zarr"
+        output = ROOT / "nan-missing-output.zarr"
+        dataset = xr.Dataset(
+            {
+                "value": (
+                    ("time", "lat", "lon"),
+                    np.arange(2 * 4 * 4, dtype="float32").reshape(2, 4, 4),
+                    {"missing_value": np.nan},
+                )
+            },
+            coords={
+                "time": np.arange(2, dtype="int64"),
+                "lat": np.asarray([3.5, 2.5, 1.5, 0.5], dtype="float32"),
+                "lon": np.asarray([0.5, 1.5, 2.5, 3.5], dtype="float32"),
+            },
+        )
+        dataset.to_zarr(
+            source,
+            mode="w",
+            consolidated=False,
+            zarr_format=3,
+            encoding={
+                "value": {
+                    "_FillValue": np.nan,
+                    "chunks": (1, 2, 2),
+                }
+            },
+        )
+        dataset.close()
+
+        metrics = run_resample(
+            ResampleConfig(source, output, resolution=2.0, method="bilinear"),
+            progress=False,
+        )
+
+        self.assertGreater(metrics["physical_bytes"], 0)
+        self.assertTrue(output.is_dir())
+        with xr.open_zarr(
+            output,
+            consolidated=False,
+            chunks=None,
+            decode_times=False,
+            mask_and_scale=False,
+        ) as result:
+            self.assertEqual(result["value"].attrs.get("missing_value"), None)
+            self.assertEqual(result["value"].attrs["resampling_method"], "bilinear")
+
+    def test_packed_source_is_decoded_and_output_metadata_is_canonical(self) -> None:
+        source = ROOT / "packed-source.zarr"
+        output = ROOT / "packed-output.zarr"
+        raw_values = np.asarray([[[1, 2], [3, 4]]], dtype="int16")
+        dataset = xr.Dataset(
+            {
+                "value": (
+                    ("time", "lat", "lon"),
+                    raw_values,
+                    {
+                        "scale_factor": 0.1,
+                        "add_offset": 273.15,
+                        "missing_value": -9999,
+                    },
+                )
+            },
+            coords={
+                "time": np.asarray([0], dtype="int64"),
+                "lat": np.asarray([0.0, 1.0], dtype="float32"),
+                "lon": np.asarray([0.0, 1.0], dtype="float32"),
+            },
+        )
+        dataset.to_zarr(
+            source,
+            mode="w",
+            consolidated=False,
+            zarr_format=3,
+            encoding={"value": {"_FillValue": -9999, "chunks": (1, 2, 2)}},
+        )
+        dataset.close()
+
+        run_resample(
+            ResampleConfig(source, output, resolution=1.0, method="bilinear"),
+            progress=False,
+        )
+
+        with xr.open_zarr(
+            output,
+            consolidated=False,
+            chunks=None,
+            decode_times=False,
+            mask_and_scale=False,
+        ) as result:
+            values = np.asarray(result["value"].values)
+            np.testing.assert_allclose(values, raw_values.astype("float64") * 0.1 + 273.15)
+            self.assertNotIn("scale_factor", result["value"].attrs)
+            self.assertNotIn("add_offset", result["value"].attrs)
+            self.assertNotIn("missing_value", result["value"].attrs)
+            self.assertTrue(np.isnan(result["value"].attrs["_FillValue"]))
 
     def test_grid_inspection_and_target_resolution(self) -> None:
         info, grid = inspect_grid(ROOT / "input.zarr")
@@ -119,6 +216,23 @@ class ResamplingTests(unittest.TestCase):
         target = build_target_grid(grid, 2.0)
         self.assertEqual(target.dimensions, {"lat": 2, "lon": 2})
         self.assertTrue(target.lat[0] > target.lat[-1])
+    def test_custom_extent_aligns_outward_to_target_resolution(self) -> None:
+        _info, grid = inspect_grid(ROOT / "input.zarr")
+        target = build_target_grid(
+            grid,
+            0.1,
+            extent="custom",
+            lat_bounds=(30.0, 89.975),
+            lon_bounds=(10.0, 20.025),
+            lat_descending=True,
+            lon_descending=False,
+        )
+        self.assertEqual(float(target.lat_bounds[0]), 90.0)
+        self.assertEqual(float(target.lat_bounds[-1]), 30.0)
+        self.assertEqual(float(target.lon_bounds[0]), 10.0)
+        self.assertEqual(float(target.lon_bounds[-1]), 20.1)
+        self.assertEqual(target.dimensions, {"lat": 600, "lon": 101})
+
 
     def test_plan_lists_xesmf_methods_and_preserves_chunks(self) -> None:
         inspection = inspect_resample_input(ROOT / "input.zarr")
@@ -271,6 +385,29 @@ class ResamplingTests(unittest.TestCase):
         with self.assertRaises(ResampleExecutionError):
             run_resample(ResampleConfig(native_source, cancelled, resolution=2.0, method="nearest_s2d"), cancel_event=event, progress=False)
         self.assertFalse(cancelled.exists())
+
+    def test_native_route_falls_back_for_nonfinite_typed_buffer_inputs(self) -> None:
+        source = ROOT / "input.zarr"
+        native_source = ROOT / "native-nan-source.zarr"
+        output = ROOT / "native-nan-output.zarr"
+        with xr.open_zarr(source, consolidated=False, chunks=None) as dataset:
+            nan_dataset = dataset[["value"]].copy()
+            nan_dataset["value"] = nan_dataset["value"] * np.nan
+            nan_dataset.to_zarr(
+                native_source,
+                mode="w",
+                consolidated=False,
+                zarr_format=3,
+                encoding={"value": {"compressors": []}},
+            )
+            nan_dataset.close()
+        run_resample(
+            ResampleConfig(native_source, output, resolution=2.0, method="bilinear"),
+            progress=False,
+        )
+        self.assertTrue(output.is_dir())
+        with xr.open_zarr(output, consolidated=False, chunks=None) as dataset:
+            self.assertTrue(np.isnan(dataset["value"].values).any())
 
     def test_before_and_after_literal_replacements_are_fused_into_tiles(self) -> None:
         output = ROOT / "replacement-literal.zarr"

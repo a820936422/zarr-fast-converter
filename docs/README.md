@@ -1,4 +1,4 @@
-# Fast NC Zarr v1.7.4 模块与运行指南
+# Fast NC Zarr v1.7.5 模块与运行指南
 
 本文档合并项目各模块的入口、核心约束和验证方式。项目总览、环境安装和快速示例见根目录 [README](../README.md)。IPC 定义见 [contracts/README.md](../contracts/README.md)；历史基线审查见 [全面代码审查报告](comprehensive-code-audit-2026-08-15.md)。
 
@@ -88,6 +88,8 @@ pixi run resample -- \
 
 执行器按空间 tile 和时间 block 流式运行，统一受 `EffectiveResourceBudget`、owner buffer、worker 和物理 chunk ownership 约束。缺失值会被掩码；目标范围超出源覆盖时不外推，未覆盖格点保持缺测。替换规则通过 `--before-conditions/--before-results` 与 `--after-conditions/--after-results` 成对提供。
 
+规则 float32 且无压缩的输入可走 Rust native 快速路径；该路径通过 typed buffer bridge 传递连续 float32 数据，避免 Python list/JSON 序列化。CF `scale_factor`、`add_offset`、非 NaN 缺失标记或非有限输入会回退 Python 路径，先解码并规范化为物理值，避免 metadata 语义丢失。
+
 ## 4. 重分块与重压缩
 
 入口：
@@ -150,16 +152,18 @@ cargo test -p fast-nc-zarr-desktop
 
 前端通过 Tauri commands 调用 Rust runtime；runtime 负责 worker、任务 registry、取消、资源快照、事件流、native capability 和恢复。主要 command 包括 `inspect_source`、`inspect_zarr`、`inspect_time_metadata`、`preview_pipeline`、`start_pipeline`、`resume_pipeline`、`start_native_task`、`list_tasks`、`get_task` 和 `cancel_task`。worker stdout 只承载 JSONL，诊断进入结构化事件或 stderr。
 
-## v1.7.4 Linux 发布范围
+## v1.7.5 Linux 发布范围
 
-v1.7.4 以 Linux `x86_64-unknown-linux-gnu` 为阻塞发布平台。发布前至少执行：
+v1.7.5 以 Linux `x86_64-unknown-linux-gnu` 为阻塞发布平台。发布前至少执行：
 
 ```bash
 pixi run version-check
+pixi run contract-check
 pixi run desktop-sidecar
 pixi run desktop-typecheck
 pixi run desktop-build
 pixi run tauri-build
+pixi run release-candidate
 ```
 
 安装后还需确认 bundled worker、字体、图标、前端资源和至少一个真实 Tauri/worker IPC 流程可以从发布包路径加载。未完成 native parity 的操作必须记录实际 backend 和 fallback reason，不能伪装成 native 成功。

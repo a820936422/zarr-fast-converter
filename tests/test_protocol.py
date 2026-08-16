@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import tomllib
 import json
 import os
 import math
+import tempfile
 import numpy as np
+import xarray as xr
 from pathlib import Path
 import subprocess
 import sys
@@ -79,6 +82,23 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertEqual([json.loads(item)["event"] for item in actual], ["accepted", "started", "finished"])
         self.assertEqual(json.loads(actual[-1])["payload"]["backend"], "python")
         self.assertEqual(len(expected), 2)
+    def test_project_metadata_declares_runtime_dependencies(self) -> None:
+        metadata = tomllib.loads((PROJECT / "pyproject.toml").read_text(encoding="utf-8"))
+        dependencies = set(metadata["project"]["dependencies"])
+        for requirement in (
+            "dask>=2026.7.1,<2027",
+            "h5netcdf>=1.8.1,<2",
+            "netCDF4>=1.7.4,<2",
+            "numpy>=2.4.6,<3",
+            "rioxarray>=0.23,<0.24",
+            "xarray>=2026.7,<2027",
+            "zarr>=3.3,<4",
+        ):
+            self.assertIn(requirement, dependencies)
+        self.assertEqual(
+            metadata["project"]["optional-dependencies"]["resampling"],
+            ["xesmf>=0.9.2,<0.10"],
+        )
 
 
 class DesktopWorkerTests(unittest.TestCase):
@@ -119,6 +139,12 @@ class DesktopWorkerTests(unittest.TestCase):
             {
                 "output": "/tmp/restored-controls.zarr",
                 "temporary_dir": "/tmp/processing",
+                "time_start": "2001-01-01",
+                "time_end": "2001-01-08",
+                "lat_min": 0.1,
+                "lat_max": 0.3,
+                "lon_min": -0.1,
+                "lon_max": 0.1,
                 "input_kind": "raw",
                 "variables": ["value"],
                 "variable_names": {"value": "renamed_value"},
@@ -144,6 +170,8 @@ class DesktopWorkerTests(unittest.TestCase):
                 "compression_shuffle": "noshuffle",
                 "compression_objective": "compact",
                 "compression_tune_budget": 30,
+                "strategy": "custom",
+                "custom_chunks": [4, 128, 256],
             }
         )
         transform = config.conversion.variable_transforms["value"]
@@ -156,12 +184,98 @@ class DesktopWorkerTests(unittest.TestCase):
         self.assertEqual(config.resampling.before_conditions, "<0")
         self.assertEqual(config.resampling.after_results, "100")
         self.assertEqual(config.general.temporary_dir, Path("/tmp/processing"))
+        self.assertEqual(config.chunking.strategy, "custom")
+        self.assertEqual(config.chunking.custom_chunks, (4, 128, 256))
+        self.assertEqual(config.general.time_start, "2001-01-01")
+        self.assertEqual(config.general.time_end, "2001-01-08")
+        self.assertEqual(config.general.lat_min, 0.1)
+        self.assertEqual(config.general.lat_max, 0.3)
+        self.assertEqual(config.general.lon_min, -0.1)
+        self.assertEqual(config.general.lon_max, 0.1)
         self.assertEqual(config.compression.profile, "balanced")
         self.assertEqual(config.compression.codec, "zstd")
         self.assertEqual(config.compression.level, 5)
         self.assertEqual(config.compression.shuffle, "noshuffle")
         self.assertEqual(config.compression.objective, "compact")
         self.assertEqual(config.compression.tune_budget, 30)
+    def test_run_pipeline_publishes_output_after_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-pipeline-") as raw:
+            root = Path(raw)
+            source = root / "source"
+            output = root / "result.zarr"
+            source.mkdir()
+            dataset = xr.Dataset(
+                {"value": (("time", "lat", "lon"), np.ones((1, 2, 2), dtype="float32"))},
+                coords={
+                    "time": np.asarray(["2001-01-01"], dtype="datetime64[ns]"),
+                    "lat": [10.0, 20.0],
+                    "lon": [30.0, 40.0],
+                },
+            )
+            dataset.to_netcdf(source / "sample.nc", engine="h5netcdf")
+            dataset.close()
+            environment = {**os.environ, "PYTHONPATH": str(PROJECT / "src")}
+
+            inspect = subprocess.run(
+                [sys.executable, "-m", "fast_nc_zarr.application.desktop_worker"],
+                cwd=PROJECT,
+                input=json.dumps(
+                    {
+                        "protocol_version": 1,
+                        "request_id": "inspect-launch",
+                        "command": "inspect_source",
+                        "payload": {
+                            "input_dir": str(source),
+                            "mode": "complete",
+                            "engine": "h5netcdf",
+                            "validation_mode": "fast",
+                        },
+                    }
+                )
+                + "\n",
+                text=True,
+                capture_output=True,
+                check=True,
+                env=environment,
+            )
+            inspection_events = [json.loads(line) for line in inspect.stdout.splitlines() if line.strip()]
+            snapshot = inspection_events[-1]["payload"]["inspection_snapshot_path"]
+
+            run = subprocess.run(
+                [sys.executable, "-m", "fast_nc_zarr.application.desktop_worker"],
+                cwd=PROJECT,
+                input=json.dumps(
+                    {
+                        "protocol_version": 1,
+                        "request_id": "run-launch",
+                        "task_id": "run-launch-task",
+                        "command": "run_pipeline",
+                        "payload": {
+                            "input_dir": str(source),
+                            "input_kind": "raw",
+                            "inspection_kind": "source",
+                            "inspection_snapshot_path": snapshot,
+                            "validate_snapshot": False,
+                            "variables": ["value"],
+                            "output": str(output),
+                            "temporary_dir": str(root / "temporary"),
+                            "backend": "auto",
+                            "validate": True,
+                            "resample": False,
+                            "rechunk": False,
+                            "recompress": False,
+                        },
+                    }
+                )
+                + "\n",
+                text=True,
+                capture_output=True,
+                check=True,
+                env=environment,
+            )
+            run_events = [json.loads(line) for line in run.stdout.splitlines() if line.strip()]
+            self.assertEqual(run_events[-1]["event"], "finished")
+            self.assertTrue((output / "zarr.json").is_file())
 
     def test_invalid_request_returns_structured_failure(self) -> None:
         result = subprocess.run(

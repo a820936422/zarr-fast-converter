@@ -42,7 +42,7 @@ from fast_nc_zarr.pipeline.models import (  # noqa: E402
     PipelineOperations,
     PipelineResamplingOptions,
 )
-from fast_nc_zarr.pipeline.planner import build_pipeline_plan  # noqa: E402
+from fast_nc_zarr.pipeline.planner import _axis_window, build_pipeline_plan
 from fast_nc_zarr.models import ConversionPlan, VariableSpec  # noqa: E402
 from fast_nc_zarr.resampling.environment import ResamplingEnvironmentError  # noqa: E402
 
@@ -783,6 +783,19 @@ class PipelineTests(unittest.TestCase):
                     plan.decision("resampling").disposition,
                     "executed_as_stage",
                 )
+
+    def test_bilinear_target_window_keeps_spatial_halo(self) -> None:
+        lat_values = np.asarray([0.25, 0.15, 0.05], dtype="float64")
+        lat_bounds = np.asarray([0.3, 0.2, 0.1, 0.0], dtype="float64")
+        start, stop, reason = _axis_window(
+            lat_values,
+            lat_bounds,
+            0.12,
+            0.22,
+            "bilinear",
+        )
+        self.assertEqual((start, stop), (0, 3))
+        self.assertIn("stencil", reason)
 
     def test_smaller_conversion_tasks_force_storage_finalization(self) -> None:
         inspection = inspect_source(

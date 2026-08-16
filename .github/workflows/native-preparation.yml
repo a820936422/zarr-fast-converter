@@ -28,6 +28,8 @@ jobs:
 
       - name: Check version consistency
         run: pixi run version-check
+      - name: Validate protocol schemas and fixtures
+        run: pixi run contract-check
       - name: Check native environment
         run: pixi run native-check
 
@@ -79,6 +81,14 @@ jobs:
         run: pixi run rust-desktop-test
       - name: Build Linux sidecar
         run: pixi run desktop-sidecar
+      - name: Verify sidecar artifact and checksum
+        shell: bash
+        run: |
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          sidecar="apps/desktop/src-tauri/binaries/fast-nc-zarr-worker-${target}"
+          test -x "$sidecar"
+          test -s "$sidecar.sha256"
+          (cd "$(dirname "$sidecar")" && sha256sum -c "$(basename "$sidecar.sha256")")
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

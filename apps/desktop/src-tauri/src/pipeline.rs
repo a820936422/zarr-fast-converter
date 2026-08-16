@@ -109,7 +109,10 @@ pub fn start_inspection(
     operation: String,
     payload: Map<String, Value>,
 ) -> Result<String, AppError> {
-    if !matches!(operation.as_str(), "inspect_time_metadata" | "inspect_source" | "inspect_zarr") {
+    if !matches!(
+        operation.as_str(),
+        "inspect_time_metadata" | "inspect_source" | "inspect_zarr"
+    ) {
         return Err(AppError::new(
             ErrorKind::InvalidRequest,
             format!("不支持的检查操作：{operation}"),

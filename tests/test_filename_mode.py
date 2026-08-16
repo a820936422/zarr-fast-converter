@@ -373,6 +373,35 @@ class FilenameModeTests(unittest.TestCase):
         self.assertEqual(inventory.variables["value"].attrs["_FillValue"], -1)
         self.assertEqual(inventory.variables["value"].attrs["scale_factor"], 0.01)
 
+    def test_rasterio_fallback_signature_includes_crs_and_transform(self) -> None:
+        from fast_nc_zarr import filename_mode
+
+        class FakeCrs:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def to_wkt(self) -> str:
+                return self.value
+
+        def dataset(crs: str, transform: tuple[float, ...]) -> SimpleNamespace:
+            return SimpleNamespace(
+                attrs={},
+                rio=SimpleNamespace(crs=FakeCrs(crs), transform=lambda: transform),
+            )
+
+        variables = (("band_data", "float32", ("lat", "lon"), (2, 3), ()),)
+        reference = filename_mode._append_filename_spatial_signature(
+            variables, dataset("EPSG:4326", (1.0, 0.0, 0.0, 0.0, -1.0, 2.0)), "rasterio"
+        )
+        different_crs = filename_mode._append_filename_spatial_signature(
+            variables, dataset("EPSG:3857", (1.0, 0.0, 0.0, 0.0, -1.0, 2.0)), "rasterio"
+        )
+        different_transform = filename_mode._append_filename_spatial_signature(
+            variables, dataset("EPSG:4326", (2.0, 0.0, 0.0, 0.0, -1.0, 2.0)), "rasterio"
+        )
+        self.assertNotEqual(reference, different_crs)
+        self.assertNotEqual(reference, different_transform)
+
     def test_rasterio_low_level_metadata_scan_avoids_xarray(self) -> None:
         try:
             import rasterio

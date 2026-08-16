@@ -1,12 +1,14 @@
 mod resample_native;
 
-pub use resample_native::{resample_f32, ResampleF32Request, ResampleF32Response};
+pub use resample_native::{
+    resample_f32, resample_f32_values, ResampleF32Request, ResampleF32Response,
+};
 
 mod netcdf_native;
 
 pub use netcdf_native::{
-    convert_netcdf_to_zarr, inspect_netcdf, NetcdfConversionSummary, NetcdfDimensionSummary,
-    NetcdfSummary, NetcdfVariableSummary,
+    convert_netcdf_to_zarr, convert_netcdf_to_zarr_with_cancellation, inspect_netcdf,
+    NetcdfConversionSummary, NetcdfDimensionSummary, NetcdfSummary, NetcdfVariableSummary,
 };
 
 use fast_nc_zarr_model::{
@@ -139,6 +141,9 @@ fn cancellation_requested(plan: &RechunkExecutionPlan) -> bool {
     plan.cancellation_file
         .as_deref()
         .is_some_and(|path| Path::new(path).is_file())
+}
+fn cancellation_file_requested(path: Option<&Path>) -> bool {
+    path.is_some_and(|path| path.is_file())
 }
 
 fn validate_codec_shuffle(value: &str) -> Result<()> {
@@ -418,6 +423,20 @@ pub fn write_f64_array(
     chunks: &[u64],
     values: &[f64],
 ) -> Result<()> {
+    write_f64_array_with_cancellation(root, array_path, shape, chunks, values, None)
+}
+
+pub fn write_f64_array_with_cancellation(
+    root: impl AsRef<Path>,
+    array_path: &str,
+    shape: &[u64],
+    chunks: &[u64],
+    values: &[f64],
+    cancellation_file: Option<&Path>,
+) -> Result<()> {
+    if cancellation_file_requested(cancellation_file) {
+        return Err(ZarrError::message("任务已取消"));
+    }
     if shape.is_empty() || shape.len() != chunks.len() {
         return Err(ZarrError::message(
             "shape and chunks must have the same non-zero dimensionality",
@@ -452,6 +471,9 @@ pub fn write_f64_array(
     } else {
         fs::create_dir_all(root).map_err(ZarrError::from_display)?;
     }
+    if cancellation_file_requested(cancellation_file) {
+        return Err(ZarrError::message("任务已取消"));
+    }
 
     let store = Arc::new(FilesystemStore::new(root).map_err(ZarrError::from_display)?);
     let group = GroupBuilder::new()
@@ -484,6 +506,9 @@ pub fn write_f64_array(
         .collect::<Result<Vec<_>>>()?;
     let mut chunk_indices = vec![0_usize; grid_shape.len()];
     loop {
+        if cancellation_file_requested(cancellation_file) {
+            return Err(ZarrError::message("任务已取消"));
+        }
         let chunk_indices_u64 = chunk_indices
             .iter()
             .map(|value| {
@@ -500,6 +525,9 @@ pub fn write_f64_array(
         if !increment_index(&mut chunk_indices, &grid_shape) {
             break;
         }
+    }
+    if cancellation_file_requested(cancellation_file) {
+        return Err(ZarrError::message("任务已取消"));
     }
     Ok(())
 }
@@ -810,7 +838,12 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
                         )
                             as std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(ZarrError::message(format!(
+                            "unsupported Rust codec: {}",
+                            plan.codec
+                        )))
+                    }
                 };
                 vec![codec]
             }
@@ -819,7 +852,12 @@ pub fn rechunk_f32_array(plan: &RechunkExecutionPlan) -> Result<RechunkMetrics> 
                     .map_err(ZarrError::from_display)?,
             )
                 as std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>],
-            _ => unreachable!(),
+            _ => {
+                return Err(ZarrError::message(format!(
+                    "unsupported Rust codec: {}",
+                    plan.codec
+                )))
+            }
         };
         array_builder.bytes_to_bytes_codecs(codecs);
     }
@@ -1200,7 +1238,12 @@ fn configure_rechunk_codecs(builder: &mut ArrayBuilder, plan: &RechunkExecutionP
                     .map_err(ZarrError::from_display)?,
             )
                 as std::sync::Arc<dyn zarrs::array::BytesToBytesCodecTraits>],
-            _ => unreachable!(),
+            _ => {
+                return Err(ZarrError::message(format!(
+                    "unsupported Rust codec: {}",
+                    plan.codec
+                )))
+            }
         };
     builder.bytes_to_bytes_codecs(codecs);
     Ok(())

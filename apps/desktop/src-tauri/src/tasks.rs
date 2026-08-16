@@ -148,31 +148,32 @@ impl TaskRegistry {
         Ok(tasks)
     }
 
-    pub fn cancellation_file(&self, task_id: &str) -> Result<Option<PathBuf>, AppError> {
-        if !valid_task_id(task_id) {
-            return Ok(None);
-        }
-        Ok(self.get(task_id)?.and_then(|task| {
-            if matches!(task.status, TaskStatus::Running | TaskStatus::Cancelling) {
-                Some(cancellation_path(task_id))
-            } else {
-                None
-            }
-        }))
-    }
-
-    pub fn mark_cancelling(&self, task_id: &str) -> Result<(), AppError> {
+    pub fn request_cancellation(&self, task_id: &str) -> Result<(), AppError> {
+        let path = cancellation_path(task_id);
         self.update(|tasks| {
             let task = tasks.get_mut(task_id).ok_or_else(|| {
                 AppError::new(ErrorKind::PathNotFound, format!("unknown task: {task_id}"))
             })?;
-            if task.status == TaskStatus::Running {
-                task.status = TaskStatus::Cancelling;
+            if !matches!(task.status, TaskStatus::Running | TaskStatus::Cancelling) {
+                return Err(AppError::new(
+                    ErrorKind::InvalidRequest,
+                    "task is no longer cancellable",
+                ));
             }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut marker = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)?;
+            marker.write_all(b"cancel")?;
+            marker.flush()?;
+            task.status = TaskStatus::Cancelling;
             Ok(())
         })
     }
-
     pub fn update_resource(
         &self,
         task_id: &str,
@@ -578,22 +579,7 @@ pub fn cancel_task(
     app: AppHandle,
     registry: State<'_, TaskRegistry>,
 ) -> Result<(), AppError> {
-    let path = registry.cancellation_file(&task_id)?.ok_or_else(|| {
-        AppError::new(ErrorKind::InvalidRequest, "task has no cancellation handle")
-    })?;
-    let mut marker = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .or_else(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(fs::OpenOptions::new().write(true).open(&path)?)
-            } else {
-                Err(error)
-            }
-        })?;
-    marker.write_all(b"cancel")?;
-    registry.mark_cancelling(&task_id)?;
+    registry.request_cancellation(&task_id)?;
     app.emit("task-cancel-requested", &task_id)
         .map_err(|error| AppError::new(ErrorKind::Unknown, error.to_string()))?;
     Ok(())
@@ -603,13 +589,6 @@ pub(crate) fn cancellation_path(task_id: &str) -> PathBuf {
     std::env::temp_dir()
         .join("fast-nc-zarr-tauri")
         .join(format!("{task_id}.cancel"))
-}
-
-fn valid_task_id(task_id: &str) -> bool {
-    !task_id.is_empty()
-        && task_id
-            .bytes()
-            .all(|value| value.is_ascii_alphanumeric() || value == b'-' || value == b'_')
 }
 
 #[cfg(test)]
@@ -665,6 +644,40 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_request_is_atomic_with_terminal_state() {
+        let task_id = "atomic-cancel-task";
+        let state = temp_path("atomic-cancel");
+        let path = cancellation_path(task_id);
+        let _ = fs::remove_file(&path);
+        let registry = TaskRegistry::with_state_path(state.clone());
+        registry
+            .insert(task(task_id, path.to_str().expect("utf8 path")))
+            .expect("insert task");
+        registry
+            .request_cancellation(task_id)
+            .expect("request cancellation");
+        let current = registry
+            .get(task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(current.status, TaskStatus::Cancelling);
+        assert_eq!(
+            fs::read(&path).expect("read cancellation marker"),
+            b"cancel"
+        );
+
+        registry
+            .update_terminal(task_id, Some(&finished_event(task_id)))
+            .expect("terminal update");
+        let error = registry
+            .request_cancellation(task_id)
+            .expect_err("finished task must not accept cancellation");
+        assert_eq!(error.kind, ErrorKind::InvalidRequest);
+        assert!(!path.exists());
+        let _ = fs::remove_file(state);
+    }
+
+    #[test]
     fn terminal_transition_cleans_cancellation_and_manifest() {
         let task_id = "terminal-task";
         let state = temp_path("terminal");
@@ -686,10 +699,6 @@ mod tests {
         assert_eq!(current.manifest.as_deref(), Some("/tmp/manifest.json"));
         assert!(current.cancellation_file.is_none());
         assert!(!path.exists());
-        assert!(registry
-            .cancellation_file(task_id)
-            .expect("cancel handle")
-            .is_none());
         let _ = fs::remove_file(state);
     }
 

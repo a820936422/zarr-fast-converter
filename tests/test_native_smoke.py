@@ -153,6 +153,61 @@ class RustNetcdfInspectTests(unittest.TestCase):
                 self.assertEqual(result["lon"].dtype, np.dtype("int32"))
                 self.assertEqual(result["value"].attrs["long_name"], "relative humidity")
 
+    def test_convert_preserves_packed_float_semantics(self) -> None:
+        import netCDF4
+
+        with tempfile.TemporaryDirectory(prefix="fast-nc-zarr-packed-netcdf-") as directory:
+            path = Path(directory) / "packed.nc"
+            target = Path(directory) / "packed.zarr"
+            raw = np.asarray([1.0, 2.0, -9999.0, 4.0], dtype="float32").reshape(1, 2, 2)
+            with netCDF4.Dataset(path, "w", format="NETCDF4_CLASSIC") as dataset:
+                dataset.createDimension("time", 1)
+                dataset.createDimension("lat", 2)
+                dataset.createDimension("lon", 2)
+                dataset.createVariable("time", "i2", ("time",))[:] = [0]
+                dataset.createVariable("lat", "f4", ("lat",))[:] = [0, 1]
+                dataset.createVariable("lon", "f4", ("lon",))[:] = [0, 1]
+                value = dataset.createVariable(
+                    "value", "f4", ("time", "lat", "lon"), fill_value=-9999.0
+                )
+                value.set_auto_maskandscale(False)
+                value.scale_factor = 0.1
+                value.add_offset = 273.15
+                value[:] = raw
+            native = importlib.import_module("fast_nc_zarr._native")
+            metrics = json.loads(native.convert_netcdf_json(str(path), str(target)))
+            self.assertEqual(metrics["variables"], ["time", "lat", "lon", "value"])
+            expected = raw.astype("float64") * 0.1 + 273.15
+            expected[0, 1, 0] = np.nan
+            with xr.open_zarr(
+                target,
+                consolidated=False,
+                chunks=None,
+                decode_times=False,
+                mask_and_scale=False,
+            ) as result:
+                np.testing.assert_allclose(
+                    result["value"].values,
+                    expected.astype("float32"),
+                    equal_nan=True,
+                )
+                self.assertNotIn("scale_factor", result["value"].attrs)
+                self.assertNotIn("add_offset", result["value"].attrs)
+                self.assertEqual(result["value"].attrs["source_scale_factor"], 0.1)
+                self.assertEqual(result["value"].attrs["source_add_offset"], 273.15)
+            with xr.open_zarr(
+                target,
+                consolidated=False,
+                chunks=None,
+                decode_times=False,
+                mask_and_scale=True,
+            ) as decoded_result:
+                np.testing.assert_allclose(
+                    decoded_result["value"].values,
+                    expected.astype("float32"),
+                    equal_nan=True,
+                )
+
 @unittest.skipUnless(_RUST_ZARR_READY, "Rust Zarr native extension is not built")
 class RustZarrCrossBackendTests(unittest.TestCase):
     @classmethod
@@ -609,6 +664,22 @@ class RustResamplingTests(unittest.TestCase):
         request["method"] = "nearest"
         nearest = json.loads(native.resample_f32_json(json.dumps(request)))
         self.assertEqual(nearest["values"], [0.0])
+    def test_typed_buffer_resampling_matches_json_contract(self) -> None:
+        native = importlib.import_module("fast_nc_zarr._native")
+        values = np.asarray([0.0, 1.0, 2.0, 3.0], dtype="float32").reshape(1, 2, 2)
+        raw_values, shape = native.resample_f32_buffer(
+            values,
+            list(values.shape),
+            np.asarray([0.0, 1.0], dtype="float32"),
+            np.asarray([0.0, 1.0], dtype="float32"),
+            np.asarray([0.5], dtype="float32"),
+            np.asarray([0.5], dtype="float32"),
+            "bilinear",
+        )
+        result = np.frombuffer(raw_values, dtype="float32").reshape(shape)
+        self.assertEqual(tuple(shape), (1, 1, 1))
+        self.assertFalse(result.flags.writeable)
+        self.assertAlmostEqual(float(result[0, 0, 0]), 1.5)
 
 if __name__ == "__main__":
     unittest.main()

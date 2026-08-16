@@ -132,6 +132,39 @@ function parseOptionalNumber(value: string, label: string): number | "nan" | und
   if (!Number.isFinite(result)) throw new Error(`${label} 必须是有限数值或 nan。`);
   return result;
 }
+function parseCoordinateBound(value: string, label: string, minimum: number, maximum: number): number {
+  const text = value.trim();
+  if (!text) throw new Error(`请输入${label}。`);
+  const result = Number(text);
+  if (!Number.isFinite(result) || result < minimum || result > maximum) {
+    throw new Error(`${label}必须位于 ${minimum} 到 ${maximum} 之间。`);
+  }
+  return result;
+}
+function parsePositiveInteger(value: string, label: string): number {
+  const text = value.trim();
+  const result = Number(text);
+  if (!text || !Number.isInteger(result) || result <= 0) {
+    throw new Error(`${label}必须是正整数。`);
+  }
+  return result;
+}
+function validateDateBoundary(value: string, label: string): string {
+  const text = value.trim();
+  const match = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(text);
+  if (!match) throw new Error(`${label}请输入 YYYY、YYYY-MM 或 YYYY-MM-DD。`);
+  const year = Number(match[1]);
+  const month = match[2] ? Number(match[2]) : null;
+  const day = match[3] ? Number(match[3]) : null;
+  if (year < 1 || (month !== null && (month < 1 || month > 12))) {
+    throw new Error(`${label}不是有效日期。`);
+  }
+  if (day !== null) {
+    const lastDay = new Date(Date.UTC(year, month || 1, 0)).getUTCDate();
+    if (day < 1 || day > lastDay) throw new Error(`${label}不是有效日期。`);
+  }
+  return text;
+}
 
 function parseFillValues(value: string, label: string): Array<number | "nan"> | undefined {
   const text = value.trim();
@@ -156,6 +189,7 @@ type InputKind = "source" | "zarr";
 type InspectionStage = "input" | "time" | "structure";
 type View = "overview" | "inspection" | "pipeline" | "tasks" | "settings";
 type BackendMode = "auto" | "rust";
+type ChunkStrategy = "time" | "space" | "custom";
 type IconName =
   | "activity"
   | "archive"
@@ -276,6 +310,168 @@ function StructuredTimeInspection({ inspection }: { inspection: TimeInspection }
     </div>
   );
 }
+function planValueText(value: unknown, fallback = "—"): string {
+  if (value === null || value === undefined || value === "") return fallback;
+  if (Array.isArray(value)) return value.map((item) => planValueText(item, "")).join(" × ") || fallback;
+  if (typeof value === "number") return Number.isFinite(value) ? value.toLocaleString() : fallback;
+  if (typeof value === "boolean") return value ? "是" : "否";
+  return String(value);
+}
+
+function planTuple(value: unknown): string {
+  return Array.isArray(value) ? value.map((item) => planValueText(item)).join(" × ") : planValueText(value);
+}
+function planAxisSummary(value: unknown): string {
+  if (!Array.isArray(value) || value.length === 0) return "—";
+  const first = planValueText(value[0]);
+  const last = planValueText(value[value.length - 1]);
+  return `${first} → ${last}（${value.length.toLocaleString()} 个边界）`;
+}
+
+type PipelineTargetSummary = {
+  timeStart: string;
+  timeEnd: string;
+  spatialEnabled: boolean;
+  latMin: string;
+  latMax: string;
+  lonMin: string;
+  lonMax: string;
+  resolution: number;
+  automaticResample: boolean;
+};
+
+function planOperationLabel(operation: string): string {
+  return {
+    conversion: "格式转换",
+    resampling: "空间重采样",
+    rechunking: "重分块",
+    recompression: "重压缩",
+  }[operation] || operation;
+}
+
+function planDispositionLabel(disposition: string): string {
+  return {
+    executed_as_stage: "执行阶段",
+    not_requested: "未请求",
+    skipped: "跳过",
+    reused: "复用已有结果",
+  }[disposition] || disposition;
+}
+
+function StructuredPipelinePlan({ plan, target }: { plan: Record<string, unknown>; target: PipelineTargetSummary }) {
+  const targetGrid = asRecord(plan.target_grid);
+  const sourceWindow = asRecord(plan.source_read_window);
+  const sourceSelection = asRecord(plan.source_selection);
+  const inputInfo = asRecord(plan.input_info);
+  const chunkPlan = asRecord(plan.final_chunk_plan);
+  const compression = asRecord(plan.final_compression);
+  const outputLayout = asRecord(plan.output_layout);
+  const variables = Array.isArray(outputLayout?.variables)
+    ? outputLayout.variables.flatMap((item) => {
+      const record = asRecord(item);
+      return record ? [record] : [];
+    })
+    : [];
+  const decisions = Array.isArray(plan.operation_decisions)
+    ? plan.operation_decisions.flatMap((item) => {
+      const record = asRecord(item);
+      return record ? [record] : [];
+    })
+    : [];
+  const dimensions = asRecord(inputInfo?.dimensions);
+  const dataVariables = Array.isArray(inputInfo?.variables)
+    ? inputInfo.variables.flatMap((item) => {
+      const record = asRecord(item);
+      return record && record.is_coord !== true ? [record] : [];
+    })
+    : [];
+  const targetShape = targetGrid
+    ? `${Array.isArray(targetGrid.lat) ? targetGrid.lat.length : "—"} × ${Array.isArray(targetGrid.lon) ? targetGrid.lon.length : "—"}`
+    : planTuple(inputInfo?.shape || (dimensions ? Object.values(dimensions) : undefined));
+  const planKind = sourceSelection ? "原始数据转换" : "现有 Zarr 处理";
+  const warning = typeof plan.coverage_warning === "string" ? plan.coverage_warning : null;
+  const axisReversals = Array.isArray(outputLayout?.axis_reversals) ? outputLayout.axis_reversals : [];
+  return (
+    <div className="structured-plan-report">
+      <div className="inspection-report-grid">
+        <div><span>计划类型</span><strong>{planKind}</strong><small>检查 ID · {planValueText(plan.inspection_id)}</small></div>
+        <div><span>目标形状</span><strong>{targetShape}</strong><small>{targetGrid ? planValueText(targetGrid.extent, "自定义网格") : "沿用现有数据维度"}</small></div>
+        <div><span>空间重采样</span><strong>{plan.needs_resample ? "需要执行" : "不需要"}</strong><small>{plan.needs_resample ? "将生成目标网格" : "保持源网格"}</small></div>
+        <div><span>最终发布</span><strong>{plan.direct_finalization ? "直接发布" : plan.finalization_required ? "需要发布阶段" : "按计划完成"}</strong><small>{axisReversals.length ? `轴方向调整：${axisReversals.join("、")}` : "无轴方向调整"}</small></div>
+      </div>
+      <section className="report-section">
+        <div className="report-section-heading"><strong>输出目标范围</strong><span>{target.automaticResample ? "自动规划重采样" : "按源网格裁剪"}</span></div>
+        <div className="report-detail-grid">
+          <div className="wide"><span>目标时间段</span><strong>{target.timeStart && target.timeEnd ? `${target.timeStart} → ${target.timeEnd}` : "全部时间"}</strong></div>
+          <div><span>目标纬度范围</span><strong>{target.spatialEnabled ? `${target.latMin}° → ${target.latMax}°` : "源数据范围"}</strong></div>
+          <div><span>目标经度范围</span><strong>{target.spatialEnabled ? `${target.lonMin}° → ${target.lonMax}°` : "源数据范围"}</strong></div>
+          <div><span>目标空间分辨率</span><strong>{target.spatialEnabled || target.automaticResample ? `${planValueText(target.resolution)}°` : "源分辨率"}</strong></div>
+        </div>
+      </section>
+
+      {targetGrid && (
+        <section className="report-section">
+          <div className="report-section-heading"><strong>目标空间网格</strong><span>{planValueText(targetGrid.extent, "自定义")}</span></div>
+          <div className="report-detail-grid">
+            <div><span>纬度点数</span><strong>{Array.isArray(targetGrid.lat) ? targetGrid.lat.length.toLocaleString() : "—"}</strong><small>{planValueText(targetGrid.lat_resolution)}° 分辨率</small></div>
+            <div><span>经度点数</span><strong>{Array.isArray(targetGrid.lon) ? targetGrid.lon.length.toLocaleString() : "—"}</strong><small>{planValueText(targetGrid.lon_resolution)}° 分辨率</small></div>
+            <div className="wide"><span>纬度范围</span><strong>{planAxisSummary(targetGrid.lat_bounds)}</strong></div>
+            <div className="wide"><span>经度范围</span><strong>{planAxisSummary(targetGrid.lon_bounds)}</strong></div>
+          </div>
+        </section>
+      )}
+
+      <section className="report-section">
+        <div className="report-section-heading"><strong>{sourceSelection ? "源数据读取窗口" : "输入 Zarr 结构"}</strong><span>{sourceSelection ? `${planValueText(sourceSelection.variables && Array.isArray(sourceSelection.variables) ? sourceSelection.variables.length : 0)} 个变量` : `${dataVariables.length} 个数据变量`}</span></div>
+        <div className="report-detail-grid">
+          {sourceSelection ? (
+            <>
+              <div><span>变量</span><strong>{planValueText(sourceSelection.variables)}</strong></div>
+              <div><span>时间范围</span><strong>{planValueText(sourceSelection.time_start)} – {planValueText(sourceSelection.time_stop)}</strong></div>
+              <div><span>纬度索引</span><strong>{planValueText(sourceSelection.lat_start)} – {planValueText(sourceSelection.lat_stop)}</strong></div>
+              <div><span>经度索引</span><strong>{planValueText(sourceSelection.lon_start)} – {planValueText(sourceSelection.lon_stop)}</strong></div>
+              {sourceWindow && <div className="wide"><span>窗口策略</span><strong>{planValueText(sourceWindow.method)} · {planValueText(sourceWindow.halo_description)}</strong></div>}
+            </>
+          ) : (
+            <>
+              <div><span>数据维度</span><strong>{dimensions ? Object.entries(dimensions).map(([key, value]) => `${key}=${planValueText(value)}`).join(" · ") : "—"}</strong></div>
+              <div><span>输入形状</span><strong>{planTuple(inputInfo?.shape)}</strong></div>
+              <div className="wide"><span>数据变量</span><strong>{dataVariables.map((item) => planValueText(item.name)).join("、") || "—"}</strong></div>
+            </>
+          )}
+        </div>
+      </section>
+
+      <section className="report-section">
+        <div className="report-section-heading"><strong>执行阶段</strong><span>{decisions.length} 项操作</span></div>
+        {decisions.length ? (
+          <div className="plan-decision-list">
+            {decisions.map((decision) => {
+              const operation = planValueText(decision.operation);
+              const disposition = planValueText(decision.disposition);
+              return <div className="plan-decision" key={operation}><div><strong>{planOperationLabel(operation)}</strong><small>{planValueText(decision.reason)}</small></div><span className={`plan-decision-badge ${disposition === "not_requested" ? "muted" : "active"}`}>{planDispositionLabel(disposition)}</span></div>;
+            })}
+          </div>
+        ) : <p className="report-empty">计划没有返回操作决策。</p>}
+      </section>
+
+      <section className="report-section">
+        <div className="report-section-heading"><strong>存储布局</strong><span>{variables.length || dataVariables.length} 个变量</span></div>
+        <div className="plan-storage-summary">
+          <div><span>转换 chunks</span><strong>{planTuple(plan.conversion_chunks)}</strong></div>
+          <div><span>最终 chunks</span><strong>{planTuple(plan.final_chunks)}</strong></div>
+          <div><span>压缩方案</span><strong>{planValueText(compression?.profile, "默认")}</strong><small>{planValueText(compression?.codec)} · {planValueText(compression?.shuffle)}</small></div>
+          <div><span>分块策略</span><strong>{planValueText(chunkPlan?.strategy, "标准")}</strong><small>{planValueText(chunkPlan?.estimated_chunk_bytes)} bytes / chunk</small></div>
+        </div>
+        {variables.length ? <div className="plan-variable-list">{variables.map((variable) => <div className="plan-variable-card" key={planValueText(variable.output_name)}><div className="plan-variable-head"><strong>{planValueText(variable.output_name)}</strong><span>{variable.is_coord ? "坐标" : "数据"}</span></div><div><span>{planValueText(variable.dtype)}</span><span>维度 {planValueText(variable.dims)}</span><span>形状 {planTuple(variable.shape)}</span></div><small>chunks {planTuple(variable.chunks)}{asRecord(variable.codec) ? ` · ${planValueText(asRecord(variable.codec)?.kind)}` : ""}</small></div>)}</div> : <p className="report-empty">暂无变量布局详情。</p>}
+      </section>
+
+      {warning && <div className="plan-warning"><Icon name="activity" size={14} /><span>{warning}</span></div>}
+      <details className="raw-plan-report"><summary>查看原始计划 JSON</summary><pre>{JSON.stringify(plan, null, 2)}</pre></details>
+    </div>
+  );
+}
+
 
 function progressStatusLabel(status: InspectionProgressStatus): string {
   return { starting: "正在启动", running: "后端执行中", cancelling: "正在取消", finished: "检查完成", failed: "检查失败", cancelled: "已取消" }[status];
@@ -380,6 +576,33 @@ function eventText(event: TaskEvent): string {
   }
   return event.stage || "任务事件";
 }
+function pathBaseName(value: string): string {
+  const trimmed = value.replace(/[\\/]+$/, "");
+  return trimmed.split(/[\\/]/).pop() || "output";
+}
+
+function pathParent(value: string): string {
+  const trimmed = value.replace(/[\\/]+$/, "");
+  const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return index >= 0 ? trimmed.slice(0, index) || trimmed.slice(0, 1) : ".";
+}
+
+function joinPath(parent: string, child: string): string {
+  const separator = parent.includes("\\") && !parent.includes("/") ? "\\" : "/";
+  const trimmed = parent.replace(/[\\/]+$/, "");
+  return `${trimmed}${trimmed ? separator : separator}${child}`;
+}
+
+function outputStoreName(inputPath: string, inputKind: InputKind): string {
+  const base = pathBaseName(inputPath).replace(/\.zarr$/i, "") || "output";
+  return inputKind === "zarr" ? `${base}-processed.zarr` : `${base}.zarr`;
+}
+
+function defaultOutputPath(inputPath: string, inputKind: InputKind): string {
+  if (!inputPath) return "";
+  return joinPath(pathParent(inputPath), outputStoreName(inputPath, inputKind));
+}
+
 
 function App() {
   const [backend, setBackend] = useState<BackendInfo | null>(null);
@@ -417,15 +640,27 @@ function App() {
   const [resample, setResample] = useState(false);
   const [resampleMethod, setResampleMethod] = useState("bilinear");
   const [resolution, setResolution] = useState(0.1);
+  const [targetTimeStart, setTargetTimeStart] = useState("");
+  const [targetTimeEnd, setTargetTimeEnd] = useState("");
+  const [targetSpatialEnabled, setTargetSpatialEnabled] = useState(false);
+  const [targetLatMin, setTargetLatMin] = useState("");
+  const [targetLatMax, setTargetLatMax] = useState("");
+  const [targetLonMin, setTargetLonMin] = useState("");
+  const [targetLonMax, setTargetLonMax] = useState("");
   const [skipna, setSkipna] = useState(true);
   const [naThres, setNaThres] = useState(1);
   const [computeDtype, setComputeDtype] = useState("source");
   const [beforeConditions, setBeforeConditions] = useState("");
   const [beforeResults, setBeforeResults] = useState("");
+  const [pipelineTaskId, setPipelineTaskId] = useState<string | null>(null);
   const [afterConditions, setAfterConditions] = useState("");
   const [afterResults, setAfterResults] = useState("");
   const [rechunk, setRechunk] = useState(false);
   const [targetMib, setTargetMib] = useState(128);
+  const [chunkStrategy, setChunkStrategy] = useState<ChunkStrategy>("time");
+  const [customChunkTime, setCustomChunkTime] = useState("");
+  const [customChunkLat, setCustomChunkLat] = useState("");
+  const [customChunkLon, setCustomChunkLon] = useState("");
   const [recompress, setRecompress] = useState(false);
   const [compression, setCompression] = useState("auto");
   const [compressionCodec, setCompressionCodec] = useState("");
@@ -440,7 +675,7 @@ function App() {
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) {
-      setBackend({ app: "fast-nc-zarr", version: "1.7.4", runtime: "browser-preview" });
+      setBackend({ app: "fast-nc-zarr", version: "1.7.5", runtime: "browser-preview" });
       return;
     }
     void getBackendInfo().then(setBackend).catch((reason: unknown) => setBackendError(reasonText(reason)));
@@ -541,6 +776,16 @@ function App() {
       setInspectionTaskOperation(null);
     }
   }, [events, inputPath, inspectionTaskId, inspectionTaskOperation]);
+  useEffect(() => {
+    if (!pipelineTaskId) return;
+    const event = [...events].reverse().find((item) => item.task_id === pipelineTaskId);
+    if (!event || !["finished", "failed", "cancelled"].includes(event.event)) return;
+    if (event.event === "failed") {
+      const failure = asRecord(event.payload.error);
+      setError(failure ? reasonText(failure) : "数据处理失败，请打开任务中心查看后端事件。");
+    }
+    setPipelineTaskId(null);
+  }, [events, pipelineTaskId]);
 
   useEffect(() => {
     try {
@@ -579,11 +824,28 @@ function App() {
     setVariableNames({});
     setVariableTransforms({});
     setPlan(null);
+    setTargetTimeStart("");
+    setTargetTimeEnd("");
+    setTargetSpatialEnabled(false);
+    setTargetLatMin("");
+    setTargetLatMax("");
+    setTargetLonMin("");
+    setTargetLonMax("");
+    setPipelineTaskId(null);
     setInspectionTaskId(null);
     setInspectionTaskOperation(null);
     setInspectionProgress(null);
     setStage("input");
 
+  };
+  const toggleTargetSpatial = (enabled: boolean) => {
+    setTargetSpatialEnabled(enabled);
+    if (!enabled) return;
+    const coordinates = asRecord(inspection?.snapshot.coordinates);
+    setTargetLatMin((current) => current || String(coordinates?.lat_min ?? ""));
+    setTargetLatMax((current) => current || String(coordinates?.lat_max ?? ""));
+    setTargetLonMin((current) => current || String(coordinates?.lon_min ?? ""));
+    setTargetLonMax((current) => current || String(coordinates?.lon_max ?? ""));
   };
 
   const chooseInput = async () => {
@@ -614,7 +876,7 @@ function App() {
     setError(null);
     try {
       const selected = await pickDirectory();
-      if (typeof selected === "string") setOutputPath(selected);
+      if (typeof selected === "string") setOutputPath(joinPath(selected, outputStoreName(inputPath, inputKind)));
     } catch (reason) {
       setError(reasonText(reason));
     }
@@ -765,6 +1027,33 @@ function App() {
     if (new Set(outputNameValues).size !== outputNameValues.length) {
       throw new Error("输出变量名不能重复。");
     }
+    const timeStart = targetTimeStart.trim();
+    const timeEnd = targetTimeEnd.trim();
+    if (Boolean(timeStart) !== Boolean(timeEnd)) {
+      throw new Error("目标时间段必须同时填写开始和结束日期。");
+    }
+    if (timeStart) validateDateBoundary(timeStart, "目标开始日期");
+    if (timeEnd) validateDateBoundary(timeEnd, "目标结束日期");
+    let latMin = -90;
+    let latMax = 90;
+    let lonMin = -180;
+    let lonMax = 180;
+    if (targetSpatialEnabled) {
+      latMin = parseCoordinateBound(targetLatMin, "目标纬度下限", -90, 90);
+      latMax = parseCoordinateBound(targetLatMax, "目标纬度上限", -90, 90);
+      lonMin = parseCoordinateBound(targetLonMin, "目标经度下限", -180, 180);
+      lonMax = parseCoordinateBound(targetLonMax, "目标经度上限", -180, 180);
+      if (latMin >= latMax) throw new Error("目标纬度下限必须小于上限。");
+      if (lonMin >= lonMax) throw new Error("目标经度下限必须小于上限。");
+    }
+    const effectiveResample = resample || automaticResample;
+    const customChunks = rechunk && chunkStrategy === "custom"
+      ? [
+        parsePositiveInteger(customChunkTime, "时间 chunk"),
+        parsePositiveInteger(customChunkLat, "纬度 chunk"),
+        parsePositiveInteger(customChunkLon, "经度 chunk"),
+      ]
+      : null;
     const transforms = Object.fromEntries(
       selectedVariables.flatMap((name) => {
         const draft = variableTransforms[name] || EMPTY_VARIABLE_TRANSFORM;
@@ -781,7 +1070,7 @@ function App() {
       }),
     );
     return {
-      output: outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`,
+      output: outputPath || defaultOutputPath(inputPath, inputKind),
       temporary_dir: temporaryDir || null,
       input_dir: inputPath,
       input_kind: inputKind === "zarr" ? "zarr" : "raw",
@@ -789,6 +1078,13 @@ function App() {
       inspection_snapshot_path: inspection.inspection_snapshot_path || null,
       validate_snapshot: false,
       validation_mode: fullStructureValidation ? "full" : "fast",
+      time_start: timeStart || null,
+      time_end: timeEnd || null,
+      lat_min: latMin,
+      lat_max: latMax,
+      lon_min: lonMin,
+      lon_max: lonMax,
+      target_extent_enabled: targetSpatialEnabled,
       time_rule: timeRule,
       recursive,
       engine,
@@ -800,7 +1096,7 @@ function App() {
       compression_shuffle: compressionShuffle,
       compression_objective: compressionObjective,
       compression_tune_budget: compressionTuneBudget,
-      resample,
+      resample: effectiveResample,
       method: resampleMethod,
       resolution,
       skipna,
@@ -811,7 +1107,8 @@ function App() {
       after_conditions: afterConditions,
       after_results: afterResults,
       rechunk,
-      strategy: "time",
+      strategy: chunkStrategy,
+      custom_chunks: customChunks,
       target_mib: targetMib,
       recompress,
       compression: recompress ? compression : "none",
@@ -844,7 +1141,8 @@ function App() {
     setBusy(true);
     setError(null);
     try {
-      await startPipeline(payload);
+      const taskId = await startPipeline(payload);
+      setPipelineTaskId(taskId);
       setView("tasks");
     } catch (reason) {
       setError(reasonText(reason));
@@ -889,6 +1187,19 @@ function App() {
   };
 
   const stageIndex = stage === "input" ? 1 : stage === "time" ? 2 : 3;
+  const automaticResample = targetSpatialEnabled;
+  const effectiveResample = resample || automaticResample;
+  const pipelineTarget: PipelineTargetSummary = {
+    timeStart: targetTimeStart.trim(),
+    timeEnd: targetTimeEnd.trim(),
+    spatialEnabled: targetSpatialEnabled,
+    latMin: targetLatMin.trim(),
+    latMax: targetLatMax.trim(),
+    lonMin: targetLonMin.trim(),
+    lonMax: targetLonMax.trim(),
+    resolution,
+    automaticResample,
+  };
   const canInspectTime = inputKind === "source" && Boolean(inputPath) && !busy;
   const hasTimeAxis = Boolean(timeInspection?.time_dimension?.exists);
   const canInspectStructure = Boolean(inputPath) && (inputKind === "zarr" || Boolean(timeRule) || (stage === "time" && hasTimeAxis)) && !busy;
@@ -1071,8 +1382,26 @@ function App() {
                 <section className="surface pipeline-surface">
                   <div className="surface-title"><div><span className="section-kicker">PROCESS FLOW</span><h2>处理阶段</h2></div><span className="surface-number">02</span></div>
                   {inspectionProgress && inspectionTaskOperation === "preview_pipeline" && <InspectionProgressCard progress={inspectionProgress} nowMs={progressNowMs} onCancel={inspectionTaskId ? cancelInspection : undefined} />}
-                  <div className="stage-flow"><div className="flow-stage complete"><span>01</span><Icon name="database" size={16} /><div><strong>输入检查</strong><small>{inputPath.split(/[\\/]/).pop() || "已确认数据"}</small></div><Icon name="spark" size={14} /></div><div className="flow-connector" /><label className={`flow-stage toggle-stage ${resample ? "enabled" : ""}`}><span>02</span><Icon name="grid" size={16} /><div><strong>空间重采样</strong><small>{resample ? resampleMethod : "未启用"}</small></div><input type="checkbox" checked={resample} onChange={(event) => setResample(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${rechunk ? "enabled" : ""}`}><span>03</span><Icon name="layers" size={16} /><div><strong>重分块</strong><small>{rechunk ? `目标 ${targetMib} MiB` : "未启用"}</small></div><input type="checkbox" checked={rechunk} onChange={(event) => setRechunk(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${recompress ? "enabled" : ""}`}><span>04</span><Icon name="spark" size={16} /><div><strong>重压缩</strong><small>{recompress ? compression : "未启用"}</small></div><input type="checkbox" checked={recompress} onChange={(event) => setRecompress(event.target.checked)} /><span className="toggle-switch" /></label></div>
-                  {resample && (
+                  <div className="stage-flow"><div className="flow-stage complete"><span>01</span><Icon name="database" size={16} /><div><strong>输入检查</strong><small>{inputPath.split(/[\\/]/).pop() || "已确认数据"}</small></div><Icon name="spark" size={14} /></div><div className="flow-connector" /><label className={`flow-stage toggle-stage ${effectiveResample ? "enabled" : ""}`}><span>02</span><Icon name="grid" size={16} /><div><strong>空间重采样</strong><small>{effectiveResample ? (automaticResample ? "按目标范围自动规划" : resampleMethod) : "未启用"}</small></div><input type="checkbox" checked={effectiveResample} disabled={automaticResample} onChange={(event) => setResample(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${rechunk ? "enabled" : ""}`}><span>03</span><Icon name="layers" size={16} /><div><strong>重分块</strong><small>{rechunk ? `目标 ${targetMib} MiB` : "未启用"}</small></div><input type="checkbox" checked={rechunk} onChange={(event) => setRechunk(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${recompress ? "enabled" : ""}`}><span>04</span><Icon name="spark" size={16} /><div><strong>重压缩</strong><small>{recompress ? compression : "未启用"}</small></div><input type="checkbox" checked={recompress} onChange={(event) => setRecompress(event.target.checked)} /><span className="toggle-switch" /></label></div>
+                  <div className="advanced-panel target-range-panel">
+                    <div className="panel-label"><Icon name="clock" size={15} />输出目标范围</div>
+                    <p className="target-range-help">填写最终输出的时间段和空间范围。日期支持直接输入年份、年月或完整日期（YYYY、YYYY-MM、YYYY-MM-DD）；启用自定义经纬度后，系统会自动启用重采样，并根据目标网格计算读取窗口、chunks 和发布策略。</p>
+                    <div className="advanced-fields target-time-fields">
+                      <label>开始日期<input type="text" inputMode="numeric" value={targetTimeStart} disabled={inputKind === "zarr"} placeholder="YYYY / YYYY-MM / YYYY-MM-DD" onChange={(event) => setTargetTimeStart(event.target.value)} /></label>
+                      <label>结束日期<input type="text" inputMode="numeric" value={targetTimeEnd} disabled={inputKind === "zarr"} placeholder="YYYY / YYYY-MM / YYYY-MM-DD" onChange={(event) => setTargetTimeEnd(event.target.value)} /></label>
+                      {inputKind === "zarr" && <span className="target-range-note">现有 Zarr 流程当前按原始时间轴处理</span>}
+                    </div>
+                    <label className="check-control target-spatial-toggle"><input type="checkbox" checked={targetSpatialEnabled} onChange={(event) => toggleTargetSpatial(event.target.checked)} /><span className="fake-check" />启用自定义经纬度范围（自动重采样）</label>
+                    {targetSpatialEnabled && (
+                      <div className="advanced-fields target-spatial-fields">
+                        <label>纬度下限<input type="number" min="-90" max="90" step="any" value={targetLatMin} onChange={(event) => setTargetLatMin(event.target.value)} /></label>
+                        <label>纬度上限<input type="number" min="-90" max="90" step="any" value={targetLatMax} onChange={(event) => setTargetLatMax(event.target.value)} /></label>
+                        <label>经度下限<input type="number" min="-180" max="180" step="any" value={targetLonMin} onChange={(event) => setTargetLonMin(event.target.value)} /></label>
+                        <label>经度上限<input type="number" min="-180" max="180" step="any" value={targetLonMax} onChange={(event) => setTargetLonMax(event.target.value)} /></label>
+                      </div>
+                    )}
+                  </div>
+                  {effectiveResample && (
                     <div className="advanced-panel">
                       <div className="panel-label"><Icon name="grid" size={15} />重采样参数</div>
                       <div className="advanced-fields resample-fields">
@@ -1088,7 +1417,24 @@ function App() {
                       </div>
                     </div>
                   )}
-                  {rechunk && <div className="advanced-panel"><div className="panel-label"><Icon name="layers" size={15} />重分块参数</div><div className="advanced-fields"><label>目标 chunk MiB<input type="number" min="1" step="1" value={targetMib} onChange={(event) => setTargetMib(Number(event.target.value))} /></label></div></div>}
+                  {rechunk && (
+                    <div className="advanced-panel">
+                      <div className="panel-label"><Icon name="layers" size={15} />重分块参数</div>
+                      <div className="advanced-fields rechunk-fields">
+                        <label>重分块规则<select value={chunkStrategy} onChange={(event) => setChunkStrategy(event.target.value as ChunkStrategy)}><option value="time">时间连续</option><option value="space">空间连续</option><option value="custom">自定义</option></select></label>
+                        <label>目标 chunk MiB<input type="number" min="1" step="1" value={targetMib} disabled={chunkStrategy === "custom"} onChange={(event) => setTargetMib(Number(event.target.value))} /></label>
+                      </div>
+                      {chunkStrategy === "time" && <p className="chunk-strategy-help">时间维度保持连续，纬度和经度按目标 chunk 大小自动规划。</p>}
+                      {chunkStrategy === "space" && <p className="chunk-strategy-help">纬度和经度保持完整连续，时间维度按目标 chunk 大小自动规划。</p>}
+                      {chunkStrategy === "custom" && (
+                        <div className="advanced-fields custom-chunk-fields">
+                          <label>时间 chunk<input type="number" min="1" step="1" value={customChunkTime} onChange={(event) => setCustomChunkTime(event.target.value)} placeholder="例如 10" /></label>
+                          <label>纬度 chunk<input type="number" min="1" step="1" value={customChunkLat} onChange={(event) => setCustomChunkLat(event.target.value)} placeholder="例如 300" /></label>
+                          <label>经度 chunk<input type="number" min="1" step="1" value={customChunkLon} onChange={(event) => setCustomChunkLon(event.target.value)} placeholder="例如 300" /></label>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   {recompress && (
                     <div className="advanced-panel">
                       <div className="panel-label"><Icon name="spark" size={15} />重压缩参数</div>
@@ -1136,12 +1482,13 @@ function App() {
                     </div>
                     <div className="output-option">
                       <label className="field-label" htmlFor="output-path">输出 Zarr 目录</label>
-                      <div className="input-with-action"><Icon name="upload" size={17} /><input id="output-path" value={outputPath || `${inputPath.replace(/[\\/]$/, "")}.zarr`} onChange={(event) => setOutputPath(event.target.value)} /><button className="field-action" type="button" onClick={() => void chooseOutputDirectory()}>浏览</button></div>
+                      <div className="input-with-action"><Icon name="upload" size={17} /><input id="output-path" value={outputPath || defaultOutputPath(inputPath, inputKind)} onChange={(event) => setOutputPath(event.target.value)} placeholder="选择或填写最终 Zarr 目录" /><button className="field-action" type="button" onClick={() => void chooseOutputDirectory()}>选父目录</button></div>
+                      <p className="path-help">浏览选择输出父目录，系统会生成“输入目录名.zarr”；也可直接填写最终 Zarr 目录。</p>
                     </div>
                   </div>
                   <div className="surface-actions"><button className="quiet-button" disabled={busy} type="button" onClick={() => void runPreview()}><Icon name="layers" size={16} />预览计划</button><button className="primary-button" disabled={busy} type="button" onClick={() => void runPipeline()}><Icon name="play" size={16} />启动处理</button></div>
                 </section>
-                <aside className="pipeline-side"><section className="surface execution-card"><div className="surface-title compact"><div><span className="section-kicker">EXECUTION POLICY</span><h2>执行策略</h2></div><Icon name="activity" size={18} /></div><label className="route-select-label">后端路由<select value={backendMode} onChange={(event) => setBackendMode(event.target.value as BackendMode)}><option value="auto">自动路由 · 推荐</option><option value="rust">原生强制 · 能力不足时失败</option></select></label><div className="policy-note"><span className="note-icon"><Icon name="spark" size={14} /></span><p><strong>Auto route</strong><br />优先使用已通过能力验证的原生操作，其他阶段保持结果语义不变。</p></div><div className="policy-list"><div><span className="policy-dot native" />原生能力优先</div><div><span className="policy-dot safe" />staging 校验后发布</div><div><span className="policy-dot trace" />manifest 全程留痕</div></div></section><section className="surface plan-card"><div className="surface-title compact"><div><span className="section-kicker">PLAN PREVIEW</span><h2>计划摘要</h2></div><span className="plan-state">{plan ? "READY" : "DRAFT"}</span></div>{plan ? <pre>{JSON.stringify(plan, null, 2)}</pre> : <div className="plan-empty"><Icon name="layers" size={22} /><span>点击“预览计划”<br />查看资源和阶段估算</span></div>}</section></aside>
+                <aside className="pipeline-side"><section className="surface execution-card"><div className="surface-title compact"><div><span className="section-kicker">EXECUTION POLICY</span><h2>执行策略</h2></div><Icon name="activity" size={18} /></div><label className="route-select-label">后端路由<select value={backendMode} onChange={(event) => setBackendMode(event.target.value as BackendMode)}><option value="auto">自动路由 · 推荐</option><option value="rust">原生强制 · 能力不足时失败</option></select></label><div className="policy-note"><span className="note-icon"><Icon name="spark" size={14} /></span><p><strong>Auto route</strong><br />优先使用已通过能力验证的原生操作，其他阶段保持结果语义不变。</p></div><div className="policy-list"><div><span className="policy-dot native" />原生能力优先</div><div><span className="policy-dot safe" />staging 校验后发布</div><div><span className="policy-dot trace" />manifest 全程留痕</div></div></section><section className="surface plan-card"><div className="surface-title compact"><div><span className="section-kicker">PLAN PREVIEW</span><h2>计划摘要</h2></div><span className="plan-state">{plan ? "READY" : "DRAFT"}</span></div>{plan ? <StructuredPipelinePlan plan={plan} target={pipelineTarget} /> : <div className="plan-empty"><Icon name="layers" size={22} /><span>点击“预览计划”<br />查看资源和阶段估算</span></div>}</section></aside>
               </div>
             </>
           )}

@@ -172,26 +172,32 @@ def _custom_axis(
     resolution: float,
     descending: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build an exact pixel-edge axis for a user-specified target extent."""
+    """Build a resolution-aligned target axis covering the requested extent.
+
+    User-provided bounds commonly come from source cell centers (for example
+    ``89.975``), while target resolution describes output cell edges.  Expand
+    the bounds outward to the nearest resolution edge instead of rejecting a
+    valid coverage request merely because its center-derived extent is not an
+    exact multiple of the target resolution.
+    """
 
     low = float(low)
     high = float(high)
     if not np.isfinite(low) or not np.isfinite(high) or high <= low:
         raise GridInspectionError("目标范围必须是有限且严格递增的外边界。")
-    count = int(round((high - low) / resolution))
-    if count <= 0 or not np.isclose(
-        count * resolution,
-        high - low,
-        rtol=0.0,
-        atol=max(1e-10, resolution * 1e-8),
-    ):
-        raise GridInspectionError(
-            f"目标范围 {low:g} .. {high:g} 不能被分辨率 {resolution:g} 整除。"
-        )
-    edges = low + np.arange(count + 1, dtype="float64") * resolution
-    # Avoid exposing a final edge such as 90.00000000000001 after repeated
-    # floating-point addition.
-    edges[-1] = high
+    lower_steps = low / resolution
+    upper_steps = high / resolution
+    tolerance = max(1e-10, abs(lower_steps), abs(upper_steps)) * 1e-12
+    aligned_low = float(np.floor(lower_steps + tolerance) * resolution)
+    aligned_high = float(np.ceil(upper_steps - tolerance) * resolution)
+    if aligned_high <= aligned_low:
+        raise GridInspectionError("目标范围在当前分辨率下没有有效网格单元。")
+    count = int(round((aligned_high - aligned_low) / resolution))
+    if count <= 0:
+        raise GridInspectionError("目标范围在当前分辨率下没有有效网格单元。")
+    edges = aligned_low + np.arange(count + 1, dtype="float64") * resolution
+    edges[0] = aligned_low
+    edges[-1] = aligned_high
     centers = (edges[:-1] + edges[1:]) / 2.0
     if descending:
         return centers[::-1], edges[::-1]

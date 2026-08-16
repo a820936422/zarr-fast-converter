@@ -4,10 +4,24 @@ build-backend = "maturin"
 
 [project]
 name = "fast-nc-zarr"
-version = "1.7.4"
+version = "1.7.5"
 description = "Fast NetCDF, HDF and TIFF to Zarr v3 conversion toolkit"
 requires-python = ">=3.13"
+dependencies = [
+    "dask>=2026.7.1,<2027",
+    "h5netcdf>=1.8.1,<2",
+    "netCDF4>=1.7.4,<2",
+    "numcodecs>=0.16,<0.17",
+    "numpy>=2.4.6,<3",
+    "psutil>=7.2,<8",
+    "rasterio>=1.5,<2",
+    "rioxarray>=0.23,<0.24",
+    "xarray>=2026.7,<2027",
+    "zarr>=3.3,<4",
+]
 
+[project.optional-dependencies]
+resampling = ["xesmf>=0.9.2,<0.10"]
 [tool.maturin]
 manifest-path = "rust/crates/fast-nc-zarr-python/Cargo.toml"
 python-source = "src"

@@ -157,11 +157,14 @@ impl BackendCapability {
                     "raw.netcdf.convert" => &[
                         "NetCDF-4/classic",
                         "float32/float64 data variables",
+                        "decoded physical float output",
+                        "source_* packing metadata",
                         "staged Zarr v3 output",
                     ],
                     "resample.nearest" | "resample.bilinear" => &[
                         "float32",
                         "regular latitude/longitude grids",
+                        "no CF packing or missing-value markers",
                         "NaN outside source bounds",
                     ],
                     "zarr.rechunk_f32" => &[
@@ -174,7 +177,11 @@ impl BackendCapability {
                         "staged output",
                         "cooperative cancellation",
                     ],
-                    "zarr.write_f64" => &["float64 arrays", "staged Zarr v3 output"],
+                    "zarr.write_f64" => &[
+                        "float64 arrays",
+                        "staged Zarr v3 output",
+                        "cooperative cancellation",
+                    ],
                     _ => &[],
                 };
                 OperationCapability::supported(operation, limitations)
@@ -235,8 +242,10 @@ impl BackendCapability {
                 &[
                     "NetCDF-4/classic",
                     "float32/float64 time-lat-lon data variables",
+                    "decoded physical float output",
+                    "source_* packing metadata",
                     "numeric standard coordinates",
-                    "Zarr v3 output",
+                    "staged Zarr v3 output",
                 ][..],
             ),
             (
@@ -244,6 +253,7 @@ impl BackendCapability {
                 &[
                     "float32",
                     "regular latitude/longitude grids",
+                    "finite JSON bridge inputs",
                     "NaN outside source bounds",
                 ][..],
             ),
@@ -252,6 +262,7 @@ impl BackendCapability {
                 &[
                     "float32",
                     "regular latitude/longitude grids",
+                    "finite JSON bridge inputs",
                     "NaN outside source bounds",
                 ][..],
             ),

@@ -45,9 +45,13 @@ from .replacements import ReplacementRules, apply_replacement_rules, sample_stat
 
 class ResampleExecutionError(RuntimeError):
     """Raised when a resampling operation cannot safely complete."""
+class _NativeResampleFallback(ResampleExecutionError):
+    """Signal that the bounded native buffer bridge cannot represent this source safely."""
+
 
 
 COMPUTE_DTYPES = ("source", "float32")
+MAX_NATIVE_RESAMPLE_VALUES = 4_000_000
 
 
 @dataclass(frozen=True)
@@ -1819,6 +1823,34 @@ def format_plan(plan: ResamplePlan) -> str:
     return "\n".join(lines)
 
 
+def _is_nan_scalar(value: object) -> bool:
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError):
+        return False
+    if array.size != 1 or not np.issubdtype(array.dtype, np.floating):
+        return False
+    return bool(np.isnan(array.reshape(-1)[0]))
+
+
+def _assert_output_marker_matches(
+    marker: str,
+    actual: object,
+    expected: object,
+) -> None:
+    """Compare metadata markers after resampling normalization.
+
+    Floating resampling canonicalizes missing values to the Zarr NaN fill
+    value and intentionally removes a redundant ``missing_value=NaN`` CF
+    attribute. Treat that representation as equivalent to the source
+    marker; numeric missing markers and scale/offset remain exact checks.
+    """
+
+    if marker == "missing_value" and actual is None and _is_nan_scalar(expected):
+        return
+    np.testing.assert_equal(actual, expected)
+
+
 def _validate_output(
     source: xr.Dataset,
     output_path: Path,
@@ -1865,14 +1897,35 @@ def _validate_output(
                         f"变量 {item.name} 的 dtype 不符合计划："
                         f"期望 {expected_dtype}，实际 {actual.dtype}"
                     )
-                for marker in ("missing_value", "scale_factor", "add_offset"):
-                    expected_marker = source[item.name].attrs.get(marker)
-                    if expected_marker is not None:
-                        actual_marker = actual.attrs.get(marker)
-                        np.testing.assert_equal(actual_marker, expected_marker)
-                expected_fill = source[item.name].encoding.get("_FillValue")
-                if expected_fill is not None:
-                    np.testing.assert_equal(actual.encoding.get("_FillValue"), expected_fill)
+                source_variable = source[item.name]
+                source_has_missing_marker = any(
+                    marker in source_variable.encoding or marker in source_variable.attrs
+                    for marker in ("_FillValue", "missing_value")
+                )
+                if np.issubdtype(actual.dtype, np.floating):
+                    actual_fill = actual.encoding.get("_FillValue")
+                    if actual_fill is None:
+                        actual_fill = actual.attrs.get("_FillValue")
+                    if source_has_missing_marker and not _is_nan_scalar(actual_fill):
+                        raise ResampleExecutionError(
+                            f"变量 {item.name} 的浮点输出必须使用 NaN _FillValue，实际 {actual_fill!r}"
+                        )
+                    if actual_fill is not None and not _is_nan_scalar(actual_fill):
+                        raise ResampleExecutionError(
+                            f"变量 {item.name} 的浮点输出 _FillValue 无效：{actual_fill!r}"
+                        )
+                    if source_has_missing_marker and actual.attrs.get("missing_value") is not None:
+                        raise ResampleExecutionError(
+                            f"变量 {item.name} 的浮点输出不应保留 missing_value。"
+                        )
+                else:
+                    expected_fill = source_variable.encoding.get("_FillValue")
+                    if expected_fill is not None:
+                        _assert_output_marker_matches(
+                            "_FillValue",
+                            actual.encoding.get("_FillValue"),
+                            expected_fill,
+                        )
         np.testing.assert_allclose(target.lat.values, plan.target.lat, rtol=0, atol=1e-10)
         np.testing.assert_allclose(target.lon.values, plan.target.lon, rtol=0, atol=1e-10)
         if "time" in source.coords and "time" in target.coords:
@@ -1963,7 +2016,7 @@ def _apply_data_dependent_post_replacements(
         consolidated=False,
         chunks={},
         decode_times=False,
-        mask_and_scale=False,
+        mask_and_scale=True,
     )
     maximum, mode = _statistics_limit(plan)
     try:
@@ -1976,21 +2029,30 @@ def _apply_data_dependent_post_replacements(
         for region in _chunk_regions(tuple(array.shape), tuple(array.chunks)):
             if cancel_event is not None and cancel_event.is_set():
                 raise ResampleExecutionError("任务已取消，未生成输出。")
-            values = np.asarray(array[region])
             replaced = apply_replacement_rules(
-                values,
+                np.asarray(array[region]),
                 plan.after_replacements,
                 statistics.get(name, {}),
             )
             array[region] = replaced.astype(array.dtype, copy=False)
     return statistics, mode
-
-def _native_source_has_no_codec(path: Path, plan: ResamplePlan) -> bool:
+def _native_source_has_direct_values(path: Path, plan: ResamplePlan) -> bool:
     try:
         group = zarr.open_group(path, mode="r")
-        return all(not tuple(group[item.name].compressors) for item in plan.inspection.info.data_variables)
+        for item in plan.inspection.info.variables:
+            attrs = item.attrs
+            if "scale_factor" in attrs or "add_offset" in attrs:
+                return False
+            for marker in ("_FillValue", "missing_value"):
+                if marker in attrs and not _is_nan_scalar(attrs[marker]):
+                    return False
+        return all(
+            not tuple(group[item.name].compressors)
+            for item in plan.inspection.info.data_variables
+        )
     except (KeyError, OSError, ValueError, TypeError):
         return False
+
 
 
 
@@ -1999,31 +2061,53 @@ def _run_native_regular_resample(config: ResampleConfig, plan: ResamplePlan, *, 
     target_path = Path(config.output).expanduser().resolve()
     if config.before_replacements.data_dependent or config.after_replacements.data_dependent:
         raise ResampleExecutionError("native regular resampling does not support data-dependent replacements")
-    native = __import__("fast_nc_zarr._native", fromlist=["resample_f32_json"])
-    source = xr.open_zarr(source_path, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False)
+    output_values = int(plan.target.dimensions["lat"]) * int(plan.target.dimensions["lon"])
+    for item in plan.inspection.info.data_variables:
+        source_values = 1
+        for size in item.shape:
+            source_values *= int(size)
+        variable_output_values = int(item.shape[0]) * output_values
+        if (
+            source_values > MAX_NATIVE_RESAMPLE_VALUES
+            or variable_output_values > MAX_NATIVE_RESAMPLE_VALUES
+        ):
+            raise ResampleExecutionError(
+                "native regular resampling exceeds the bounded typed buffer bridge limit "
+                f"of {MAX_NATIVE_RESAMPLE_VALUES:,} values for {item.name}"
+            )
+    source = xr.open_zarr(source_path, consolidated=False, chunks=None, decode_times=False, mask_and_scale=True)
     staging = target_path.parent / f".{target_path.name}.native-resample-{uuid4().hex}.tmp"
     try:
         if cancel_event is not None and cancel_event.is_set():
             raise ResampleExecutionError("任务已取消，未生成输出。")
-        lat = np.asarray(source["lat"].values, dtype="float32")
-        lon = np.asarray(source["lon"].values, dtype="float32")
+        lat = np.ascontiguousarray(source["lat"].values, dtype="float32")
+        lon = np.ascontiguousarray(source["lon"].values, dtype="float32")
+        target_lat = np.ascontiguousarray(plan.target.lat, dtype="float32")
+        target_lon = np.ascontiguousarray(plan.target.lon, dtype="float32")
+        native = __import__("fast_nc_zarr._native", fromlist=["resample_f32_buffer"])
         variables = {}
         for item in plan.inspection.info.data_variables:
             if item.dims != ("time", "lat", "lon") or str(item.dtype) != "float32":
                 raise ResampleExecutionError("native regular resampling requires float32 (time, lat, lon) variables")
-            values = np.asarray(source[item.name].values, dtype="float32")
-            request = {
-                "values": values.reshape(-1).tolist(),
-                "shape": list(values.shape),
-                "source_lat": lat.tolist(),
-                "source_lon": lon.tolist(),
-                "target_lat": np.asarray(plan.target.lat, dtype="float32").tolist(),
-                "target_lon": np.asarray(plan.target.lon, dtype="float32").tolist(),
-                "method": "nearest" if plan.method.startswith("nearest") else "bilinear",
-            }
-            result = json.loads(native.resample_f32_json(json.dumps(request)))
+            values = np.ascontiguousarray(source[item.name].values, dtype="float32")
+            if not np.isfinite(values).all():
+                raise _NativeResampleFallback(
+                    "native regular resampling requires finite input values for the typed buffer bridge"
+                )
+            raw_values, result_shape = native.resample_f32_buffer(
+                values,
+                list(values.shape),
+                lat,
+                lon,
+                target_lat,
+                target_lon,
+                "nearest" if plan.method.startswith("nearest") else "bilinear",
+            )
+            output_values = np.frombuffer(raw_values, dtype="float32").reshape(
+                tuple(int(value) for value in result_shape)
+            )
             output_variable = xr.DataArray(
-                np.asarray(result["values"], dtype="float32").reshape(result["shape"]),
+                output_values,
                 dims=("time", "lat", "lon"),
                 attrs=dict(source[item.name].attrs),
             )
@@ -2047,8 +2131,16 @@ def _run_native_regular_resample(config: ResampleConfig, plan: ResamplePlan, *, 
         if config.validate:
             _validate_output(source, staging, plan)
         publish_staging(staging, target_path, "resample-native", overwrite=config.overwrite, require_zarr_v3=True)
-        logical_bytes = sum(int(np.asarray(source[item.name]).size) * 4 for item in plan.inspection.info.data_variables)
+        logical_bytes = sum(int(source[item.name].size) * 4 for item in plan.inspection.info.data_variables)
         return {"backend": "rust", "backend_fallback": False, "output": str(target_path), "logical_bytes": logical_bytes, "physical_bytes": _directory_size(target_path), "method": plan.method}
+    except Exception as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ResampleExecutionError("任务已取消，未生成输出。") from exc
+        if isinstance(exc, ResampleExecutionError):
+            raise
+        raise ResampleExecutionError(
+            f"原生重采样失败；输出临时目录已清理：{staging}\n{exc}"
+        ) from exc
     finally:
         source.close()
         shutil.rmtree(staging, ignore_errors=True)
@@ -2071,9 +2163,12 @@ def run_resample(
         and not config.before_replacements.rules
         and not config.after_replacements.rules
         and all(item.dims == ("time", "lat", "lon") and str(item.dtype) == "float32" for item in plan.inspection.info.data_variables)
-        and _native_source_has_no_codec(Path(config.input), plan)
+        and _native_source_has_direct_values(Path(config.input), plan)
     ):
-        return _run_native_regular_resample(config, plan, cancel_event=cancel_event)
+        try:
+            return _run_native_regular_resample(config, plan, cancel_event=cancel_event)
+        except _NativeResampleFallback:
+            pass
     source_path = Path(config.input).expanduser().resolve()
     target_path = Path(config.output).expanduser().resolve()
     if source_path == target_path:
@@ -2101,7 +2196,7 @@ def run_resample(
             consolidated=False,
             chunks={},
             decode_times=False,
-            mask_and_scale=False,
+            mask_and_scale=True,
         )
         before_statistics, before_statistics_mode = _source_replacement_statistics(
             source, requested_plan

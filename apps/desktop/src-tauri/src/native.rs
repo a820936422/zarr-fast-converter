@@ -8,8 +8,8 @@ use fast_nc_zarr_model::{
     MultiRechunkExecutionPlan, RechunkExecutionPlan, DESKTOP_NATIVE_OPERATIONS,
 };
 use fast_nc_zarr_zarr::{
-    convert_netcdf_to_zarr, inspect_array, inspect_netcdf, rechunk_f32_array, rechunk_multi_array,
-    resample_f32, write_f64_array, ResampleF32Request,
+    convert_netcdf_to_zarr_with_cancellation, inspect_array, inspect_netcdf, rechunk_f32_array,
+    rechunk_multi_array, resample_f32, write_f64_array_with_cancellation, ResampleF32Request,
 };
 use serde_json::{Map, Value};
 use tauri::{AppHandle, State};
@@ -162,9 +162,11 @@ fn run_native_task(
     let result = catch_unwind(AssertUnwindSafe(|| match operation.as_str() {
         "zarr.inspect" => native_inspect(&request.payload),
         "raw.netcdf.inspect" => native_netcdf_inspect(&request.payload),
-        "raw.netcdf.convert" => native_netcdf_convert(&request.payload),
-        "resample.nearest" | "resample.bilinear" => native_resample(&request.payload),
-        "zarr.write_f64" => native_write_f64(&request.payload),
+        "raw.netcdf.convert" => native_netcdf_convert(&request.payload, &cancellation_file),
+        "resample.nearest" | "resample.bilinear" => {
+            native_resample(&request.payload, &cancellation_file)
+        }
+        "zarr.write_f64" => native_write_f64(&request.payload, &cancellation_file),
         "zarr.rechunk_f32" => native_rechunk(
             &request.payload,
             &cancellation_file,
@@ -266,16 +268,28 @@ fn native_netcdf_inspect(payload: &Map<String, Value>) -> Result<Map<String, Val
     Ok(output)
 }
 
-fn native_netcdf_convert(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+fn native_netcdf_convert(
+    payload: &Map<String, Value>,
+    cancellation_file: &Path,
+) -> Result<Map<String, Value>, AppError> {
     let input = required_string(payload, "input")?;
     let output = required_string(payload, "output")?;
     if !Path::new(&input).is_file() {
         return Err(AppError::new(ErrorKind::PathNotFound, input).at_stage("conversion"));
     }
-    let summary =
-        convert_netcdf_to_zarr(Path::new(&input), Path::new(&output)).map_err(|error| {
-            AppError::new(ErrorKind::PublicationFailed, error).at_stage("conversion")
-        })?;
+    let summary = convert_netcdf_to_zarr_with_cancellation(
+        Path::new(&input),
+        Path::new(&output),
+        Some(cancellation_file),
+    )
+    .map_err(|error| {
+        let kind = if error == "任务已取消" {
+            ErrorKind::Cancelled
+        } else {
+            ErrorKind::PublicationFailed
+        };
+        AppError::new(kind, error).at_stage("conversion")
+    })?;
     let mut result = Map::new();
     result.insert(
         "operation".to_string(),
@@ -288,8 +302,13 @@ fn native_netcdf_convert(payload: &Map<String, Value>) -> Result<Map<String, Val
     );
     Ok(result)
 }
-
-fn native_resample(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+fn native_resample(
+    payload: &Map<String, Value>,
+    cancellation_file: &Path,
+) -> Result<Map<String, Value>, AppError> {
+    if cancellation_file.is_file() {
+        return Err(AppError::new(ErrorKind::Cancelled, "任务已取消").at_stage("resampling"));
+    }
     let request: ResampleF32Request = serde_json::from_value(Value::Object(payload.clone()))
         .map_err(|error| {
             AppError::new(ErrorKind::InvalidRequest, error.to_string()).at_stage("resampling")
@@ -326,6 +345,9 @@ fn native_resample(payload: &Map<String, Value>) -> Result<Map<String, Value>, A
     }
     let result = resample_f32(&request)
         .map_err(|error| AppError::new(ErrorKind::InputInvalid, error).at_stage("resampling"))?;
+    if cancellation_file.is_file() {
+        return Err(AppError::new(ErrorKind::Cancelled, "任务已取消").at_stage("resampling"));
+    }
     let mut output = Map::new();
     output.insert(
         "operation".to_string(),
@@ -342,7 +364,13 @@ fn path_entry_exists(path: &Path) -> bool {
     path.exists() || fs::symlink_metadata(path).is_ok()
 }
 
-fn native_write_f64(payload: &Map<String, Value>) -> Result<Map<String, Value>, AppError> {
+fn native_write_f64(
+    payload: &Map<String, Value>,
+    cancellation_file: &Path,
+) -> Result<Map<String, Value>, AppError> {
+    if cancellation_file.is_file() {
+        return Err(AppError::new(ErrorKind::Cancelled, "任务已取消").at_stage("native"));
+    }
     let root = required_string(payload, "path")?;
     let array_path = required_string(payload, "array_path")?;
     let shape = required_u64_vec(payload, "shape")?;
@@ -364,11 +392,25 @@ fn native_write_f64(payload: &Map<String, Value>) -> Result<Map<String, Value>, 
         )
         .at_stage("native"));
     }
-    if let Err(error) = write_f64_array(&staging, &array_path, &shape, &chunks, &values) {
+    if let Err(error) = write_f64_array_with_cancellation(
+        &staging,
+        &array_path,
+        &shape,
+        &chunks,
+        &values,
+        Some(cancellation_file),
+    ) {
         let _ = fs::remove_dir_all(&staging);
-        return Err(
-            AppError::new(ErrorKind::PublicationFailed, error.to_string()).at_stage("native"),
-        );
+        let kind = if error.to_string() == "任务已取消" {
+            ErrorKind::Cancelled
+        } else {
+            ErrorKind::PublicationFailed
+        };
+        return Err(AppError::new(kind, error.to_string()).at_stage("native"));
+    }
+    if cancellation_file.is_file() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(AppError::new(ErrorKind::Cancelled, "任务已取消").at_stage("native"));
     }
     if !staging.join("zarr.json").is_file() {
         let _ = fs::remove_dir_all(&staging);
@@ -733,7 +775,8 @@ mod tests {
             "values": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
         }))
         .expect("write payload");
-        let result = native_write_f64(&payload).expect("native write");
+        let cancellation = store("float64-write.cancel");
+        let result = native_write_f64(&payload, &cancellation).expect("native write");
         assert_eq!(result["operation"], "zarr.write_f64");
         let summary = native_inspect(
             &serde_json::from_value(json!({"path": target, "array_path": "/value"}))

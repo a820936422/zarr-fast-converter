@@ -997,6 +997,33 @@ def _variable_attrs(variable) -> dict[str, Any]:
         if key not in attrs and key in variable.encoding:
             attrs[key] = _clean_attr(variable.encoding[key])
     return attrs
+def _filename_dataset_spatial_signature(dataset, engine: str) -> tuple[Any, ...] | None:
+    if engine != "rasterio":
+        return None
+    crs_text = None
+    transform_values: tuple[float, ...] | None = None
+    try:
+        rio = dataset.rio
+        crs = rio.crs
+        crs_text = crs.to_wkt() if crs is not None else None
+        transform_values = tuple(round(float(value), 12) for value in rio.transform())
+    except (AttributeError, TypeError, ValueError):
+        crs_value = dataset.attrs.get("crs_wkt", dataset.attrs.get("crs"))
+        crs_text = str(crs_value) if crs_value not in (None, "") else None
+        transform_value = dataset.attrs.get("transform")
+        if isinstance(transform_value, (list, tuple, np.ndarray)):
+            try:
+                transform_values = tuple(round(float(value), 12) for value in transform_value)
+            except (TypeError, ValueError):
+                transform_values = None
+    return ("__spatial__", crs_text, transform_values)
+
+
+def _append_filename_spatial_signature(
+    signatures: tuple[Any, ...], dataset, engine: str
+) -> tuple[Any, ...]:
+    spatial = _filename_dataset_spatial_signature(dataset, engine)
+    return signatures if spatial is None else (*signatures, spatial)
 
 
 def _filename_variable_signature(variable) -> tuple[Any, ...]:
@@ -1036,16 +1063,20 @@ def _inspect_filename_file_xarray(task) -> FileRecord:
         time_value,
     ) = task
     with _normalized_filename_dataset(path, engine) as (ds, _):
-        current_signature = tuple(
-            sorted(
-                (
-                    _filename_variable_signature(variable)
-                    for variable in ds.data_vars.values()
-                    if variable.dims == ("lat", "lon")
-                    and np.dtype(variable.dtype).kind in "biufc"
-                ),
-                key=lambda item: item[0],
-            )
+        current_signature = _append_filename_spatial_signature(
+            tuple(
+                sorted(
+                    (
+                        _filename_variable_signature(variable)
+                        for variable in ds.data_vars.values()
+                        if variable.dims == ("lat", "lon")
+                        and np.dtype(variable.dtype).kind in "biufc"
+                    ),
+                    key=lambda item: item[0],
+                )
+            ),
+            ds,
+            engine,
         )
         if current_signature != expected_signature:
             raise FilenameTimeError(f"{path.name} 的变量结构或属性与首文件不一致。")
@@ -1173,16 +1204,20 @@ def inspect_filename_inventory(
                 )
             if not reference_specs:
                 raise FilenameTimeError("源文件没有可转换的二维 lat/lon 变量。")
-            expected_signature = tuple(
-                sorted(
-                    (
-                        _filename_variable_signature(variable)
-                        for variable in reference_ds.data_vars.values()
-                        if variable.dims == ("lat", "lon")
-                        and np.dtype(variable.dtype).kind in "biufc"
-                    ),
-                    key=lambda item: item[0],
-                )
+            expected_signature = _append_filename_spatial_signature(
+                tuple(
+                    sorted(
+                        (
+                            _filename_variable_signature(variable)
+                            for variable in reference_ds.data_vars.values()
+                            if variable.dims == ("lat", "lon")
+                            and np.dtype(variable.dtype).kind in "biufc"
+                        ),
+                        key=lambda item: item[0],
+                    )
+                ),
+                reference_ds,
+                engine,
             )
             del reference_ds
     expected_lat_hash = _hash_axis(lat)
