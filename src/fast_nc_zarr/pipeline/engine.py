@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import os
+import threading
 import shutil
 import time
 from tempfile import TemporaryDirectory
@@ -98,6 +101,100 @@ def _stage_event_payload(
     }
     evidence.update(payload or {})
     return evidence
+
+
+def _storage_progress_snapshot(roots: tuple[Path, ...]) -> tuple[int, int]:
+    """Return observed bytes and file count without affecting task execution."""
+    total_bytes = 0
+    total_files = 0
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            if resolved.is_file():
+                total_files += 1
+                total_bytes += resolved.stat().st_size
+                continue
+            if not resolved.is_dir():
+                continue
+            for directory, _subdirectories, filenames in os.walk(resolved):
+                for filename in filenames:
+                    try:
+                        total_bytes += (Path(directory) / filename).stat().st_size
+                        total_files += 1
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total_bytes, total_files
+
+
+@contextlib.contextmanager
+def _stage_progress(
+    event_path: Path,
+    manifest: dict[str, object],
+    stage: str,
+    roots: tuple[Path, ...],
+    *,
+    checkpoint: str,
+    interval_seconds: float = 10.0,
+):
+    """Emit storage-backed progress events while a long stage is running."""
+    stop = threading.Event()
+    started = time.perf_counter()
+    sequence = 0
+
+    def emit() -> None:
+        nonlocal sequence
+        observed_bytes, observed_files = _storage_progress_snapshot(roots)
+        elapsed = max(0.0, time.perf_counter() - started)
+        _write_event(
+            event_path,
+            "progress",
+            _stage_event_payload(
+                manifest,
+                stage,
+                {
+                    "status": "running",
+                    "heartbeat": True,
+                    "sequence": sequence,
+                    "elapsed_seconds": elapsed,
+                    "observed_bytes": observed_bytes,
+                    "observed_files": observed_files,
+                    "temporary_bytes": observed_bytes,
+                    "throughput_mib_s": (
+                        observed_bytes / max(elapsed, 1e-9) / 1024**2
+                    ),
+                },
+                checkpoint=checkpoint,
+                terminal_status="running",
+            ),
+        )
+        sequence += 1
+
+    emit()
+
+    def heartbeat() -> None:
+        while not stop.wait(max(0.1, interval_seconds)):
+            emit()
+
+    thread = threading.Thread(
+        target=heartbeat,
+        name=f"pipeline-progress-{stage}",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
 
 def _apply_runtime_compression(
     manifest: dict,
@@ -740,42 +837,49 @@ def _run_zarr_pipeline(
             if progress:
                 print(f"统一流程阶段 1/{len(physical_stages)}：重采样现有 Zarr")
             current_stage = "resampling"
-            resample_metrics = run_resample(
-                ResampleConfig(
-                    input=current,
-                    output=resample_output,
-                    resolution=options.resolution,
-                    method=options.method,
-                    skipna=options.skipna,
-                    na_thres=options.na_thres,
-                    compute_dtype=options.compute_dtype,
-                    extent="custom",
-                    target_lat_bounds=(config.general.lat_min, config.general.lat_max),
-                    target_lon_bounds=(config.general.lon_min, config.general.lon_max),
-                    target_lat_descending=True,
-                    target_lon_descending=False,
-                    overwrite=False,
-                    validate=config.validate,
-                    tile_size=options.tile_size,
-                    time_block=options.time_block,
-                    compute_workers=options.compute_workers,
-                    space_workers=options.space_workers,
-                    tuning_objective=options.tuning_objective,
-                    tune_budget=options.tune_budget,
-                    temporary_dir=paths.root,
-                    resource_budget=effective_resource_budget(resources),
-                    output_layout=plan.output_layout,
-                    before_replacements=parse_replacement_rules(
-                        options.before_conditions, options.before_results
+            with _stage_progress(
+                paths.events,
+                manifest,
+                "resampling",
+                (paths.root, resample_output),
+                checkpoint="resampled.zarr" if plan.finalization_required else "output",
+            ):
+                resample_metrics = run_resample(
+                    ResampleConfig(
+                        input=current,
+                        output=resample_output,
+                        resolution=options.resolution,
+                        method=options.method,
+                        skipna=options.skipna,
+                        na_thres=options.na_thres,
+                        compute_dtype=options.compute_dtype,
+                        extent="custom",
+                        target_lat_bounds=(config.general.lat_min, config.general.lat_max),
+                        target_lon_bounds=(config.general.lon_min, config.general.lon_max),
+                        target_lat_descending=True,
+                        target_lon_descending=False,
+                        overwrite=False,
+                        validate=config.validate,
+                        tile_size=options.tile_size,
+                        time_block=options.time_block,
+                        compute_workers=options.compute_workers,
+                        space_workers=options.space_workers,
+                        tuning_objective=options.tuning_objective,
+                        tune_budget=options.tune_budget,
+                        temporary_dir=paths.root,
+                        resource_budget=effective_resource_budget(resources),
+                        output_layout=plan.output_layout,
+                        before_replacements=parse_replacement_rules(
+                            options.before_conditions, options.before_results
+                        ),
+                        after_replacements=parse_replacement_rules(
+                            options.after_conditions, options.after_results
+                        ),
+                        statistics_policy=options.statistics_policy,
                     ),
-                    after_replacements=parse_replacement_rules(
-                        options.after_conditions, options.after_results
-                    ),
-                    statistics_policy=options.statistics_policy,
-                ),
-                plan.resample_plan.inspection if plan.resample_plan else None,
-                cancel_event=cancel_event,
-            )
+                    plan.resample_plan.inspection if plan.resample_plan else None,
+                    cancel_event=cancel_event,
+                )
             current = resample_output
             manifest["stages"]["resampling"] = {
                 "status": "validating_math_samples" if resuming else "validated"
@@ -794,15 +898,22 @@ def _run_zarr_pipeline(
                 current_stage = "mathematical_validation"
                 if progress:
                     print("重采样主体完成，开始恢复任务数学验证……", flush=True)
-                validation_metrics = validate_resample_samples(
-                    Path(inspection.path),
-                    resample_output,
-                    plan.resample_plan.target,
-                    config,
-                    cancel_event=cancel_event,
-                    progress=progress,
-                    replacement_statistics=resample_metrics.get("replacement_statistics"),
-                )
+                with _stage_progress(
+                    paths.events,
+                    manifest,
+                    "mathematical_validation",
+                    (paths.root, resample_output),
+                    checkpoint="resampled.zarr" if plan.finalization_required else "output",
+                ):
+                    validation_metrics = validate_resample_samples(
+                        Path(inspection.path),
+                        resample_output,
+                        plan.resample_plan.target,
+                        config,
+                        cancel_event=cancel_event,
+                        progress=progress,
+                        replacement_statistics=resample_metrics.get("replacement_statistics"),
+                    )
                 manifest["stages"]["resampling"]["mathematical_validation"] = validation_metrics
                 manifest["stages"]["resampling"]["status"] = "validated"
                 if direct_resample_target:
@@ -823,39 +934,46 @@ def _run_zarr_pipeline(
         if plan.finalization_required:
             chunking = config.chunking
             current_stage = "finalization"
-            finalization_metrics = run_rechunk(
-                RechunkConfig(
-                    input=current,
-                    output=output,
-                    strategy=chunking.strategy,
-                    target_mib=chunking.target_mib,
-                    custom_chunks=chunking.custom_chunks,
-                    compression=(
-                        config.compression.profile
-                        if config.operations.recompress
-                        else "none"
+            with _stage_progress(
+                paths.events,
+                manifest,
+                "finalization",
+                (paths.root, output),
+                checkpoint="output",
+            ):
+                finalization_metrics = run_rechunk(
+                    RechunkConfig(
+                        input=current,
+                        output=output,
+                        strategy=chunking.strategy,
+                        target_mib=chunking.target_mib,
+                        custom_chunks=chunking.custom_chunks,
+                        compression=(
+                            config.compression.profile
+                            if config.operations.recompress
+                            else "none"
+                        ),
+                        workers=chunking.workers,
+                        overwrite=config.general.overwrite,
+                        validate=config.validate,
+                        backend=getattr(config, "backend", "python"),
+                        rechunk=config.operations.rechunk,
+                        recompress=config.operations.recompress,
+                        temporary_dir=paths.root,
+                        compression_codec=config.compression.codec,
+                        compression_level=config.compression.level,
+                        storage_overrides={
+                            "source": config.general.source_storage,
+                            "temporary": config.general.temporary_storage,
+                            "output": config.general.output_storage,
+                        },
+                        compression_shuffle=config.compression.shuffle,
+                        compression_objective=config.compression.objective,
+                        compression_tune_budget=config.compression.tune_budget,
+                        resource_budget=effective_resource_budget(resources),
                     ),
-                    workers=chunking.workers,
-                    overwrite=config.general.overwrite,
-                    validate=config.validate,
-                    backend=getattr(config, "backend", "python"),
-                    rechunk=config.operations.rechunk,
-                    recompress=config.operations.recompress,
-                    temporary_dir=paths.root,
-                    compression_codec=config.compression.codec,
-                    compression_level=config.compression.level,
-                    storage_overrides={
-                        "source": config.general.source_storage,
-                        "temporary": config.general.temporary_storage,
-                        "output": config.general.output_storage,
-                    },
-                    compression_shuffle=config.compression.shuffle,
-                    compression_objective=config.compression.objective,
-                    compression_tune_budget=config.compression.tune_budget,
-                    resource_budget=effective_resource_budget(resources),
-                ),
-                cancel_event=cancel_event,
-            )
+                    cancel_event=cancel_event,
+                )
             manifest["backend"] = {
                 "requested": requested_backend,
                 "resolved": str(finalization_metrics.get("backend", "python")),
@@ -1127,11 +1245,18 @@ def run_pipeline(
             if plan.coverage_warning:
                 print("覆盖提醒：" + plan.coverage_warning)
         current_stage = "conversion"
-        conversion_plan, conversion_metrics = run_conversion(
-            inspection,
-            conversion_config,
-            cancel_event=cancel_event,
-        )
+        with _stage_progress(
+            paths.events,
+            manifest,
+            "conversion",
+            (paths.root, conversion_output),
+            checkpoint="source-crop.zarr" if not conversion_is_final else "output",
+        ):
+            conversion_plan, conversion_metrics = run_conversion(
+                inspection,
+                conversion_config,
+                cancel_event=cancel_event,
+            )
         manifest["stages"]["conversion"] = {
             "status": "validated_staging" if conversion_is_final else "validated",
             "metrics": conversion_metrics,
@@ -1215,10 +1340,17 @@ def run_pipeline(
                     "xESMF 重采样到目标网格"
                 )
             current_stage = "resampling"
-            resample_metrics = run_resample(
-                resample_config,
-                cancel_event=cancel_event,
-            )
+            with _stage_progress(
+                paths.events,
+                manifest,
+                "resampling",
+                (paths.root, resample_output),
+                checkpoint="resampled.zarr" if not resampling_is_final else "output",
+            ):
+                resample_metrics = run_resample(
+                    resample_config,
+                    cancel_event=cancel_event,
+                )
             manifest["stages"]["resampling"] = {
                 "status": "validating_math_samples",
                 "metrics": resample_metrics,
@@ -1227,16 +1359,23 @@ def run_pipeline(
             if progress:
                 print("重采样主体完成，开始局部数学验证……", flush=True)
             current_stage = "mathematical_validation"
-            validation_metrics = validate_resample_samples(
-                paths.converted,
-                resample_output,
-                plan.target_grid,
-                config,
-                inspection=inspection,
-                cancel_event=cancel_event,
-                progress=progress,
-                replacement_statistics=resample_metrics.get("replacement_statistics"),
-            )
+            with _stage_progress(
+                paths.events,
+                manifest,
+                "mathematical_validation",
+                (paths.root, resample_output),
+                checkpoint="resampled.zarr" if not resampling_is_final else "output",
+            ):
+                validation_metrics = validate_resample_samples(
+                    paths.converted,
+                    resample_output,
+                    plan.target_grid,
+                    config,
+                    inspection=inspection,
+                    cancel_event=cancel_event,
+                    progress=progress,
+                    replacement_statistics=resample_metrics.get("replacement_statistics"),
+                )
             manifest["stages"]["resampling"] = {
                 "status": "validated",
                 "metrics": resample_metrics,
@@ -1313,7 +1452,14 @@ def run_pipeline(
                     "执行布局兼容性最终化"
                 )
             current_stage = "finalization"
-            rechunk_metrics = run_rechunk(rechunk_config, cancel_event=cancel_event)
+            with _stage_progress(
+                paths.events,
+                manifest,
+                "finalization",
+                (paths.root, Path(config.general.output).expanduser().resolve()),
+                checkpoint="output",
+            ):
+                rechunk_metrics = run_rechunk(rechunk_config, cancel_event=cancel_event)
             _apply_backend_metrics(manifest, rechunk_metrics, requested_backend)
             manifest["stages"]["finalization"] = {
                 "status": "published_and_validated",

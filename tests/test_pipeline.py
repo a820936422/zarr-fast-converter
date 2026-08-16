@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import tempfile
+import time
 import io
 import shutil
 import json
@@ -28,6 +30,7 @@ from fast_nc_zarr.application.services import (  # noqa: E402
 )
 from fast_nc_zarr.pipeline.engine import (  # noqa: E402
     PipelineExecutionError,
+    _stage_progress,
     preview_pipeline,
     run_pipeline,
 )
@@ -362,6 +365,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(float(dataset["value"].isel(time=0, lat=0, lon=0)), 42.0)
 
     def test_executor_manifest_covers_all_identity_grid_combinations(self) -> None:
+
         inspection = inspect_source(
             SourceInspectionConfig(
                 ROOT / "canonical", mode="complete", engine="h5netcdf", workers=1
@@ -436,6 +440,32 @@ class PipelineTests(unittest.TestCase):
                 )
                 self.assertEqual(result["logical_io"]["write_amplification"], 1.0)
                 self.assertTrue(config.general.output.exists())
+
+    def test_stage_progress_emits_storage_heartbeats(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "chunk.bin").write_bytes(b"progress")
+            events = root / "events.jsonl"
+            manifest = {"manifest": str(root / "manifest.json"), "backend": {}}
+            with _stage_progress(
+                events,
+                manifest,
+                "conversion",
+                (root,),
+                checkpoint="source-crop.zarr",
+                interval_seconds=0.02,
+            ):
+                time.sleep(0.2)
+            records = [
+                json.loads(line)
+                for line in events.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertGreaterEqual(len(records), 2)
+            self.assertTrue(all(record["event"] == "progress" for record in records))
+            self.assertTrue(all(record["stage"] == "conversion" for record in records))
+            self.assertTrue(all(record["heartbeat"] for record in records))
+            self.assertGreaterEqual(records[-1]["observed_bytes"], len(b"progress"))
 
     def test_pipeline_writes_canonical_target_zarr(self) -> None:
         inspection = inspect_source(

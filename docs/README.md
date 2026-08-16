@@ -2,6 +2,8 @@
 
 本文档合并项目各模块的入口、核心约束和验证方式。项目总览、环境安装和快速示例见根目录 [README](../README.md)。IPC 定义见 [contracts/README.md](../contracts/README.md)；历史基线审查见 [全面代码审查报告](comprehensive-code-audit-2026-08-15.md)。
 
+下一版本优化路线图见：[v1.7.6 优化路线图](v1.7.6-optimization-roadmap.md)。
+
 ## 共通约定
 
 - 环境和命令由 `pixi.toml`、`pixi.lock` 管理。

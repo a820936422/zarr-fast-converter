@@ -1715,6 +1715,8 @@ def validate_filename_output(
 class FilenameTimeWriteTask:
     """A batch of reconstructed times and spatial blocks for one worker."""
 
+    time_start: int
+    time_stop: int
     entries: tuple[tuple[int, str | None], ...]
     blocks: tuple[tuple[int, int, int, int], ...]
 
@@ -1760,7 +1762,7 @@ def _filename_worker_init(
 
 
 def _filename_write_task(task: FilenameTimeWriteTask) -> int:
-    """Read a batch of source files and write disjoint Zarr time slices."""
+    """Read source files and write each complete time/spatial Zarr chunk once."""
     context = _FILENAME_CONTEXT
     group = _FILENAME_OUTPUT_GROUP
     specs = context["specs"]
@@ -1768,53 +1770,62 @@ def _filename_write_task(task: FilenameTimeWriteTask) -> int:
     effective = context["effective"]
     variable_names = context["variable_names"]
     names = tuple(specs)
-    total_bytes = 0
-    for index, source_path in task.entries:
-        if source_path is None:
-            for y0, y1, x0, x1 in task.blocks:
-                shape = (y1 - y0, x1 - x0)
-                for name in names:
-                    dtype, fill = effective[name]
-                    group[variable_names.get(name, name)][index, y0:y1, x0:x1] = np.full(
-                        shape, fill, dtype=dtype
-                    )
-                    total_bytes += int(np.prod(shape) * dtype.itemsize)
-            continue
+    indices = tuple(index for index, _ in task.entries)
+    expected_indices = tuple(range(task.time_start, task.time_stop))
+    if indices != expected_indices:
+        raise ValueError("文件名写入任务的时间索引必须连续且与 chunk 边界一致。")
 
-        with _normalized_filename_dataset(
-            Path(source_path), context["engine"]
-        ) as (ds, _):
-            for y0, y1, x0, x1 in task.blocks:
-                source_y0, source_y1 = (
-                    (context["lat_size"] - y1, context["lat_size"] - y0)
-                    if context["reverse_lat"] else (y0, y1)
-                )
-                source_x0, source_x1 = (
-                    (context["lon_size"] - x1, context["lon_size"] - x0)
-                    if context["reverse_lon"] else (x0, x1)
-                )
-                source_lat = slice(
-                    context["lat_start"] + source_y0,
-                    context["lat_start"] + source_y1,
-                )
-                source_lon = slice(
-                    context["lon_start"] + source_x0,
-                    context["lon_start"] + source_x1,
-                )
-                for name in names:
-                    dtype, fill = effective[name]
-                    raw = ds[name].isel(lat=source_lat, lon=source_lon).values
+    total_bytes = 0
+    with contextlib.ExitStack() as stack:
+        sources = []
+        for _, source_path in task.entries:
+            if source_path is None:
+                sources.append(None)
+                continue
+            dataset, _ = stack.enter_context(
+                _normalized_filename_dataset(Path(source_path), context["engine"])
+            )
+            sources.append(dataset)
+
+        for y0, y1, x0, x1 in task.blocks:
+            source_y0, source_y1 = (
+                (context["lat_size"] - y1, context["lat_size"] - y0)
+                if context["reverse_lat"] else (y0, y1)
+            )
+            source_x0, source_x1 = (
+                (context["lon_size"] - x1, context["lon_size"] - x0)
+                if context["reverse_lon"] else (x0, x1)
+            )
+            source_lat = slice(
+                context["lat_start"] + source_y0,
+                context["lat_start"] + source_y1,
+            )
+            source_lon = slice(
+                context["lon_start"] + source_x0,
+                context["lon_start"] + source_x1,
+            )
+            block_shape = (task.time_stop - task.time_start, y1 - y0, x1 - x0)
+            for name in names:
+                dtype, fill = effective[name]
+                data = np.empty(block_shape, dtype=dtype)
+                for row, source in enumerate(sources):
+                    if source is None:
+                        data[row].fill(fill)
+                        continue
+                    raw = source[name].isel(lat=source_lat, lon=source_lon).values
                     if context["reverse_lat"]:
                         raw = np.flip(raw, axis=0)
                     if context["reverse_lon"]:
                         raw = np.flip(raw, axis=1)
-                    data = _prepare_filename_data(
+                    data[row] = _prepare_filename_data(
                         raw, specs[name], transforms.get(name), dtype, fill
                     )
-                    group[variable_names.get(name, name)][index, y0:y1, x0:x1] = data
-                    total_bytes += int(data.nbytes)
-            del ds
+                group[variable_names.get(name, name)][
+                    task.time_start : task.time_stop, y0:y1, x0:x1
+                ] = data
+                total_bytes += int(data.nbytes)
     return total_bytes
+
 
 
 def filename_direct_write(
@@ -1863,6 +1874,8 @@ def filename_direct_write(
         for start in range(0, nt, batch_size):
             stop = min(nt, start + batch_size)
             yield FilenameTimeWriteTask(
+                time_start=start,
+                time_stop=stop,
                 entries=tuple(
                     (
                         index,
@@ -1952,6 +1965,8 @@ def filename_direct_write(
         "average_cpu": sum(cpu for cpu, _ in samples) / len(samples) if samples else 0.0,
         "peak_rss": max((rss for _, rss in samples), default=0),
         "tasks": total_tasks,
+        "chunk_owner_writes": total_tasks * len(blocks) * len(selection.variables),
+        "write_mode": "chunk-owner",
     }
 
 
