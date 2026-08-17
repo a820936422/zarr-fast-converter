@@ -367,6 +367,31 @@ class PipelineTests(unittest.TestCase):
             np.testing.assert_allclose(dataset.lon.values, [-0.075, -0.025, 0.025, 0.075])
             self.assertEqual(float(dataset["value"].isel(time=0, lat=0, lon=0)), 42.0)
 
+    def test_raw_auto_pipeline_records_python_coordinator_fallback(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT / "canonical", mode="complete", engine="h5netcdf", workers=1)
+        )
+        config = replace(
+            self._config(ROOT / "auto-backend.zarr"),
+            backend="auto",
+            operations=PipelineOperations(),
+            validate=False,
+        )
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        backend = manifest["backend"]
+        self.assertEqual(backend["requested"], "auto")
+        self.assertEqual(backend["resolved"], "python")
+        self.assertTrue(backend["fallback"])
+        self.assertEqual(backend["fallback_reason"], "raw pipeline conversion remains Python coordinator")
+        conversion_backend = manifest["stages"]["conversion"]["metrics"]
+        self.assertEqual(conversion_backend["backend"], "python")
+        self.assertTrue(conversion_backend["backend_fallback"])
+        self.assertEqual(
+            conversion_backend["backend_fallback_reason"],
+            "raw pipeline conversion remains Python coordinator",
+        )
+
     def test_executor_manifest_covers_all_identity_grid_combinations(self) -> None:
 
         inspection = inspect_source(
@@ -502,6 +527,34 @@ class PipelineTests(unittest.TestCase):
                     "compression_tune_budget": 13.0,
                 },
             )
+    def test_stage_progress_does_not_report_running_100_percent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            events = root / "events.jsonl"
+            manifest = {"manifest": str(root / "manifest.json"), "backend": {}, "config": {}}
+            with _stage_progress(
+                events,
+                manifest,
+                "conversion",
+                (root,),
+                checkpoint="output",
+                logical_total=123,
+                progress_callback=None,
+            ) as report:
+                report(123, 123, 123, "worker completed")
+            records = [
+                json.loads(line)
+                for line in events.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            running = [record for record in records if record["status"] == "running"]
+            self.assertTrue(running)
+            self.assertTrue(all(record["completed"] < record["total"] for record in running))
+            self.assertTrue(all(record["logical_bytes"] < record["total"] for record in running))
+            self.assertEqual(records[-1]["status"], "completed")
+            self.assertEqual(records[-1]["completed"], records[-1]["total"])
+            self.assertEqual(records[-1]["logical_bytes"], records[-1]["total"])
+
 
     def test_stage_progress_callback_maps_tile_units_to_logical_bytes(self) -> None:
         records: list[tuple[int, int, int, str | None]] = []

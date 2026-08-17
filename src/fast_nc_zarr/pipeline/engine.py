@@ -194,6 +194,13 @@ def _stage_progress(
         total_value = current_total if total is None else max(0, int(total))
         completed_value = max(0, int(completed))
         logical_value = completed_value if logical_bytes is None else max(0, int(logical_bytes))
+        if status == "running" and total_value > 0:
+            # Keep 100% exclusive to the terminal completed event. A worker
+            # callback can report its final bytes before the stage context has
+            # finished validation and publication bookkeeping.
+            running_limit = max(0, total_value - 1)
+            completed_value = min(completed_value, running_limit)
+            logical_value = min(logical_value, running_limit)
         current_total = total_value
         current_completed = min(completed_value, total_value) if total_value else completed_value
         current_logical_bytes = logical_value
@@ -342,6 +349,18 @@ def _apply_runtime_compression(
                 "cname": None,
                 "shuffle": "noshuffle",
             }
+def _raw_pipeline_backend(requested: str) -> dict[str, object]:
+    """Describe the Python coordinator used by every raw-input pipeline."""
+
+    fallback = requested in {"auto", "rust"}
+    return {
+        "requested": requested,
+        "resolved": "python",
+        "fallback": fallback,
+        "fallback_reason": "raw pipeline conversion remains Python coordinator" if fallback else None,
+        "protocol_version": None,
+    }
+
 def _apply_backend_metrics(manifest: dict, metrics: dict | None, requested: str) -> None:
     if isinstance(metrics, dict) and "backend" in metrics:
         manifest["backend"] = {
@@ -1265,7 +1284,22 @@ def run_pipeline(
     paths.root.mkdir(parents=True, exist_ok=False)
     resources = _pipeline_resource_snapshot(inspection, config, paths)
     resource_budget = effective_resource_budget(resources)
-    _write_event(paths.events, "started", {"job_id": paths.root.name, "stage": "preparation", "requested_backend": getattr(config, "backend", "python"), "resolved_backend": "python", "fallback": getattr(config, "backend", "python") in {"auto", "rust"}, "fallback_reason": "raw pipeline conversion remains Python coordinator", "stage_checkpoint": None, "manifest": str(paths.manifest), "terminal_status": "running"})
+    raw_backend = _raw_pipeline_backend(str(getattr(config, "backend", "python")))
+    _write_event(
+        paths.events,
+        "started",
+        {
+            "job_id": paths.root.name,
+            "stage": "preparation",
+            "requested_backend": raw_backend["requested"],
+            "resolved_backend": raw_backend["resolved"],
+            "fallback": raw_backend["fallback"],
+            "fallback_reason": raw_backend["fallback_reason"],
+            "stage_checkpoint": None,
+            "manifest": str(paths.manifest),
+            "terminal_status": "running",
+        },
+    )
     _write_event(paths.events, "resource", {"stage": "preparation", "resource_budget": resource_budget.to_dict(), "manifest": str(paths.manifest), "terminal_status": "running"})
     if progress:
         _print_resource_snapshot(resources)
@@ -1283,7 +1317,7 @@ def run_pipeline(
         physical_stages.append("resampling")
     if plan.finalization_required:
         physical_stages.append("finalization")
-    requested_backend = getattr(config, "backend", "python")
+    requested_backend = str(raw_backend["requested"])
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "job_id": paths.root.name,
@@ -1295,13 +1329,7 @@ def run_pipeline(
         "temporary_root": str(paths.root),
         "manifest": str(paths.manifest),
         "events": str(paths.events),
-        "backend": {
-            "requested": requested_backend,
-            "resolved": "python",
-            "fallback": False,
-            "fallback_reason": None,
-            "protocol_version": None,
-        },
+        "backend": raw_backend,
         "resource_snapshot": resources.to_dict(),
         "resource_budget": resource_budget.to_dict(),
         "storage_profiles": {
@@ -1425,6 +1453,15 @@ def run_pipeline(
                     conversion_logical_total,
                 ),
             )
+        conversion_metrics = dict(conversion_metrics)
+        conversion_metrics.update(
+            {
+                "backend": "python",
+                "backend_fallback": bool(raw_backend["fallback"]),
+                "backend_fallback_reason": raw_backend["fallback_reason"],
+                "protocol_version": None,
+            }
+        )
         manifest["stages"]["conversion"] = {
             "status": "validated_staging" if conversion_is_final else "validated",
             "metrics": conversion_metrics,
