@@ -9,6 +9,7 @@ cd "$ROOT"
 # Native/Python builds continue to use the conda toolchain; desktop Rust uses
 # the host linker and host GUI development libraries.
 source "$ROOT/scripts/desktop_linker_env.sh"
+python scripts/check_sidecar.py
 
 has_bundles_arg=false
 bundle_spec="${TAURI_BUNDLES:-}"

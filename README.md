@@ -145,8 +145,8 @@ pixi run test
 
 构建桌面发布包：
 
-```bash
 pixi run desktop-sidecar
+pixi run sidecar-check
 pixi run tauri-build
 ```
 

@@ -23,7 +23,30 @@ Transport boundaries:
 }
 ```
 
-Tauri command set:
+## Command layers
+
+The project has two command surfaces. Tauri invoke commands are implemented by
+`apps/desktop/src-tauri/src/lib.rs` and called by `apps/desktop/src/api.ts`:
+
+- `get_backend_info`
+- `native_capabilities`
+- `inspect_source`
+- `inspect_zarr`
+- `inspect_time_metadata`
+- `save_inspection_snapshot`
+- `preview_pipeline`
+- `start_pipeline`
+- `start_inspection`
+- `resume_pipeline`
+- `inspect_pipeline_recovery`
+- `start_native_task`
+- `get_task`
+- `list_tasks`
+- `clear_task_history`
+- `cancel_task`
+
+The Python worker JSONL command set is narrower and is defined by
+`fast_nc_zarr.application.desktop_worker.protocol.COMMANDS`:
 
 - `get_capabilities`
 - `inspect_source`
@@ -33,15 +56,12 @@ Tauri command set:
 - `preview_pipeline`
 - `run_pipeline`
 - `resume_pipeline`
-- `cancel_task`
-- `native_task`（仅由 Tauri Rust native runtime 执行）
 - `shutdown`
 
-The Python worker receives only `get_capabilities`, `inspect_source`,
-`inspect_zarr`, `inspect_time_metadata`, `save_inspection_snapshot`,
-`preview_pipeline`, `run_pipeline`, `resume_pipeline`, and `shutdown`.
-`native_task` and `cancel_task` are desktop-side commands and MUST NOT be
-forwarded to the Python worker.
+The shared request schema also reserves `native_task` and `cancel_task` for
+desktop-side task handling. They MUST NOT be forwarded to the Python worker.
+`start_native_task` is the public Tauri command that creates a native task;
+`cancel_task` writes the cancellation marker consumed by the task registry.
 
 ## Event envelope
 

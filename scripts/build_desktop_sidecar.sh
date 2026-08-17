@@ -17,7 +17,7 @@ if [[ -n "$TAURI_TARGET" ]]; then
 else
   SIDECAR_PATH="$SIDECAR_DIR/fast-nc-zarr-worker"
 fi
-rm -f "$SIDECAR_PATH" "$SIDECAR_PATH.sha256"
+rm -f "$SIDECAR_PATH" "$SIDECAR_PATH.sha256" "$SIDECAR_PATH.build.json"
 
 # Build the native Python extension first. The desktop worker is intentionally
 # launched with the same Python environment as the sidecar.
@@ -62,4 +62,5 @@ test -x "$WORKER"
 cp "$WORKER" "$SIDECAR_PATH"
 chmod +x "$SIDECAR_PATH"
 (cd "$(dirname "$SIDECAR_PATH")" && sha256sum "$(basename "$SIDECAR_PATH")") > "$SIDECAR_PATH.sha256"
-echo "built sidecar: $SIDECAR_PATH"
+"$PYTHON" scripts/check_sidecar.py --path "$SIDECAR_PATH" --write
+echo "built and validated sidecar: $SIDECAR_PATH"

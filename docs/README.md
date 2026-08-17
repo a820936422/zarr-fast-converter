@@ -1,8 +1,6 @@
 # Fast NC Zarr v1.7.6 模块与运行指南
 
-本文档合并项目各模块的入口、核心约束和验证方式。项目总览、环境安装和快速示例见根目录 [README](../README.md)。IPC 定义见 [contracts/README.md](../contracts/README.md)；历史基线审查见 [全面代码审查报告](comprehensive-code-audit-2026-08-15.md)。
-
-下一版本优化路线图见：[v1.7.7 优化路线图](v1.7.7-optimization-roadmap.md)。
+本文档合并项目各模块的入口、核心约束和验证方式。项目总览、环境安装和快速示例见根目录 [README](../README.md)。IPC 定义见 [contracts/README.md](../contracts/README.md)。下一版本优化路线图见：[v1.7.7 优化路线图](v1.7.7-optimization-roadmap.md)。
 
 ## 共通约定
 
@@ -152,7 +150,7 @@ npm --prefix apps/desktop run build
 cargo test -p fast-nc-zarr-desktop
 ```
 
-前端通过 Tauri commands 调用 Rust runtime；runtime 负责 worker、任务 registry、取消、资源快照、事件流、native capability 和恢复。主要 command 包括 `inspect_source`、`inspect_zarr`、`inspect_time_metadata`、`preview_pipeline`、`start_pipeline`、`resume_pipeline`、`start_native_task`、`list_tasks`、`get_task` 和 `cancel_task`。worker stdout 只承载 JSONL，诊断进入结构化事件或 stderr。
+前端通过 Tauri commands 调用 Rust runtime；runtime 负责 worker、任务 registry、取消、资源快照、事件流、native capability 和恢复。Tauri command 包括 `get_backend_info`、`native_capabilities`、`inspect_source`、`inspect_zarr`、`inspect_time_metadata`、`save_inspection_snapshot`、`preview_pipeline`、`start_pipeline`、`start_inspection`、`resume_pipeline`、`inspect_pipeline_recovery`、`start_native_task`、`get_task`、`list_tasks`、`clear_task_history` 和 `cancel_task`。worker stdout 只承载 JSONL，诊断进入结构化事件或 stderr。
 
 ## v1.7.6 Linux 发布范围
 
@@ -162,10 +160,12 @@ v1.7.6 以 Linux `x86_64-unknown-linux-gnu` 为阻塞发布平台。发布前至
 pixi run version-check
 pixi run contract-check
 pixi run desktop-sidecar
+pixi run sidecar-check
 pixi run desktop-typecheck
 pixi run desktop-build
 pixi run tauri-build
 pixi run release-candidate
 ```
+`pixi run tauri-build` 会先验证 sidecar 的源码 fingerprint 和 capabilities smoke；sidecar 缺失或过期时必须先运行 `pixi run desktop-sidecar`。
 
 安装后还需确认 bundled worker、字体、图标、前端资源和至少一个真实 Tauri/worker IPC 流程可以从发布包路径加载。未完成 native parity 的操作必须记录实际 backend 和 fallback reason，不能伪装成 native 成功。

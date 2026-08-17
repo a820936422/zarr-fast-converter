@@ -10,6 +10,7 @@
     "request_id": {"type": "string", "minLength": 1},
     "task_id": {"type": ["string", "null"]},
     "command": {
+      "description": "Shared envelope command; native_task and cancel_task are desktop-side and are not forwarded to the Python worker.",
       "enum": ["get_capabilities", "inspect_source", "inspect_zarr", "inspect_time_metadata", "save_inspection_snapshot", "preview_pipeline", "run_pipeline", "resume_pipeline", "native_task", "cancel_task", "shutdown"]
     },
     "payload": {"type": "object"}

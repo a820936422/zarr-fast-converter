@@ -9,6 +9,8 @@ if [[ -n "$target" ]]; then
 else
   bundle_root="$ROOT/target/$profile/bundle"
 fi
+python scripts/check_sidecar.py
+
 
 release_dir="$ROOT/release"
 mkdir -p "$release_dir"
