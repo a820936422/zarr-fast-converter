@@ -121,6 +121,57 @@ class ApplicationServiceTests(unittest.TestCase):
             expected = np.stack([np.full((3, 4), -7, dtype="float32"), np.full((3, 4), 2, dtype="float32")])
             np.testing.assert_equal(dataset.renamed_value.values, expected)
 
+    def test_conversion_progress_uses_effective_output_dtype(self) -> None:
+        source_root = ROOT / "widened-source"
+        source_root.mkdir()
+        for index in range(2):
+            dataset = xr.Dataset(
+                {
+                    "value": (
+                        ("time", "lat", "lon"),
+                        np.full((1, 3, 4), index, dtype="int16"),
+                    )
+                },
+                coords={
+                    "time": np.asarray([np.datetime64("2001-01-01") + np.timedelta64(index, "D")]),
+                    "lat": np.asarray([30, 20, 10], dtype="float32"),
+                    "lon": np.asarray([100, 110, 120, 130], dtype="float32"),
+                },
+            )
+            dataset.to_netcdf(source_root / f"day-{index}.nc", engine="h5netcdf")
+            dataset.close()
+
+        inspection = inspect_source(
+            SourceInspectionConfig(source_root, engine="h5netcdf", workers=1)
+        )
+        expected = 2 * 3 * 4 * np.dtype("float32").itemsize
+        preview = preview_conversion(
+            inspection,
+            ConversionConfig(
+                ROOT / "widened-output.zarr",
+                variable_transforms={"value": VariableTransform(scale_factor=2)},
+                max_workers=1,
+            ),
+        )
+        self.assertEqual(preview.logical_bytes, expected)
+
+        progress: list[tuple[int, int, int | None, str | None]] = []
+        run_conversion(
+            inspection,
+            ConversionConfig(
+                ROOT / "widened-output.zarr",
+                variable_transforms={"value": VariableTransform(scale_factor=2)},
+                max_workers=1,
+                validate=True,
+            ),
+            progress_callback=lambda completed, total, logical_bytes, message: progress.append(
+                (completed, total, logical_bytes, message)
+            ),
+        )
+
+        self.assertTrue(progress)
+        self.assertEqual(progress[-1][:3], (expected, expected, expected))
+
     def test_zarr_service_and_rechunk_preview(self) -> None:
         result = inspect_zarr(ROOT / "input.zarr")
         preview = preview_rechunk(RechunkConfig(ROOT / "input.zarr", ROOT / "output.zarr", workers=1), result.zarr_info)

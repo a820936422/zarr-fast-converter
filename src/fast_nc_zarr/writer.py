@@ -19,7 +19,7 @@ from .models import (
     Selection,
     VariableTransform,
 )
-from .selection import selected_logical_bytes
+from .selection import selected_output_logical_bytes
 from .runtime import bounded_process_map
 
 _OUTPUT_GROUP = None
@@ -891,7 +891,12 @@ def direct_write(
         raise ValueError(f"direct_write 不支持策略 {plan.strategy}")
     total_tasks = _task_count(selection, plan)
     total_batches = _batch_count(inventory, selection, plan, output_layout)
-    total_logical = selected_logical_bytes(inventory, selection)
+    total_logical = selected_output_logical_bytes(
+        inventory,
+        selection,
+        variable_transforms,
+        output_layout,
+    )
     total_chunks = _physical_chunk_count(inventory, selection, plan, output_layout)
     effective_batch = _effective_task_batch(plan.task_batch)
     worker_count = max(1, min(plan.workers, total_batches))

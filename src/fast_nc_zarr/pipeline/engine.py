@@ -23,7 +23,7 @@ from ..application.services import (
     run_resample,
 )
 from ..publication import preflight_writable, publish_staging, validate_publish_target
-from ..selection import selected_logical_bytes
+from ..selection import selected_logical_bytes, selected_output_logical_bytes
 from ..runtime import ProcessLifecycle
 from ..system import effective_resource_budget, runtime_resource_snapshot
 from ..resampling.engine import (
@@ -1207,14 +1207,24 @@ def _run_zarr_pipeline(
             "logical_io": logical_io,
         }
     except Exception as exc:
-        lifecycle.finish(
-            "cancelled" if cancel_event is not None and cancel_event.is_set() else "failed"
-        )
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        terminal_status = "cancelled" if cancelled else "failed"
+        lifecycle.finish(terminal_status)
         manifest["worker_lifecycle"] = lifecycle.to_dict()
-        manifest["status"] = "failed"
+        manifest["status"] = terminal_status
         manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started
-        _write_event(paths.events, "finished", _stage_event_payload(manifest, current_stage, {"status": "failed", "error": str(exc)}, checkpoint=None, terminal_status="failed"))
+        _write_event(
+            paths.events,
+            "finished",
+            _stage_event_payload(
+                manifest,
+                current_stage,
+                {"status": terminal_status, "error": str(exc)},
+                checkpoint=None,
+                terminal_status=terminal_status,
+            ),
+        )
         manifest["error"] = str(exc)
         _write_manifest(paths.manifest, manifest)
         if isinstance(exc, PipelineExecutionError):
@@ -1381,6 +1391,12 @@ def run_pipeline(
             overwrite=False,
             validate=config.validate,
         )
+        conversion_logical_total = selected_output_logical_bytes(
+            inspection.source_inventory,
+            plan.source_selection,
+            conversion.variable_transforms,
+            plan.output_layout if conversion_is_final else None,
+        )
         if progress:
             stage_total = len(physical_stages)
             print(
@@ -1397,7 +1413,7 @@ def run_pipeline(
             "conversion",
             (paths.root, conversion_output),
             checkpoint="source-crop.zarr" if not conversion_is_final else "output",
-            logical_total=selected_logical_bytes(inspection.source_inventory, plan.source_selection),
+            logical_total=conversion_logical_total,
             progress_callback=progress_callback,
         ) as stage_report:
             conversion_plan, conversion_metrics = run_conversion(
@@ -1406,7 +1422,7 @@ def run_pipeline(
                 cancel_event=cancel_event,
                 progress_callback=_stage_progress_callback(
                     stage_report,
-                    selected_logical_bytes(inspection.source_inventory, plan.source_selection),
+                    conversion_logical_total,
                 ),
             )
         manifest["stages"]["conversion"] = {
@@ -1726,14 +1742,24 @@ def run_pipeline(
             "logical_io": logical_io,
         }
     except Exception as exc:
-        lifecycle.finish(
-            "cancelled" if cancel_event is not None and cancel_event.is_set() else "failed"
-        )
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        terminal_status = "cancelled" if cancelled else "failed"
+        lifecycle.finish(terminal_status)
         manifest["worker_lifecycle"] = lifecycle.to_dict()
-        manifest["status"] = "failed"
+        manifest["status"] = terminal_status
         manifest["failed_stage"] = current_stage
         manifest["elapsed"] = time.perf_counter() - started
-        _write_event(paths.events, "finished", _stage_event_payload(manifest, current_stage, {"status": "failed", "error": str(exc)}, checkpoint=None, terminal_status="failed"))
+        _write_event(
+            paths.events,
+            "finished",
+            _stage_event_payload(
+                manifest,
+                current_stage,
+                {"status": terminal_status, "error": str(exc)},
+                checkpoint=None,
+                terminal_status=terminal_status,
+            ),
+        )
         manifest["error"] = str(exc)
         _write_manifest(paths.manifest, manifest)
         if isinstance(exc, PipelineExecutionError):

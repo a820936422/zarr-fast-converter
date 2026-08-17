@@ -21,7 +21,6 @@ from ..filename_mode import (
     FilenameScan,
     convert_filename as core_convert_filename,
     discover_filename_files,
-    filename_logical_bytes,
     FAST_STRUCTURE_SAMPLE_LIMIT,
     inspect_filename_inventory,
     probe_dataset_structure,
@@ -41,7 +40,7 @@ from ..models import (
     VariableTransform,
 )
 from ..planner import resolve_conversion_plan
-from ..selection import make_selection, selected_logical_bytes
+from ..selection import make_selection, selected_output_logical_bytes
 from ..rechunking.compression import make_compression_plan
 from ..rechunking.engine import RechunkExecutionError, run_rechunk as core_run_rechunk
 from ..rechunking.inspection import format_inspection, inspect_store
@@ -715,10 +714,11 @@ def preview_conversion(
         max_workers=config.max_workers,
         resource_budget=config.resource_budget,
     )
-    logical = (
-        filename_logical_bytes(inventory, selection, config.variable_transforms)
-        if inventory.source_mode == "filename"
-        else selected_logical_bytes(inventory, selection)
+    logical = selected_output_logical_bytes(
+        inventory,
+        selection,
+        config.variable_transforms,
+        config.output_layout,
     )
     return ConversionPreview(inventory, selection, plan, logical)
 

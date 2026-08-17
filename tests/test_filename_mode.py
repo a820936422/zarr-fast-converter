@@ -150,7 +150,8 @@ class FilenameModeTests(unittest.TestCase):
         self.assertEqual(len(inventory.missing_time_keys), 1)
         selection = make_selection(inventory)
         output = ROOT / "gap-output.zarr"
-        convert_filename(
+        progress: list[tuple[int, int, int | None, str | None]] = []
+        _, metrics = convert_filename(
             inventory,
             selection,
             output,
@@ -158,7 +159,12 @@ class FilenameModeTests(unittest.TestCase):
             variable_names={"value": "renamed_value"},
             plan=ConversionPlan("file", 1, 1, 2, 2),
             progress=False,
+            progress_callback=lambda completed, total, logical_bytes, message: progress.append(
+                (completed, total, logical_bytes, message)
+            ),
         )
+        self.assertEqual(metrics["logical_bytes"], 4 * 2 * 2 * np.dtype("float32").itemsize)
+        self.assertEqual(progress[-1][:3], (metrics["logical_bytes"],) * 3)
         with xr.open_zarr(output, consolidated=False, chunks=None, mask_and_scale=False) as dataset:
             np.testing.assert_equal(
                 dataset.time.values,

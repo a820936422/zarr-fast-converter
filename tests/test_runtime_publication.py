@@ -40,6 +40,10 @@ def _zarr_marker(path: Path) -> None:
 def _raise_from_worker(value):
     raise RuntimeError(f"worker failure: {value}")
 
+def _crash_from_worker(_value):
+    os._exit(97)
+
+
 class RuntimePublicationTests(unittest.TestCase):
     def setUp(self) -> None:
         shutil.rmtree(ROOT, ignore_errors=True)
@@ -102,6 +106,18 @@ class RuntimePublicationTests(unittest.TestCase):
                     workers=2,
                 )
             )
+
+    def test_bounded_process_map_handles_crashed_workers(self) -> None:
+        with self.assertRaises(Exception) as context:
+            list(
+                bounded_process_map(
+                    _crash_from_worker,
+                    range(4),
+                    workers=2,
+                )
+            )
+        self.assertIn("process", str(context.exception).lower())
+
     def test_executor_fallback_terminates_private_processes(self) -> None:
         class Process:
             def __init__(self) -> None:
@@ -161,6 +177,32 @@ class RuntimePublicationTests(unittest.TestCase):
 
         self.assertTrue((target / "old").is_file())
         self.assertTrue(staging.is_dir())
+
+    def test_publish_rejects_cross_filesystem_staging(self) -> None:
+        staging_parent = ROOT / "staging-parent"
+        target_parent = ROOT / "target-parent"
+        staging_parent.mkdir()
+        target_parent.mkdir()
+        staging = staging_parent / "output.zarr"
+        target = target_parent / "output.zarr"
+        _zarr_marker(staging)
+
+        path_type = type(staging_parent)
+        original_stat = path_type.stat
+        def fake_stat(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if str(path).endswith("staging-parent"):
+                values = list(result)
+                values[2] += 1
+                return os.stat_result(values)
+            return result
+
+        with patch.object(path_type, "stat", autospec=True, side_effect=fake_stat):
+            with self.assertRaisesRegex(OSError, "同一文件系统"):
+                publish_staging(staging, target, "cross-device")
+
+        self.assertTrue(staging.is_dir())
+        self.assertFalse(target.exists())
 
     def test_target_validation_rejects_symlink_and_plain_directory(self) -> None:
         plain = ROOT / "plain"

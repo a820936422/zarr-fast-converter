@@ -17,7 +17,7 @@ from .planner import (
     resolve_conversion_plan,
 )
 from .publication import make_staging_path, preflight_writable, publish_staging, validate_publish_target
-from .selection import selected_logical_bytes
+from .selection import selected_output_logical_bytes
 from .validation import validate_output
 from .system import EffectiveResourceBudget, effective_resource_budget
 from .writer import direct_write, make_compressor
@@ -239,7 +239,12 @@ def _dask_write(
             with dask.config.set(scheduler="processes", num_workers=plan.workers):
                 dask.compute(delayed)
         elapsed = time.perf_counter() - started
-        logical = selected_logical_bytes(inventory, selection)
+        logical = selected_output_logical_bytes(
+            inventory,
+            selection,
+            variable_transforms,
+            output_layout,
+        )
         if progress_callback is not None:
             progress_callback(logical, logical, logical, "Dask 转换写入完成")
         return {
@@ -339,6 +344,12 @@ def convert(
                 "output_layout": output_layout,
                 "cancel_event": cancel_event,
             },
+            logical_bytes_fn=lambda info, chosen: selected_output_logical_bytes(
+                info,
+                chosen,
+                variable_transforms,
+                output_layout,
+            ),
             fixed_layout=fixed_layout,
             minimum_candidates=3 if fixed_layout else 1,
         )
@@ -353,7 +364,12 @@ def convert(
             selected_result.logical_bytes, 1
         )
         estimated_output = int(
-            selected_logical_bytes(inventory, selection)
+            selected_output_logical_bytes(
+                inventory,
+                selection,
+                variable_transforms,
+                output_layout,
+            )
             * compression_ratio
             * COMPRESSION_SAFETY
         )

@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .models import Inventory, Selection
+from .models import Inventory, OutputLayout, Selection, VariableSpec, VariableTransform
 
 
 _UNQUOTED_DATE_TOKEN = re.compile(
@@ -140,4 +140,56 @@ def selected_logical_bytes(inventory: Inventory, selection: Selection) -> int:
                 original_size = next(non_time_sizes)
                 count *= sizes.get(dim, original_size)
         total += count * spec.itemsize
+    return total
+
+def effective_output_dtype(
+    spec: VariableSpec,
+    transform: VariableTransform | None = None,
+) -> np.dtype:
+    """Return the dtype used by conversion writers after raw transforms."""
+    dtype = np.dtype(spec.dtype)
+    if (
+        transform is not None
+        and (transform.scale_factor is not None or transform.add_offset is not None)
+        and dtype.kind not in "fc"
+    ):
+        return np.dtype("float32" if dtype.itemsize <= 4 else "float64")
+    return dtype
+
+
+def selected_output_logical_bytes(
+    inventory: Inventory,
+    selection: Selection,
+    variable_transforms: dict[str, VariableTransform] | None = None,
+    output_layout: OutputLayout | None = None,
+) -> int:
+    """Return uncompressed bytes written by conversion data-variable chunks.
+
+    Unlike :func:`selected_logical_bytes`, this uses effective output dtypes.
+    An explicit output layout is authoritative when conversion is the final
+    stage; otherwise transform rules determine the output dtype.
+    """
+    transforms = variable_transforms or {}
+    nt, ny, nx = selection.shape
+    sizes = {"time": nt, "lat": ny, "lon": nx}
+    total = 0
+    for name in selection.variables:
+        if output_layout is not None:
+            try:
+                layout = output_layout.for_source(name)
+            except KeyError:
+                layout = None
+            if layout is not None:
+                total += int(np.prod(layout.shape)) * np.dtype(layout.dtype).itemsize
+                continue
+        spec = inventory.variables[name]
+        count = 1
+        non_time_sizes = iter(spec.shape_without_time)
+        for dim in spec.dims:
+            if dim == "time":
+                count *= nt
+            else:
+                original_size = next(non_time_sizes)
+                count *= sizes.get(dim, original_size)
+        total += count * effective_output_dtype(spec, transforms.get(name)).itemsize
     return total

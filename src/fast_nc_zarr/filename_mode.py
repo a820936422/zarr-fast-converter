@@ -51,6 +51,7 @@ from .system import EffectiveResourceBudget, effective_resource_budget
 from .publication import make_staging_path, preflight_writable, publish_staging, validate_publish_target
 from .runtime import bounded_process_map, spawn_context
 from .writer import _monitor, compressor_from_spec, make_compressor, progress_line
+from .selection import effective_output_dtype, selected_output_logical_bytes
 
 
 FILENAME_SUFFIXES = {".nc", ".nc4", ".nc3", ".cdf", ".hdf", ".tif", ".tiff"}
@@ -1366,26 +1367,21 @@ def source_path_by_time(inventory: Inventory) -> dict[str, Path]:
 
 
 def _output_dtype(spec: VariableSpec, transform: VariableTransform | None) -> np.dtype:
-    dtype = np.dtype(spec.dtype)
-    if transform is not None and transform.scale_factor is not None and dtype.kind not in "fc":
-        # A manually requested scale must not silently overflow an integer
-        # result.  float32 is sufficient for the usual remote-sensing scale
-        # factors and keeps the output compact.
-        return np.dtype("float32" if dtype.itemsize <= 4 else "float64")
-    return dtype
+    return effective_output_dtype(spec, transform)
 
 
 def filename_logical_bytes(
     inventory: Inventory,
     selection: Selection,
     transforms: dict[str, VariableTransform] | None = None,
+    output_layout: OutputLayout | None = None,
 ) -> int:
     """Uncompressed output size, including synthetic theoretical times."""
-    transforms = transforms or {}
-    nt, ny, nx = selection.shape
-    return sum(
-        nt * ny * nx * _output_dtype(inventory.variables[name], transforms.get(name)).itemsize
-        for name in selection.variables
+    return selected_output_logical_bytes(
+        inventory,
+        selection,
+        transforms,
+        output_layout,
     )
 
 
@@ -1868,7 +1864,12 @@ def filename_direct_write(
     batch_size = plan.task_batch if plan.strategy == "file" else plan.chunk_time
     batch_size = max(1, batch_size)
     total_tasks = ceil(nt / batch_size)
-    total_logical = filename_logical_bytes(inventory, selection, transforms)
+    total_logical = filename_logical_bytes(
+        inventory,
+        selection,
+        transforms,
+        output_layout,
+    )
     if total_tasks == 0:
         raise ValueError("没有可写入的时间点。")
 
@@ -1969,7 +1970,12 @@ def filename_direct_write(
         )
     return {
         "elapsed": elapsed,
-        "logical_bytes": filename_logical_bytes(inventory, selection, transforms),
+        "logical_bytes": filename_logical_bytes(
+            inventory,
+            selection,
+            transforms,
+            output_layout,
+        ),
         "throughput_mib_s": logical_bytes / max(elapsed, 1e-9) / 1024**2,
         "average_cpu": sum(cpu for cpu, _ in samples) / len(samples) if samples else 0.0,
         "peak_rss": max((rss for _, rss in samples), default=0),
@@ -2082,7 +2088,10 @@ def convert_filename(
                 "validate": False,
             },
             logical_bytes_fn=lambda info, chosen: filename_logical_bytes(
-                info, chosen, transforms
+                info,
+                chosen,
+                transforms,
+                output_layout,
             ),
             fixed_layout=fixed_layout,
         )
@@ -2097,7 +2106,12 @@ def convert_filename(
             selected_result.logical_bytes, 1
         )
         estimated_output = int(
-            filename_logical_bytes(inventory, selection, transforms)
+            filename_logical_bytes(
+                inventory,
+                selection,
+                transforms,
+                output_layout,
+            )
             * compression_ratio
             * COMPRESSION_SAFETY
         )

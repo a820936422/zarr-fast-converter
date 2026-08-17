@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 import os
 import tempfile
 import time
+from threading import Event
 import io
 import shutil
 import json
@@ -973,6 +974,88 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse((root / "resampled.zarr").exists())
         self.assertTrue(config.general.output.exists())
 
+
+    def test_success_without_cleanup_retains_validated_checkpoint(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(
+                ROOT,
+                mode="complete",
+                engine="h5netcdf",
+                workers=1,
+            )
+        )
+        config = self._config(ROOT / "retained-checkpoint-result.zarr")
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        root = Path(manifest["temporary_root"])
+
+        self.assertEqual(manifest["status"], "succeeded")
+        self.assertFalse(manifest["cleanup_intermediate"])
+        self.assertEqual(manifest["stages"]["conversion"]["status"], "validated")
+        self.assertTrue((root / "source-crop.zarr" / "zarr.json").is_file())
+        self.assertTrue(config.general.output.exists())
+
+    def test_cancelled_pipeline_records_cancelled_terminal_state(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(
+                ROOT,
+                mode="complete",
+                engine="h5netcdf",
+                workers=1,
+            )
+        )
+        config = self._config(ROOT / "cancelled-result.zarr")
+        cancelled = Event()
+        cancelled.set()
+
+        with self.assertRaises(PipelineExecutionError):
+            run_pipeline(inspection, config, cancel_event=cancelled, progress=False)
+
+        roots = list((ROOT / "temporary" / "fast-nc-zarr-pipeline").iterdir())
+        self.assertEqual(len(roots), 1)
+        manifest = json.loads((roots[0] / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "cancelled")
+        self.assertEqual(manifest["worker_lifecycle"]["exit_reason"], "cancelled")
+        events = [
+            json.loads(line)
+            for line in (roots[0] / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        terminal = [event for event in events if event["event"] == "finished"][-1]
+        self.assertEqual(terminal["terminal_status"], "cancelled")
+        self.assertFalse(config.general.output.exists())
+
+    def test_cancelled_zarr_pipeline_records_cancelled_terminal_state(self) -> None:
+        inspection = inspect_zarr(ROOT / "canonical-input.zarr")
+        base = self._config(ROOT / "cancelled-zarr-result.zarr")
+        temporary = ROOT / "cancelled-zarr-temporary"
+        config = replace(
+            base,
+            input=PipelineInput(kind="zarr"),
+            operations=PipelineOperations(resample=True),
+            general=replace(base.general, temporary_dir=temporary),
+            validate=False,
+        )
+        cancelled = Event()
+        cancelled.set()
+
+        with self.assertRaises(PipelineExecutionError):
+            run_pipeline(inspection, config, cancel_event=cancelled, progress=False)
+
+        roots = list((temporary / "fast-nc-zarr-pipeline").iterdir())
+        self.assertEqual(len(roots), 1)
+        manifest = json.loads((roots[0] / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "cancelled")
+        self.assertEqual(manifest["worker_lifecycle"]["exit_reason"], "cancelled")
+        events = [
+            json.loads(line)
+            for line in (roots[0] / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        terminal = [event for event in events if event["event"] == "finished"][-1]
+        self.assertEqual(terminal["terminal_status"], "cancelled")
+        self.assertFalse(config.general.output.exists())
+
     def test_resample_math_failure_does_not_replace_existing_output(self) -> None:
         inspection = inspect_source(
             SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
@@ -1167,6 +1250,29 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertTrue(original_manifest["retained_checkpoints_cleaned"])
         self.assertFalse(recovered.recovery.checkpoint.exists())
+
+    def test_recovery_rejects_checkpoint_outside_job_directory(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        temporary = ROOT / "escape-recovery-temporary"
+        config = self._config(ROOT / "escape-recovery-output.zarr")
+        config = replace(config, general=replace(config.general, temporary_dir=temporary))
+        with patch(
+            "fast_nc_zarr.pipeline.engine.run_resample",
+            side_effect=RuntimeError("simulated recovery source failure"),
+        ):
+            with self.assertRaises(PipelineExecutionError):
+                run_pipeline(inspection, config, progress=False)
+
+        job = next((temporary / "fast-nc-zarr-pipeline").iterdir())
+        manifest_path = job / "manifest.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["resume"]["checkpoints"]["conversion"]["path"] = "../outside.zarr"
+        manifest_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        with self.assertRaisesRegex(Exception, "越出任务目录"):
+            inspect_temporary_pipeline(temporary)
 
 
 if __name__ == "__main__":
