@@ -255,9 +255,19 @@ class DesktopWorkerTests(unittest.TestCase):
                 check=True,
                 env=environment,
             )
-            inspection_events = [json.loads(line) for line in inspect.stdout.splitlines() if line.strip()]
-            snapshot = inspection_events[-1]["payload"]["inspection_snapshot_path"]
-
+            inspection_events = [
+                json.loads(line) for line in inspect.stdout.splitlines() if line.strip()
+            ]
+            inspection_payload = inspection_events[-1]["payload"]
+            transport_snapshot = inspection_payload["snapshot"]
+            self.assertNotIn("inventory", transport_snapshot)
+            self.assertNotIn("lat_values", transport_snapshot["coordinates"])
+            self.assertNotIn("lon_values", transport_snapshot["coordinates"])
+            snapshot = inspection_payload["inspection_snapshot_path"]
+            persisted_snapshot = json.loads(Path(snapshot).read_text(encoding="utf-8"))
+            self.assertIn("inventory", persisted_snapshot)
+            self.assertIn("lat_values", persisted_snapshot["coordinates"])
+            self.assertIn("lon_values", persisted_snapshot["coordinates"])
             run = subprocess.run(
                 [sys.executable, "-m", "fast_nc_zarr.application.desktop_worker"],
                 cwd=PROJECT,

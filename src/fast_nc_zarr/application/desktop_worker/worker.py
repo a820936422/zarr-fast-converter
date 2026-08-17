@@ -45,6 +45,20 @@ def _safe(value: Any) -> Any:
     return value
 
 
+def _compact_inspection_snapshot(result: Any) -> dict[str, Any]:
+    """Keep full recovery state on disk and send only UI-required fields over IPC."""
+
+    snapshot = result.snapshot()
+    if result.kind != "source":
+        return snapshot
+    snapshot.pop("inventory", None)
+    coordinates = dict(snapshot.get("coordinates") or {})
+    coordinates.pop("lat_values", None)
+    coordinates.pop("lon_values", None)
+    snapshot["coordinates"] = coordinates
+    return snapshot
+
+
 def _path(payload: dict[str, Any], key: str) -> Path:
     value = payload.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -523,7 +537,7 @@ def _dispatch_impl(request: Request, sink: _EventSink, cancel_event: ThreadEvent
             "path": str(result.path),
             "report": result.report,
             "warnings": result.warnings,
-            "snapshot": result.snapshot(),
+            "snapshot": _compact_inspection_snapshot(result),
         }
         if snapshot_path is not None:
             payload["inspection_snapshot_path"] = str(snapshot_path)

@@ -71,6 +71,52 @@ def write_fixture(
     ds.to_netcdf(path, engine="h5netcdf", encoding=encoding)
 
 
+def write_cf_auxiliary_fixture(
+    path: Path,
+    day: int,
+    *,
+    bounds_dtype: str = "float64",
+    bounds_units: str | None = None,
+    value_units: str = "g m-2 d-1",
+) -> None:
+    bounds_attrs = {"long_name": "Start and End Time for Each Time Slice"}
+    if bounds_units is not None:
+        bounds_attrs["units"] = bounds_units
+    dataset = xr.Dataset(
+        {
+            "value": (
+                ("time", "lat", "lon"),
+                np.full((1, 2, 3), day, dtype="float32"),
+                {
+                    "units": value_units,
+                    "grid_mapping": "crs",
+                    "coordinates": "time lat lon",
+                },
+            ),
+            "time_bnds": (
+                ("time", "nv"),
+                np.asarray([[day, day + 1]], dtype=bounds_dtype),
+                bounds_attrs,
+            ),
+            "crs": ((), np.float64(0), {"long_name": "Coordinate Reference System"}),
+        },
+        coords={
+            "time": (
+                "time",
+                np.asarray([day + 0.5], dtype="float64"),
+                {
+                    "units": "days since 2000-01-01 00:00:00",
+                    "bounds": "time_bnds",
+                },
+            ),
+            "lat": np.asarray([0.25, -0.25], dtype="float32"),
+            "lon": np.asarray([-0.5, 0.0, 0.5], dtype="float32"),
+        },
+    )
+    dataset.to_netcdf(path, engine="h5netcdf")
+    dataset.close()
+
+
 class EndToEndTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -332,6 +378,34 @@ class EndToEndTests(unittest.TestCase):
         second.close()
         inventory = inspect_dataset(folder, engine="h5netcdf", workers=1, progress=False)
         self.assertEqual(set(inventory.variables), {"temperature", "quality", "permuted"})
+
+    def test_inspection_ignores_cf_auxiliary_schema_variants(self) -> None:
+        folder = ROOT / "cf-auxiliary-variants"
+        folder.mkdir()
+        write_cf_auxiliary_fixture(folder / "a.nc", 0)
+        write_cf_auxiliary_fixture(
+            folder / "b.nc", 1, bounds_units="days since 2000-01-01"
+        )
+        write_cf_auxiliary_fixture(folder / "c.nc", 2, bounds_dtype="int64")
+
+        inventory = inspect_dataset(folder, engine="h5netcdf", workers=1, progress=False)
+
+        self.assertEqual(set(inventory.variables), {"value"})
+        self.assertEqual(len(inventory.times), 3)
+
+        xarray_inventory = inspect_dataset(
+            folder, engine="netcdf4", workers=1, progress=False
+        )
+        self.assertEqual(set(xarray_inventory.variables), {"value"})
+
+    def test_inspection_rejects_science_variable_schema_changes(self) -> None:
+        folder = ROOT / "science-schema-mismatch"
+        folder.mkdir()
+        write_cf_auxiliary_fixture(folder / "a.nc", 0)
+        write_cf_auxiliary_fixture(folder / "b.nc", 1, value_units="kg m-2 d-1")
+
+        with self.assertRaisesRegex(ValueError, "变量定义与首文件不同"):
+            inspect_dataset(folder, engine="h5netcdf", workers=1, progress=False)
 
     def test_h5netcdf_inspection_avoids_xarray_dataset_construction(self) -> None:
         with patch(

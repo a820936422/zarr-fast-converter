@@ -93,6 +93,36 @@ def _clean_attr(value: Any) -> Any:
         return tuple(_clean_attr(item) for item in value)
     return value
 
+_CF_SINGLE_AUXILIARY_REFERENCES = (
+    "bounds",
+    "climatology",
+    "geometry",
+    "grid_mapping",
+)
+_CF_LIST_AUXILIARY_REFERENCES = ("coordinates", "node_coordinates")
+
+
+def _referenced_auxiliary_names(variables) -> set[str]:
+    """Return CF-referenced coordinate, bounds, geometry, and CRS variables."""
+
+    referenced: set[str] = set()
+    for variable in variables:
+        attrs = getattr(variable, "attrs", {})
+        for attribute in _CF_SINGLE_AUXILIARY_REFERENCES:
+            if attribute not in attrs:
+                continue
+            value = _clean_attr(attrs.get(attribute))
+            tokens = str(value).split() if value is not None else []
+            if len(tokens) == 1:
+                referenced.add(tokens[0])
+        for attribute in _CF_LIST_AUXILIARY_REFERENCES:
+            if attribute not in attrs:
+                continue
+            value = _clean_attr(attrs.get(attribute))
+            if value is not None:
+                referenced.update(str(value).split())
+    return referenced
+
 
 _SUPPORTED_CALENDARS = frozenset({"", "standard", "gregorian", "proleptic_gregorian", "julian"})
 
@@ -222,8 +252,12 @@ def _inspect_file_xarray(
                 time_rule,
                 filename_fields,
             )
+        auxiliary_names = set(ds.coords)
+        auxiliary_names.update(_referenced_auxiliary_names(ds.variables.values()))
         specs = []
         for name, variable in ds.data_vars.items():
+            if name in auxiliary_names:
+                continue
             chunks = variable.encoding.get("chunksizes")
             specs.append(
                 VariableSpec(
@@ -319,12 +353,13 @@ def _inspect_file_h5py(
             )
 
         coordinate_names = set(source_dimensions)
-        for variable in dataset.values():
-            if not isinstance(variable, h5py.Dataset):
-                continue
-            value = _clean_attr(variable.attrs.get("coordinates", ""))
-            if value:
-                coordinate_names.update(str(value).split())
+        coordinate_names.update(
+            _referenced_auxiliary_names(
+                variable
+                for variable in dataset.values()
+                if isinstance(variable, h5py.Dataset)
+            )
+        )
         rename_dimensions = dict(zip(source_dimensions, CANONICAL_DIMENSIONS))
         specs = []
         for name, variable in dataset.items():
@@ -436,10 +471,9 @@ def _inspect_file_h5netcdf(
             )
 
         coordinate_names = set(source_dimensions)
-        for variable in dataset.variables.values():
-            value = variable.attrs.get("coordinates")
-            if value:
-                coordinate_names.update(str(value).split())
+        coordinate_names.update(
+            _referenced_auxiliary_names(dataset.variables.values())
+        )
         rename_dimensions = dict(zip(source_dimensions, CANONICAL_DIMENSIONS))
         specs = []
         for name, variable in dataset.variables.items():
