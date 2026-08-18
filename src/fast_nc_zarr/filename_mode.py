@@ -1828,6 +1828,94 @@ def _filename_write_task(task: FilenameTimeWriteTask) -> int:
 
 
 
+def _filename_read_phase(task: FilenameTimeWriteTask) -> dict[str, object]:
+    """Read phase for phase-batched writes.
+
+    Opens the source files for one task and extracts raw per-row block
+    arrays (after axis reversal).  Writes are deferred to
+    ``_filename_write_phase`` so all reads of a window happen before any
+    writes, reducing same-device HDD head thrash.
+    """
+    context = _FILENAME_CONTEXT
+    names = tuple(context["specs"])
+    blocks: dict[str, list[list[np.ndarray | None]]] = {
+        name: [] for name in names
+    }
+    with contextlib.ExitStack() as stack:
+        sources = []
+        for _, source_path in task.entries:
+            if source_path is None:
+                sources.append(None)
+                continue
+            dataset, _ = stack.enter_context(
+                _normalized_filename_dataset(Path(source_path), context["engine"])
+            )
+            sources.append(dataset)
+
+        for y0, y1, x0, x1 in task.blocks:
+            source_y0, source_y1 = (
+                (context["lat_size"] - y1, context["lat_size"] - y0)
+                if context["reverse_lat"] else (y0, y1)
+            )
+            source_x0, source_x1 = (
+                (context["lon_size"] - x1, context["lon_size"] - x0)
+                if context["reverse_lon"] else (x0, x1)
+            )
+            source_lat = slice(
+                context["lat_start"] + source_y0,
+                context["lat_start"] + source_y1,
+            )
+            source_lon = slice(
+                context["lon_start"] + source_x0,
+                context["lon_start"] + source_x1,
+            )
+            for name in names:
+                rows: list[np.ndarray | None] = []
+                for source in sources:
+                    if source is None:
+                        rows.append(None)
+                        continue
+                    raw = source[name].isel(lat=source_lat, lon=source_lon).values
+                    if context["reverse_lat"]:
+                        raw = np.flip(raw, axis=0)
+                    if context["reverse_lon"]:
+                        raw = np.flip(raw, axis=1)
+                    rows.append(raw)
+                blocks[name].append(rows)
+    return {"task": task, "blocks": blocks}
+
+
+def _filename_write_phase(payload: dict[str, object]) -> int:
+    """Write phase for phase-batched writes (mirror of the write half)."""
+    context = _FILENAME_CONTEXT
+    group = _FILENAME_OUTPUT_GROUP
+    specs = context["specs"]
+    transforms = context["transforms"]
+    effective = context["effective"]
+    variable_names = context["variable_names"]
+    task = payload["task"]
+    blocks = payload["blocks"]
+    names = tuple(specs)
+    total_bytes = 0
+    for block_index, (y0, y1, x0, x1) in enumerate(task.blocks):
+        block_shape = (task.time_stop - task.time_start, y1 - y0, x1 - x0)
+        for name in names:
+            dtype, fill = effective[name]
+            data = np.empty(block_shape, dtype=dtype)
+            for row, raw in enumerate(blocks[name][block_index]):
+                if raw is None:
+                    data[row].fill(fill)
+                    continue
+                data[row] = _prepare_filename_data(
+                    raw, specs[name], transforms.get(name), dtype, fill
+                )
+            group[variable_names.get(name, name)][
+                task.time_start : task.time_stop, y0:y1, x0:x1
+            ] = data
+            total_bytes += int(data.nbytes)
+    return total_bytes
+
+
 def filename_direct_write(
     inventory: Inventory,
     selection: Selection,
@@ -1841,6 +1929,7 @@ def filename_direct_write(
     validate: bool = False,
     progress: bool = True,
     progress_callback=None,
+    phase_batch: bool = False,
 ) -> dict[str, float | int]:
     """Parallel writer for files that contribute one reconstructed time slice."""
     transforms = transforms or {}
@@ -1927,37 +2016,75 @@ def filename_direct_write(
             variable_names,
         ),
     )
-    try:
-        results = pool.map(
-            _filename_write_task,
-            write_tasks(),
-            cancel_event=cancel_event,
-        )
-        for completed, amount in enumerate(results, 1):
-            logical_bytes += amount
-            if progress_callback is not None:
-                progress_callback(
-                    min(total_logical, logical_bytes),
-                    total_logical,
+    def _report(completed: int, amount: int) -> None:
+        nonlocal logical_bytes
+        logical_bytes += amount
+        if progress_callback is not None:
+            progress_callback(
+                min(total_logical, logical_bytes),
+                total_logical,
+                logical_bytes,
+                f"文件名时间写入：{completed}/{total_tasks}",
+            )
+        if progress and (completed == total_tasks or completed % report_every == 0):
+            elapsed = max(time.perf_counter() - started, 1e-9)
+            cpu, rss = samples[-1] if samples else (None, None)
+            print(
+                progress_line(
+                    completed,
+                    total_tasks,
                     logical_bytes,
-                    f"文件名时间写入：{completed}/{total_tasks}",
-                )
-            if progress and (completed == total_tasks or completed % report_every == 0):
-                elapsed = max(time.perf_counter() - started, 1e-9)
-                cpu, rss = samples[-1] if samples else (None, None)
-                print(
-                    progress_line(
-                        completed,
-                        total_tasks,
-                        logical_bytes,
-                        elapsed,
-                        prefix="文件名时间写入",
-                        cpu=cpu,
-                        rss=rss,
-                    ),
-                    end="",
-                    flush=True,
-                )
+                    elapsed,
+                    prefix="文件名时间写入",
+                    cpu=cpu,
+                    rss=rss,
+                ),
+                end="",
+                flush=True,
+            )
+
+    try:
+        if phase_batch:
+            # Same-device HDD optimization: process tasks in bounded windows
+            # with a read phase followed by a write phase on the same pool.
+            # All reads of a window complete before any writes start, which
+            # reduces read/write head thrash; memory stays bounded to one
+            # window of raw source arrays.
+            window_size = max(1, worker_count)
+            window: list[dict[str, object]] = []
+            completed = 0
+            for read_result in pool.map(
+                _filename_read_phase,
+                write_tasks(),
+                cancel_event=cancel_event,
+                max_pending=window_size,
+            ):
+                window.append(read_result)
+                if len(window) >= window_size:
+                    for amount in pool.map(
+                        _filename_write_phase,
+                        window,
+                        cancel_event=cancel_event,
+                    ):
+                        completed += 1
+                        _report(completed, amount)
+                    window = []
+            if window:
+                for amount in pool.map(
+                    _filename_write_phase,
+                    window,
+                    cancel_event=cancel_event,
+                ):
+                    completed += 1
+                    _report(completed, amount)
+        else:
+            results = pool.map(
+                _filename_write_task,
+                write_tasks(),
+                cancel_event=cancel_event,
+            )
+            for completed, amount in enumerate(results, 1):
+                _report(completed, amount)
     finally:
         pool.close()
         stop.set()
@@ -1989,6 +2116,7 @@ def filename_direct_write(
         "tasks": total_tasks,
         "chunk_owner_writes": total_tasks * len(blocks) * len(selection.variables),
         "write_mode": "chunk-owner",
+        "phase_batch": bool(phase_batch),
     }
 
 
@@ -2013,6 +2141,7 @@ def convert_filename(
     validate: bool = True,
     progress: bool = True,
     staging_root: Path | None = None,
+    phase_batch: bool = False,
     progress_callback=None,
 ) -> tuple[ConversionPlan, dict[str, float | int]]:
     """Tune and write one 2-D source file per reconstructed time coordinate."""
@@ -2153,6 +2282,7 @@ def convert_filename(
             validate=validate,
             progress=progress,
             progress_callback=progress_callback,
+            phase_batch=phase_batch,
         )
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("任务已取消，未发布输出。")

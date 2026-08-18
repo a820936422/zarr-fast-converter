@@ -45,6 +45,14 @@ pixi run convert -- \
   --staging-root /fast-ssd/scratch
 ```
 
+同设备 HDD 分批读写（filename 模式，窗口内先读后写降低磁头争用）：
+
+```bash
+pixi run convert -- \
+  --mode filename --input /data/daily-files --output /data/result.zarr \
+  --template doy --phase-batch
+```
+
 核心服务位于 `fast_nc_zarr.application.services`：
 
 - `inspect_source(SourceInspectionConfig(...))`

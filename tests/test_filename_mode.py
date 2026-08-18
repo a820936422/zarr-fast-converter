@@ -15,6 +15,7 @@ import xarray as xr
 from fast_nc_zarr.filename_mode import (
     FilenameTimeError,
     convert_filename,
+    filename_direct_write,
     inspect_filename_inventory,
     scan_filename_times,
 )
@@ -527,6 +528,48 @@ gc.collect()
             auto_tune=False,
             progress=False,
         )
+
+    def test_phase_batch_write_matches_normal_write(self) -> None:
+        folder = ROOT / "phase-batch"
+        folder.mkdir()
+        lat = np.asarray([10.0, 20.0, 30.0], dtype="float32")
+        lon = np.asarray([0.0, 1.0, 2.0, 3.0], dtype="float32")
+        for index, doy in enumerate(("001", "005")):
+            dataset = xr.Dataset(
+                {
+                    "value": (
+                        ("latitude", "longitude"),
+                        np.arange(12, dtype="float32").reshape(3, 4) + index * 10,
+                    )
+                },
+                coords={"latitude": lat, "longitude": lon},
+            )
+            dataset.to_netcdf(folder / f"product_2001{doy}.nc", engine="h5netcdf")
+            dataset.close()
+
+        inventory = inspect_filename_inventory(
+            scan_filename_times(folder), workers=1, progress=False
+        )
+        selection = make_selection(inventory)
+        plan = ConversionPlan("file", 2, 1, 2, 3, task_batch=1)
+        normal = ROOT / "phase-batch-normal.zarr"
+        phased = ROOT / "phase-batch-phased.zarr"
+        filename_direct_write(inventory, selection, normal, plan, progress=False)
+        filename_direct_write(
+            inventory,
+            selection,
+            phased,
+            plan,
+            progress=False,
+            phase_batch=True,
+        )
+        with (
+            xr.open_zarr(normal, consolidated=False, chunks=None, decode_times=False) as left,
+            xr.open_zarr(phased, consolidated=False, chunks=None, decode_times=False) as right,
+        ):
+            np.testing.assert_array_equal(left["value"].values, right["value"].values)
+            np.testing.assert_array_equal(left["lat"].values, right["lat"].values)
+            np.testing.assert_array_equal(left["lon"].values, right["lon"].values)
 
 
 if __name__ == "__main__":

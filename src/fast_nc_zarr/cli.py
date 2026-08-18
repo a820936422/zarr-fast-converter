@@ -77,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reserve-memory", type=float, default=2.0, help="为系统保留的内存 GiB。")
     parser.add_argument("--overwrite", action="store_true", help="删除并重建已有非空输出目录。")
     parser.add_argument("--staging-root", type=Path, help="跨设备 staging 目录（HDD 读写分离：写入 scratch 设备，发布时复制回输出设备）。")
+    parser.add_argument("--phase-batch", action="store_true", help="文件名时间写入启用读/写分阶段批量调度（同设备 HDD 降低磁头争用）。")
     parser.add_argument("--no-validate", action="store_true", help="跳过转换后的抽样逐值校验。")
     parser.add_argument("--quiet", action="store_true", help="减少进度输出。")
     return parser
@@ -431,6 +432,7 @@ def run_filename(args: argparse.Namespace) -> int:
         overwrite=args.overwrite,
         validate=not args.no_validate,
         progress=not args.quiet,
+        phase_batch=getattr(args, "phase_batch", False),
     )
     print(f"\n转换完成并通过校验。\n输出：{args.output.resolve()}\n最终计划：{chosen.label()}")
     print(f"正式生产写入：{metrics['elapsed']:.1f} 秒，{metrics['throughput_mib_s']:.1f} MiB/s")
