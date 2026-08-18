@@ -1,6 +1,6 @@
 # Fast NC Zarr v1.7.8 模块与运行指南
 
-本文档合并项目各模块的入口、核心约束和验证方式。项目总览、环境安装和快速示例见根目录 [README](../README.md)。IPC 定义见 [contracts/README.md](../contracts/README.md)。项目全面评估与审查报告见：[项目评估报告](project-review.md)。项目维护文档见：[维护文档](MAINTENANCE.md)。v1.7.7 优化方案见：[v1.7.7 优化方案](v1.7.7-optimization-plan.md)。P2 评估与落地记录见：[P2 评估记录](p2-evaluation.md)。v1.7.8 真实数据测试方案见：[v1.7.8 真实数据测试方案](v1.7.8-test-plan.md)。
+本文档合并项目各模块的入口、核心约束和验证方式。项目总览、环境安装和快速示例见根目录 [README](../README.md)。IPC 定义见 [contracts/README.md](../contracts/README.md)。项目全面评估与审查报告见：[项目评估报告](project-review.md)。项目维护文档见：[维护文档](MAINTENANCE.md)。v1.7.7 优化方案见：[v1.7.7 优化方案](v1.7.7-optimization-plan.md)。P2 评估与落地记录见：[P2 评估记录](p2-evaluation.md)。v1.7.8 真实数据测试方案见：[v1.7.8 真实数据测试方案](v1.7.8-test-plan.md)。v1.7.8 后端处理逻辑性能优化分析见：[后端优化分析](v1.7.8-backend-optimization-analysis.md)。
 
 ## 共通约定
 
