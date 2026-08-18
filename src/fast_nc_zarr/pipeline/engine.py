@@ -1366,6 +1366,16 @@ def run_pipeline(
         "config": asdict(config),
         "resume": {"schema_version": 1, "checkpoints": {}},
         "stages": {},
+        "fusion": {
+            "eligible": bool(plan.streaming_fusion_eligible),
+            "stage": (
+                "conversion->resampling"
+                if plan.streaming_fusion_eligible
+                else None
+            ),
+            "intermediate_validation_skipped": False,
+            "write_amplification": None,
+        },
     }
     lifecycle = ProcessLifecycle("pipeline")
     manifest["worker_lifecycle"] = lifecycle.to_dict()
@@ -1760,6 +1770,7 @@ def run_pipeline(
             ),
         }
         manifest["logical_io"] = logical_io
+        manifest["fusion"]["write_amplification"] = logical_io["write_amplification"]
         manifest["online_adjustments"] = [
             event
             for metrics in (conversion_metrics, resample_metrics, rechunk_metrics)

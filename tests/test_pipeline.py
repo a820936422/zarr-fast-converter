@@ -767,6 +767,25 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(group["value"].chunks, plan.output_layout.for_source("value").chunks)
         self.assertIn("zstd", repr(group["value"].compressors).lower())
 
+    def test_fusion_eligible_pipeline_records_evidence(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        config = replace(
+            self._config(ROOT / "fusion-evidence.zarr"),
+            operations=PipelineOperations(resample=True),
+        )
+        plan = preview_pipeline(inspection, config)
+        self.assertTrue(plan.streaming_fusion_eligible)
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["fusion"]["eligible"], True)
+        self.assertEqual(manifest["fusion"]["stage"], "conversion->resampling")
+        self.assertEqual(manifest["fusion"]["intermediate_validation_skipped"], False)
+        self.assertEqual(manifest["stages"]["conversion"]["status"], "validated")
+        self.assertIsInstance(manifest["fusion"]["write_amplification"], (int, float))
+        self.assertGreaterEqual(manifest["fusion"]["write_amplification"], 1.0)
+
     def test_auto_pipeline_conversion_time_chunk_uses_resampling_batch(self) -> None:
         inspection = inspect_source(
             SourceInspectionConfig(
