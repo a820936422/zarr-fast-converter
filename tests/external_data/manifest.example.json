@@ -57,6 +57,20 @@
       "engine": "netcdf4",
       "variables": ["GPP"],
       "delete_after_test": true
+    },
+    {
+      "name": "glass_evi",
+      "source_root": "/path/to/GLASS-EVI",
+      "files": [
+        "GLASS14B01.V10.A2001001.2023068.hdf",
+        "GLASS14B01.V10.A2001009.2023068.hdf"
+      ],
+      "mode": "filename",
+      "engine": "netcdf4",
+      "template": "doy",
+      "field_values": ["2001", "001"],
+      "variables": ["evi_0.05"],
+      "delete_after_test": true
     }
   ]
 }

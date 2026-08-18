@@ -12,7 +12,7 @@ import xarray as xr
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 
-from fast_nc_zarr.raw_validation import main, validate_raw_tree  # noqa: E402
+from fast_nc_zarr.raw_validation import _axis_report, main, validate_raw_tree  # noqa: E402
 from fast_nc_zarr.metadata import sanitize_cf_references  # noqa: E402
 from fast_nc_zarr.validation import validate_semantic_samples  # noqa: E402
 
@@ -94,6 +94,16 @@ class RawValidationTests(unittest.TestCase):
         sampled = payload["datasets"][0]["source_samples"][0]["variables"][0]
         self.assertEqual(sampled["name"], "value")
         self.assertFalse(destination.with_name(f".{destination.name}.tmp").exists())
+
+    def test_axis_report_accepts_float32_regular_grid(self) -> None:
+        lat = np.linspace(-89.975, 89.975, 3600, dtype="float32")
+        lon = np.linspace(-179.975, 179.975, 7200, dtype="float32")
+        report = _axis_report(lat, "lat")
+        self.assertEqual(report["size"], 3600)
+        self.assertTrue(report["ascending"])
+        self.assertAlmostEqual(report["step"], 0.05, places=5)
+        report_lon = _axis_report(lon, "lon")
+        self.assertEqual(report_lon["size"], 7200)
 
     def test_invalid_time_override_does_not_replace_existing_report(self) -> None:
         destination = ROOT / "raw-validation.json"

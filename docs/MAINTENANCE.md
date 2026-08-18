@@ -4,7 +4,7 @@
 > **约定：每次版本更新时，必须同步更新本文档的“版本状态”与“版本历史”章节。**
 
 - **最近更新**：2026-08-18
-- **当前版本**：v1.7.7
+- **当前版本**：v1.7.8
 - **当前分支**：`develop`
 - **仓库**：`https://github.com/a820936422/zarr-fast-converter.git`
 
@@ -16,7 +16,7 @@
 |---|---|
 | 项目名称 | Fast NC Zarr |
 | 项目定位 | 批量 NetCDF / HDF / TIFF 数据到 Zarr v3 的转换工作台 |
-| 当前版本 | 1.7.7 |
+| 当前版本 | 1.7.8 |
 | 输出格式 | 固定为 Zarr v3，标准维度 `time/lat/lon` |
 | 桌面端 | Tauri 2 + React 19 + TypeScript |
 | 原生后端 | Rust workspace（model / zarr / python / desktop） |
@@ -249,7 +249,7 @@ pixi run release-candidate
 
 ## 6. 当前版本状态与已知问题
 
-以下为当前工作区状态（v1.7.7 发布准备中，P0/P1/P2 已完成），后续版本更新时需同步复核。
+以下为当前工作区状态（v1.7.8 真实数据测试已完成），后续版本更新时需同步复核。
 
 ### 6.1 已验证状态
 
@@ -262,29 +262,33 @@ pixi run release-candidate
 | Rust 核心测试 | ✅ 14 个通过 |
 | Rust 桌面测试 | ✅ 22 个通过 |
 | 前端 typecheck / build | ✅ 通过 |
-| Python 测试 | ✅ 225 passed，35 subtests passed，1 warning |
+| Python 测试 | ✅ 226 passed，35 subtests passed，1 warning |
 | `cross-backend-test` | ✅ 42 passed, 4 subtests passed |
-| sidecar-check | ✅ 已重建并校验通过 |
+| sidecar-check | ✅ 已重建并校验通过（v1.7.8） |
 | Filename A/B smoke | ✅ 合成数据可重复执行 |
 | Conservative A/B smoke | ✅ 合成数据可重复执行 |
+| L0 真实数据受控样本 | ✅ 2/2 passed（FLUXSATv2 + GLASS-EVI） |
+| L1 真实数据专项 | ✅ T1–T5 全部 passed，T6 `validate-raw` 全树通过 |
+| `validate-raw` 全树 | ✅ 1240 文件 / 2 数据集 passed |
 
 ### 6.2 已知问题
 
 1. ~~CI workflow 引用未定义的 pixi 任务~~ 已修复：`pixi.toml` 已新增 `cross-backend-test`，本地运行通过。
 2. ~~本地 sidecar 过期~~ 已修复：已执行 `pixi run desktop-sidecar` 并重新校验通过。
 3. ~~前端浏览器预览 fallback 版本号为 1.7.5~~ 已修复：`App.tsx` 改为从 `package.json` 读取版本。
-4. **文档/维护状态**：`docs/v1.7.7-optimization-roadmap.md` 当前工作区已删除；当前活跃文档为 `docs/project-review.md`、`docs/MAINTENANCE.md`、`docs/v1.7.7-optimization-plan.md` 和 `docs/p2-evaluation.md`。
+4. **文档/维护状态**：`docs/v1.7.7-optimization-roadmap.md` 当前工作区已删除；当前活跃文档为 `docs/project-review.md`、`docs/MAINTENANCE.md`、`docs/v1.7.7-optimization-plan.md`、`docs/p2-evaluation.md` 和 `docs/v1.7.8-test-plan.md`。
 5. **Python 可维护性**：`ruff`/`python-lint` 已落地并修复 F/E9 问题；大模块拆分仍作为后续 backlog。
+6. ~~`validate-raw` 对 FLUXSATv2 float32 经纬度网格误报“不规则网格”~~ 已修复：`raw_validation._axis_report` 容差改为按坐标 dtype 自适应（float32 0.05° 网格通过）；新增单测 `test_axis_report_accepts_float32_regular_grid`。
 
 > 详细评估与建议见 [项目评估报告](project-review.md)。
 
 ### 6.3 发布状态（开发阶段）
 
-- **v1.7.7 修改已提交**：当前 `develop` 分支已包含 v1.7.7 全部修改，并已打本地 tag `v1.7.7`；远程推送待 GitHub 凭据配置后补做。
+- **v1.7.7 修改已提交并同步远程**：当前 `develop` 分支已包含 v1.7.7 全部修改，远程已手动推送；本地 tag `v1.7.7` 已创建。
+- **v1.7.8 真实数据测试已完成**：版本已提升至 1.7.8，L0/L1 与 `validate-raw` 全树验证通过，回归门禁保持绿色；详见 [v1.7.8 真实数据测试方案](v1.7.8-test-plan.md)。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。
-- v1.7.8 真实数据测试方案见 [v1.7.8 真实数据测试方案](v1.7.8-test-plan.md)。
 
 ---
 
@@ -302,7 +306,8 @@ pixi run release-candidate
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
+| 1.7.8 | 2026-08-18 | 版本提升至 1.7.8；完成 FLUXSATv2 + GLASS-EVI 真实数据测试（L0/L1、`validate-raw` 全树 1240 文件通过）；修复 `validate-raw` float32 坐标容差；sidecar 已按 v1.7.8 重建并校验；开发阶段暂不打包上传，详见 `docs/v1.7.8-test-plan.md` |
 | 1.7.6 | 2026-08-18 | 当前基线：native-first 能力矩阵、Tauri 桌面、pipeline/resample/rechunk 能力；本文档首次建立 |
-| 1.7.7 | 2026-08-18 | 版本提升至 1.7.7；P0、P1、P2 已完成；M6 发布门禁与发布准备完成（deb 候选包已收集）；修改已提交（本地 tag `v1.7.7`，远程推送待凭据配置后补做）；当前处于开发阶段，暂不打包安装包、暂不上传发布资产，详见 `docs/v1.7.7-optimization-plan.md`、`docs/p2-evaluation.md` |
+| 1.7.7 | 2026-08-18 | 版本提升至 1.7.7；P0、P1、P2 已完成；M6 发布门禁与发布准备完成（deb 候选包已收集）；修改已提交并同步远程（tag `v1.7.7`）；当前处于开发阶段，暂不打包安装包、暂不上传发布资产，详见 `docs/v1.7.7-optimization-plan.md`、`docs/p2-evaluation.md` |
 
 > 后续每个版本发布时，在表格顶部插入新行，并更新“当前版本”与“当前版本状态”。

@@ -33,7 +33,12 @@ def _axis_report(values: np.ndarray, name: str) -> dict[str, Any]:
     if not (np.all(differences > 0) or np.all(differences < 0)):
         raise ValueError(f"{name} 不是严格单调坐标。")
     step = float(np.median(differences))
-    tolerance = max(abs(step) * 1e-6, 1e-10)
+    if np.issubdtype(np.asarray(values).dtype, np.floating):
+        eps = float(np.finfo(np.asarray(values).dtype).eps)
+    else:
+        eps = float(np.finfo(np.float64).eps)
+    scale = max(float(np.max(np.abs(numeric))), abs(step), 1.0)
+    tolerance = max(4.0 * eps * scale, 1e-10)
     maximum_error = float(np.max(np.abs(differences - step)))
     if maximum_error > tolerance:
         raise ValueError(
