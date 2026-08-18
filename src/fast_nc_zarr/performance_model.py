@@ -4,6 +4,12 @@ The v1.7.9 plan introduces a cost model that estimates wall time for a
 candidate plan before expensive sample tuning.  It is intentionally coarse:
 its purpose is to order/prune candidates, while the real sample benchmark
 remains the final arbiter.
+
+Starting with v1.8.0 the model is enabled by default when a cached hardware
+profile is available.  ``FAST_NC_ZARR_PERF_MODEL=0`` (or ``off``/``false``)
+restores the previous opt-in behavior for debugging.  Pruning always keeps
+the full 1..worker-ceiling parallelism sweep so the manifest can expose every
+safe worker count.
 """
 
 from __future__ import annotations
@@ -138,3 +144,62 @@ def prune_candidates(
     estimates = rank_candidates(list(candidates), inventory, selection, profile)
     keep = max(minimum, int(math.ceil(len(estimates) * keep_ratio)))
     return [item.plan for item in estimates[:keep]]
+
+
+def _is_worker_sweep_plan(
+    plan: ConversionPlan,
+    base: ConversionPlan,
+    ceiling: set[int],
+) -> bool:
+    """Return whether ``plan`` is part of the pure 1..worker-ceiling sweep.
+
+    A worker-sweep plan varies only ``workers`` from the base plan; layout,
+    codec and batching choices stay identical.  These plans must never be
+    pruned so the tuning stage can always discover the best concurrency.
+    """
+    return (
+        plan.workers in ceiling
+        and plan.strategy == base.strategy
+        and plan.chunk_time == base.chunk_time
+        and plan.chunk_lat == base.chunk_lat
+        and plan.chunk_lon == base.chunk_lon
+        and plan.task_batch == base.task_batch
+        and plan.compression == base.compression
+        and plan.compression_level == base.compression_level
+        and plan.shuffle == base.shuffle
+    )
+
+
+def keep_full_worker_sweep(
+    candidates: Sequence[ConversionPlan],
+    base: ConversionPlan,
+    worker_values: Iterable[int],
+    inventory: Inventory,
+    selection: Selection,
+    profile: HardwareProfile,
+    *,
+    non_worker_budget: int = 4,
+) -> list[ConversionPlan]:
+    """Order candidates by estimate and prune while keeping the full sweep.
+
+    Every distinct plan that belongs to the pure ``workers`` sweep is kept in
+    estimated-time order (fastest first).  Other layout/compression/batch
+    candidates are kept only up to ``non_worker_budget`` entries, also in
+    estimated-time order, which reduces the tuning candidate count without
+    hiding any safe worker count.
+    """
+    ceiling = {int(value) for value in worker_values}
+    ranked = rank_candidates(candidates, inventory, selection, profile)
+    kept: list[ConversionPlan] = []
+    seen_workers: set[int] = set()
+    other_count = 0
+    for estimate in ranked:
+        plan = estimate.plan
+        if _is_worker_sweep_plan(plan, base, ceiling):
+            if plan.workers not in seen_workers:
+                seen_workers.add(plan.workers)
+                kept.append(plan)
+        elif other_count < max(0, int(non_worker_budget)):
+            other_count += 1
+            kept.append(plan)
+    return kept

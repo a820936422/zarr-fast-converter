@@ -10,10 +10,24 @@ import numpy as np
 
 from .hardware import load_cached_profile
 from .models import ConversionPlan, Inventory, OutputLayout, Selection
-from .performance_model import rank_candidates
+from .performance_model import keep_full_worker_sweep, rank_candidates
 from .system import EffectiveResourceBudget, effective_resource_budget, storage_profile
 
 MIB = 1024**2
+
+_DISABLE_PERF_MODEL = {"0", "off", "false", "no"}
+
+
+def performance_model_enabled() -> bool:
+    """Return whether the performance model may reorder/prune candidates.
+
+    The model is enabled by default since v1.8.0.  Set
+    ``FAST_NC_ZARR_PERF_MODEL=0`` (or ``off``/``false``/``no``) to disable it
+    and restore the previous unranked candidate order.
+    """
+    raw = os.environ.get("FAST_NC_ZARR_PERF_MODEL", "1")
+    return raw.strip().lower() not in _DISABLE_PERF_MODEL
+
 
 def output_layout_plan_chunks(
     selection: Selection,
@@ -495,11 +509,12 @@ def candidate_plans(
         if key not in seen:
             seen.add(key)
             unique.append(item)
-    # Optional performance-model reordering: when a cached HardwareProfile is
-    # available and FAST_NC_ZARR_PERF_MODEL=1, order candidates by estimated
-    # wall time (fastest first) without dropping any candidate.  This lets a
-    # short tuning budget evaluate promising plans earlier.
-    if os.environ.get("FAST_NC_ZARR_PERF_MODEL") == "1":
+    # Default-on performance-model reordering/pruning.  When a cached
+    # HardwareProfile is available, candidates are ordered by estimated wall
+    # time (fastest first) so a short tuning budget evaluates promising plans
+    # earlier.  Pruning never drops a plan from the 1..worker-ceiling sweep.
+    profile = None
+    if performance_model_enabled():
         profile = load_cached_profile((inventory.input_dir, output))
         if profile is not None:
             unique = [
@@ -513,5 +528,18 @@ def candidate_plans(
     # worker candidates.  Only orthogonal layout candidates are compacted.
     limit = 14 if kind != "large-files" else 12
     if len(worker_values) >= limit:
+        if profile is not None:
+            non_worker_budget = min(
+                limit, max(1, len(worker_values) // 4)
+            )
+            return keep_full_worker_sweep(
+                unique,
+                base,
+                worker_values,
+                inventory,
+                selection,
+                profile,
+                non_worker_budget=non_worker_budget,
+            )
         return unique
     return unique[:limit]

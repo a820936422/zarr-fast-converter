@@ -289,6 +289,7 @@ pixi run release-candidate
 - **v1.7.8 真实数据测试已完成**：版本已提升至 1.7.8，L0/L1 与 `validate-raw` 全树验证通过，回归门禁保持绿色。
 - **v1.7.8 后端优化分析已完成，P0 代码优化已落地**：存储感知 worker/batch **初始值**（仅作起始猜测，调优仍探索完整 worker 范围）、重采样全局线程预算已实现并通过测试。
 - **v1.7.9 后端优化已实施**：已完成 HardwareProfile（含 NUMA/P/E）、PerformanceModel、重分块存储感知初始值、WorkerPool 工具类、文件亲和排序、OnlineController 可观测与保守调整、CPU affinity、PipelineFusion eligibility 标记；剩余项列入 [v1.8.0 开发文档](v1.8.0-development.md)。
+- **v1.8.0 待办推进（开发中）**：PerformanceModel 默认启用与剪枝已实现——有缓存 HardwareProfile 时候选按估算耗时排序，剪枝保留全 1..worker-ceiling worker 扫描；`FAST_NC_ZARR_PERF_MODEL=0/off/false` 可关闭；已加单测（`tests/test_performance_model.py` 8 passed），完整回归与其余 v1.8.0 项见 [v1.8.0 开发文档](v1.8.0-development.md)。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。
