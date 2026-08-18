@@ -245,6 +245,7 @@ def initial_plan(
         cx,
         task_batch=batch,
         rationale=tuple(rationale),
+        file_affinity=source.medium == "hdd",
     )
 
 

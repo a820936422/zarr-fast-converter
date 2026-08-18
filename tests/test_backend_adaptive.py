@@ -8,6 +8,7 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 
+from fast_nc_zarr.models import ConversionPlan  # noqa: E402
 from fast_nc_zarr.planner import storage_aware_initial_workers  # noqa: E402
 from fast_nc_zarr.resampling.autotune import resolve_auto_space_workers  # noqa: E402
 
@@ -20,6 +21,12 @@ def _budget(worker_ceiling: int, medium: str = "unknown") -> SimpleNamespace:
         source_storage=SimpleNamespace(medium=medium),
         same_device_roles=(),
     )
+
+
+class ConversionPlanFileAffinityTests(unittest.TestCase):
+    def test_file_affinity_defaults_to_false(self) -> None:
+        plan = ConversionPlan("chunk", 4, 2, 16, 16, task_batch=1)
+        self.assertFalse(plan.file_affinity)
 
 
 class StorageAwareWorkerLimitTests(unittest.TestCase):

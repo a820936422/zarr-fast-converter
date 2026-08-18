@@ -19,6 +19,7 @@ from .models import (
     Selection,
     VariableTransform,
 )
+from .online_controller import OnlineController
 from .selection import selected_output_logical_bytes
 from .runtime import bounded_process_map
 
@@ -692,12 +693,12 @@ def _task_batches(
         )
         for t0 in range(0, nt, chunk_time):
             t1 = min(nt, t0 + chunk_time)
-            grouped: list[ChunkTask] = []
+            spatial: list[ChunkTask] = []
             for y0 in range(0, ny, chunk_lat):
                 y1 = min(ny, y0 + chunk_lat)
                 for x0 in range(0, nx, chunk_lon):
                     x1 = min(nx, x0 + chunk_lon)
-                    grouped.append(
+                    spatial.append(
                         _chunk_task(
                             inventory,
                             selection,
@@ -715,11 +716,12 @@ def _task_batches(
                             output_layout,
                         )
                     )
-                    if len(grouped) == limit:
-                        yield tuple(grouped)
-                        grouped.clear()
-            if grouped:
-                yield tuple(grouped)
+            if plan.file_affinity:
+                spatial.sort(
+                    key=lambda task: task.segments[0].path if task.segments else ""
+                )
+            for index in range(0, len(spatial), limit):
+                yield tuple(spatial[index : index + limit])
 
 
 def chunk_tasks(
@@ -910,6 +912,8 @@ def direct_write(
         task_batch=effective_batch if plan.strategy == "file" else 1,
     )
     pending_limit = worker_count
+    online_controller = OnlineController(stage="convert", memory_budget_bytes=0)
+    last_online_action = "none"
 
     stop = threading.Event()
     samples: list[tuple[float, int]] = []
@@ -945,23 +949,38 @@ def direct_write(
                     logical_bytes,
                     f"转换写入：{completed}/{total_batches}",
                 )
-            if progress and (
-                completed == total_batches or completed % report_every == 0
-            ):
+            if completed == total_batches or completed % report_every == 0:
                 elapsed = max(time.perf_counter() - started, 1e-9)
                 cpu, rss = samples[-1] if samples else (None, None)
-                print(
-                    progress_line(
-                        completed,
-                        total_batches,
-                        logical_bytes,
-                        elapsed,
-                        cpu=cpu,
-                        rss=rss,
-                    ),
-                    end="",
-                    flush=True,
-                )
+                if cpu is not None:
+                    throughput = logical_bytes / max(elapsed, 1e-9) / 1024**2
+                    action = online_controller.decide(
+                        throughput_mib_s=throughput,
+                        cpu_percent=float(cpu),
+                        rss_bytes=int(rss),
+                    )
+                    if action != "none" and action != last_online_action:
+                        online_controller.record(
+                            action=action,
+                            reason="runtime heuristic",
+                            throughput_mib_s=throughput,
+                            cpu_percent=float(cpu),
+                            rss_bytes=int(rss),
+                        )
+                        last_online_action = action
+                if progress:
+                    print(
+                        progress_line(
+                            completed,
+                            total_batches,
+                            logical_bytes,
+                            elapsed,
+                            cpu=cpu,
+                            rss=rss,
+                        ),
+                        end="",
+                        flush=True,
+                    )
         if chunks_written != total_chunks:
             raise RuntimeError(
                 f"直接写入仅完成 {chunks_written}/{total_chunks} 个物理 chunks。"
@@ -991,6 +1010,9 @@ def direct_write(
         "source_cache_hits": source_cache_hits,
         "source_cache_misses": source_opens,
         "source_opens": source_opens,
+        "online_adjustments": [
+            event.__dict__ for event in online_controller.events
+        ],
     }
 
 

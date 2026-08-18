@@ -238,6 +238,7 @@ class ConversionPlan:
     compression_level: int = 1
     shuffle: str = "noshuffle"
     rationale: tuple[str, ...] = ()
+    file_affinity: bool = False
 
     @property
     def chunks(self) -> tuple[int, int, int]:

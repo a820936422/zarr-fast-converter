@@ -113,6 +113,57 @@ _THREAD_ENVIRONMENT = (
 
 
 
+def parse_cpu_affinity(spec: str) -> list[int] | None:
+    """Parse a CPU affinity spec such as ``0-5,8,10-11``.
+
+    Returns ``None`` when the spec is empty or malformed.
+    """
+    if not spec or not spec.strip():
+        return None
+    cpus: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_text, _, end_text = part.partition("-")
+            try:
+                start, end = int(start_text), int(end_text)
+            except ValueError:
+                return None
+            if end < start:
+                return None
+            cpus.extend(range(start, end + 1))
+        else:
+            try:
+                cpus.append(int(part))
+            except ValueError:
+                return None
+    return sorted(set(cpus)) or None
+
+
+def apply_cpu_affinity(spec: str | None) -> bool:
+    """Apply a CPU affinity mask to the current process when supported.
+
+    On Linux the mask is inherited by spawned children, which gives a simple
+    NUMA/affinity control for worker pools.  Returns ``False`` when the OS or
+    spec does not allow applying it.
+    """
+    if not spec:
+        return False
+    cpus = parse_cpu_affinity(spec)
+    if cpus is None:
+        return False
+    set_affinity = getattr(os, "sched_setaffinity", None)
+    if set_affinity is None:
+        return False
+    try:
+        set_affinity(0, cpus)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def configure_process_runtime(threads_per_worker: int | None = None) -> int:
     """Apply one explicit native-thread budget before spawning workers.
 
@@ -136,6 +187,9 @@ def configure_process_runtime(threads_per_worker: int | None = None) -> int:
     for name in _THREAD_ENVIRONMENT:
         os.environ[name] = str(threads)
     os.environ.setdefault("ESMF_RUNTIME_LOG_KIND", "NONE")
+    affinity = os.environ.get("FAST_NC_ZARR_CPU_AFFINITY")
+    if affinity:
+        apply_cpu_affinity(affinity)
     return threads
 
 
