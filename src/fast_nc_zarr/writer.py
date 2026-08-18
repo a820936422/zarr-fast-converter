@@ -912,8 +912,12 @@ def direct_write(
         task_batch=effective_batch if plan.strategy == "file" else 1,
     )
     pending_limit = worker_count
+    current_pending_limit = pending_limit
     online_controller = OnlineController(stage="convert", memory_budget_bytes=0)
     last_online_action = "none"
+
+    def _pending_limit_fn() -> int:
+        return current_pending_limit
 
     stop = threading.Event()
     samples: list[tuple[float, int]] = []
@@ -936,6 +940,7 @@ def direct_write(
             initargs=(str(output), inventory.source_engine, cache_limit),
             cancel_event=cancel_event,
             max_pending=pending_limit,
+            pending_limit_fn=_pending_limit_fn,
         )
         for completed, result in enumerate(results, 1):
             logical_bytes += result.logical_bytes
@@ -968,6 +973,8 @@ def direct_write(
                             rss_bytes=int(rss),
                         )
                         last_online_action = action
+                        if action == "spill_memory":
+                            current_pending_limit = max(1, current_pending_limit - 1)
                 if progress:
                     print(
                         progress_line(
@@ -1005,7 +1012,7 @@ def direct_write(
         "chunks_written": chunks_written,
         "planned_chunks": total_chunks,
         "workers": worker_count,
-        "scheduler_max_pending": pending_limit,
+        "scheduler_max_pending": current_pending_limit,
         "source_cache_limit": cache_limit,
         "source_cache_hits": source_cache_hits,
         "source_cache_misses": source_opens,

@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from .runtime import parse_cpu_affinity
 from .system import (
     RuntimeResourceSnapshot,
     runtime_resource_snapshot,
@@ -61,6 +62,7 @@ class HardwareProfile:
     memory_total_bytes: int
     memory_available_bytes: int
     storage: dict[str, StorageBenchmark]
+    numa_nodes: tuple[tuple[int, ...], ...] | None = None
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, object]:
@@ -74,11 +76,17 @@ class HardwareProfile:
             "storage": {
                 role: benchmark.to_dict() for role, benchmark in self.storage.items()
             },
+            "numa_nodes": (
+                [list(node) for node in self.numa_nodes]
+                if self.numa_nodes is not None
+                else None
+            ),
             "created_at": self.created_at,
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "HardwareProfile":
+        numa = payload.get("numa_nodes")
         return cls(
             cpu_physical=int(payload["cpu_physical"]),
             cpu_logical=int(payload["cpu_logical"]),
@@ -90,6 +98,11 @@ class HardwareProfile:
                 role: StorageBenchmark.from_dict(item)
                 for role, item in payload.get("storage", {}).items()
             },
+            numa_nodes=(
+                tuple(tuple(int(cpu) for cpu in node) for node in numa)
+                if numa is not None
+                else None
+            ),
             created_at=float(payload.get("created_at", time.time())),
         )
 
@@ -101,6 +114,35 @@ def _cache_key(paths: tuple[Path, ...]) -> str:
 
 def _cache_file(paths: tuple[Path, ...]) -> Path:
     return CACHE_ROOT / f"{_cache_key(paths)}.json"
+
+
+def detect_numa_nodes() -> tuple[tuple[int, ...], ...] | None:
+    """Return CPU lists per NUMA node from sysfs, or ``None`` when unavailable."""
+    sysfs = Path("/sys/devices/system/node")
+    if not sysfs.is_dir():
+        return None
+    online_path = sysfs / "online"
+    if not online_path.exists():
+        return None
+    try:
+        online = online_path.read_text(encoding="utf-8").strip()
+        node_ids = parse_cpu_affinity(online)
+    except (OSError, ValueError):
+        return None
+    if node_ids is None:
+        return None
+    nodes: list[tuple[int, ...]] = []
+    for node_id in node_ids:
+        cpulist = sysfs / f"node{node_id}" / "cpulist"
+        if not cpulist.exists():
+            continue
+        try:
+            cpus = parse_cpu_affinity(cpulist.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if cpus:
+            nodes.append(tuple(cpus))
+    return tuple(nodes) or None
 
 
 def _measure_seq_write(directory: Path, sample_mib: int) -> tuple[float, float]:
@@ -271,6 +313,7 @@ def build_hardware_profile(
         memory_total_bytes=memory.effective_total_bytes,
         memory_available_bytes=memory.effective_available_bytes,
         storage=storage,
+        numa_nodes=detect_numa_nodes(),
     )
     if use_cache and paths:
         save_cached_profile(paths, profile)

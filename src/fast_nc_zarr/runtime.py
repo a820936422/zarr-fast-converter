@@ -209,6 +209,7 @@ def bounded_process_map(
     initargs: tuple[object, ...] = (),
     cancel_event=None,
     max_pending: int | None = None,
+    pending_limit_fn: Callable[[], int] | None = None,
 ) -> Iterator[_Result]:
     """Yield completed process results while bounding queued task state.
 
@@ -248,7 +249,12 @@ def bounded_process_map(
         while pending or not exhausted:
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("任务已取消。")
-            while not exhausted and len(pending) < pending_limit:
+            while not exhausted:
+                current_pending_limit = (
+                    pending_limit_fn() if pending_limit_fn is not None else pending_limit
+                )
+                if len(pending) >= current_pending_limit:
+                    break
                 try:
                     task = next(task_iterator)
                 except StopIteration:

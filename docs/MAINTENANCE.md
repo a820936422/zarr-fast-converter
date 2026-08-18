@@ -262,7 +262,7 @@ pixi run release-candidate
 | Rust 核心测试 | ✅ 14 个通过 |
 | Rust 桌面测试 | ✅ 22 个通过 |
 | 前端 typecheck / build | ✅ 通过 |
-| Python 测试 | ✅ 247 passed，35 subtests passed，1 warning |
+| Python 测试 | ✅ 249 passed，35 subtests passed，1 warning |
 | `cross-backend-test` | ✅ 42 passed, 4 subtests passed |
 | sidecar-check | ✅ 已重建并校验通过（v1.7.8） |
 | Filename A/B smoke | ✅ 合成数据可重复执行 |
@@ -288,7 +288,7 @@ pixi run release-candidate
 - **v1.7.7 修改已提交并同步远程**：当前 `develop` 分支已包含 v1.7.7 全部修改，远程已手动推送；本地 tag `v1.7.7` 已创建。
 - **v1.7.8 真实数据测试已完成**：版本已提升至 1.7.8，L0/L1 与 `validate-raw` 全树验证通过，回归门禁保持绿色；详见 [v1.7.8 真实数据测试方案](v1.7.8-test-plan.md)。
 - **v1.7.8 后端优化分析已完成，P0 代码优化已落地**：存储感知 worker/batch **初始值**（仅作起始猜测，调优仍探索完整 worker 范围）、重采样全局线程预算已实现并通过测试，详见 [后端优化分析](v1.7.8-backend-optimization-analysis.md)。
-- **v1.7.9 后端优化方案已拟订并开始实施**：自动优化代码逻辑汇总见 [自动优化逻辑汇总](auto-optimization-logic-summary.md)，优化方案见 [v1.7.9 后端优化方案](v1.7.9-backend-optimization-plan.md)。当前已完成 HardwareProfile、PerformanceModel、重分块存储感知初始值、WorkerPool 工具类、文件亲和排序、OnlineController 可观测性、CPU affinity；PipelineFusion/native 扩展等继续推进。
+- **v1.7.9 后端优化方案已拟订并开始实施**：自动优化代码逻辑汇总见 [自动优化逻辑汇总](auto-optimization-logic-summary.md)，优化方案见 [v1.7.9 后端优化方案](v1.7.9-backend-optimization-plan.md)。当前已完成 HardwareProfile（含 NUMA）、PerformanceModel、重分块存储感知初始值、WorkerPool 工具类、文件亲和排序、OnlineController 可观测与保守调整、CPU affinity；PipelineFusion/native 扩展等继续推进。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。

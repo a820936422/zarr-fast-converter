@@ -13,6 +13,7 @@ from fast_nc_zarr.hardware import (  # noqa: E402
     StorageBenchmark,
     benchmark_storage_path,
     build_hardware_profile,
+    detect_numa_nodes,
     load_cached_profile,
     save_cached_profile,
 )
@@ -31,6 +32,26 @@ class HardwareProfileTests(unittest.TestCase):
         )
         restored = StorageBenchmark.from_dict(benchmark.to_dict())
         self.assertEqual(restored, benchmark)
+
+    def test_numa_detection_returns_none_or_tuple(self) -> None:
+        nodes = detect_numa_nodes()
+        if nodes is not None:
+            for node in nodes:
+                self.assertGreater(len(node), 0)
+
+    def test_profile_roundtrip_with_numa(self) -> None:
+        profile = HardwareProfile(
+            cpu_physical=6,
+            cpu_logical=12,
+            cpu_effective=12,
+            worker_ceiling=6,
+            memory_total_bytes=32 * 1024**3,
+            memory_available_bytes=20 * 1024**3,
+            storage={},
+            numa_nodes=((0, 1, 2, 3), (4, 5, 6, 7)),
+        )
+        restored = HardwareProfile.from_dict(profile.to_dict())
+        self.assertEqual(restored, profile)
 
     def test_profile_cache_roundtrip(self) -> None:
         profile = HardwareProfile(
