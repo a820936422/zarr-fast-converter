@@ -83,33 +83,34 @@ def direct_compatible(inventory: Inventory, selection: Selection) -> tuple[bool,
     return True, "所选变量支持直接 chunk 写入"
 
 
-def storage_aware_worker_limit(
+def storage_aware_initial_workers(
     budget: EffectiveResourceBudget,
     kind: str,
     *,
     same_device: bool,
 ) -> int:
-    """Return a storage-aware default worker ceiling for automatic plans.
+    """Return a storage-aware *initial* worker hint for automatic plans.
 
-    HDD/network devices prefer fewer concurrent workers to avoid seek and
-    round-trip contention.  SSD and unknown media keep the CPU/memory ceiling.
+    This is a heuristic starting point, not a hard ceiling.  HDD/network
+    devices start with fewer concurrent workers to avoid seek and round-trip
+    contention, but the tuning stage still explores the full safe worker
+    range so a faster HDD/network device can select higher concurrency.
+    SSD and unknown media keep the CPU/memory ceiling as the initial hint.
     Explicit ``max_workers`` remains authoritative in callers.
     """
     ceiling = max(1, int(budget.worker_ceiling))
     source = budget.source_storage
     medium = source.medium if source is not None else "unknown"
     if medium == "hdd":
-        if kind == "large-files":
-            cap = 2 if same_device else 4
-        elif kind == "many-small-files":
-            cap = 6 if same_device else 8
+        if kind == "many-small-files":
+            initial = 8
         else:
-            cap = 4 if same_device else 6
+            initial = 4
     elif medium == "network":
-        cap = 2 if same_device else 4
+        initial = 2 if same_device else 4
     else:
-        cap = ceiling
-    return max(1, min(ceiling, cap))
+        initial = ceiling
+    return max(1, min(ceiling, initial))
 
 
 def _source_medium(budget: EffectiveResourceBudget, fallback: Path) -> str:
@@ -177,7 +178,7 @@ def initial_plan(
         same_device = "source+output" in budget.same_device_roles
         storage_workers = min(
             budget.worker_ceiling,
-            storage_aware_worker_limit(budget, kind, same_device=same_device),
+            storage_aware_initial_workers(budget, kind, same_device=same_device),
         )
         return ConversionPlan(
             "dask",
@@ -195,7 +196,7 @@ def initial_plan(
     cpus = max(1, int(budget.worker_ceiling))
     storage_workers = min(
         cpus,
-        storage_aware_worker_limit(budget, kind, same_device=same_device),
+        storage_aware_initial_workers(budget, kind, same_device=same_device),
     )
     nt, _, _ = selection.shape
     rationale = [f"输入形态：{kind}"]

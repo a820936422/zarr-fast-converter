@@ -8,7 +8,7 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 
-from fast_nc_zarr.planner import storage_aware_worker_limit  # noqa: E402
+from fast_nc_zarr.planner import storage_aware_initial_workers  # noqa: E402
 from fast_nc_zarr.resampling.autotune import resolve_auto_space_workers  # noqa: E402
 
 GIB = 1024**3
@@ -23,43 +23,43 @@ def _budget(worker_ceiling: int, medium: str = "unknown") -> SimpleNamespace:
 
 
 class StorageAwareWorkerLimitTests(unittest.TestCase):
-    def test_hdd_large_files_caps_workers(self) -> None:
+    def test_hdd_large_files_starts_with_four_workers(self) -> None:
         budget = _budget(12, medium="hdd")
         self.assertEqual(
-            storage_aware_worker_limit(budget, "large-files", same_device=True),
-            2,
+            storage_aware_initial_workers(budget, "large-files", same_device=True),
+            4,
         )
         self.assertEqual(
-            storage_aware_worker_limit(budget, "large-files", same_device=False),
+            storage_aware_initial_workers(budget, "large-files", same_device=False),
             4,
         )
 
     def test_hdd_balanced_and_many_small_files_allow_more_workers(self) -> None:
         budget = _budget(12, medium="hdd")
         self.assertEqual(
-            storage_aware_worker_limit(budget, "balanced", same_device=True),
+            storage_aware_initial_workers(budget, "balanced", same_device=True),
             4,
         )
         self.assertEqual(
-            storage_aware_worker_limit(budget, "many-small-files", same_device=False),
+            storage_aware_initial_workers(budget, "many-small-files", same_device=False),
             8,
         )
 
     def test_ssd_keeps_cpu_ceiling(self) -> None:
         budget = _budget(12, medium="ssd")
         self.assertEqual(
-            storage_aware_worker_limit(budget, "large-files", same_device=False),
+            storage_aware_initial_workers(budget, "large-files", same_device=False),
             12,
         )
 
     def test_network_is_conservative(self) -> None:
         budget = _budget(12, medium="network")
         self.assertEqual(
-            storage_aware_worker_limit(budget, "large-files", same_device=True),
+            storage_aware_initial_workers(budget, "large-files", same_device=True),
             2,
         )
         self.assertEqual(
-            storage_aware_worker_limit(budget, "large-files", same_device=False),
+            storage_aware_initial_workers(budget, "large-files", same_device=False),
             4,
         )
 
