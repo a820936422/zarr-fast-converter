@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import ExitStack, contextmanager
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 import itertools
 from pathlib import Path
@@ -25,9 +25,8 @@ from ..writer import compressor_from_spec
 from ..runtime import (
     ProcessLifecycle,
     configure_process_runtime,
-    shutdown_process_executor,
-    spawn_context,
 )
+from ..worker_pool import WorkerPool
 from ..system import effective_resource_budget
 from .autotune import (
     resolve_auto_space_workers,
@@ -1610,13 +1609,8 @@ def _run_parallel_tiles(
     lifecycle = ProcessLifecycle("resampling-space-workers")
     exit_reason = "completed"
     terminated = False
-    context = spawn_context()
-    completed_batches = 0
-    report_interval = max(1, total_batches // 20) if total_batches else 1
-    next_report = report_interval
-    executor = ProcessPoolExecutor(
+    pool = WorkerPool(
         max_workers=max(1, int(plan.space_workers)),
-        mp_context=context,
         initializer=_initialize_space_worker,
         initargs=(
             str(source_path),
@@ -1626,6 +1620,9 @@ def _run_parallel_tiles(
             str(workdir),
         ),
     )
+    completed_batches = 0
+    report_interval = max(1, total_batches // 20) if total_batches else 1
+    next_report = report_interval
     pending = set()
     task_iter = iter(tasks)
     completed = 0
@@ -1651,7 +1648,7 @@ def _run_parallel_tiles(
                     task = next(task_iter)
                 except StopIteration:
                     break
-                pending.add(executor.submit(_process_space_tile, task))
+                pending.add(pool.submit(_process_space_tile, task))
                 lifecycle.sample()
 
             if not pending:
@@ -1727,12 +1724,12 @@ def _run_parallel_tiles(
             if cancel_event is not None and cancel_event.is_set()
             else "failed"
         )
-        shutdown_process_executor(executor, terminate=True, pending=pending)
+        pool.shutdown(terminate=True, pending=pending)
         terminated = True
         raise
     finally:
         if not terminated:
-            shutdown_process_executor(executor, terminate=False)
+            pool.shutdown(terminate=False)
         lifecycle.finish(exit_reason)
     return {
         "tiles": completed,

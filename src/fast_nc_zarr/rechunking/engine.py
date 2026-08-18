@@ -23,8 +23,8 @@ from ..metadata import sanitize_cf_references
 from ..models import StorageProfile
 from ..planner import storage_aware_initial_workers
 from ..publication import preflight_writable, publish_staging
-from ..runtime import bounded_process_map
 from ..system import EffectiveResourceBudget, RuntimeResourceSnapshot, effective_resource_budget, runtime_resource_snapshot, storage_profile
+from ..worker_pool import WorkerPool
 from .autotune import (
     WorkerTuneReport,
     benchmark_worker_candidates,
@@ -1041,15 +1041,17 @@ def _run_process_tasks(
     # Keep progress output useful without turning hundreds of process
     # completions into another serialization bottleneck.
     progress_interval = max(1, min(32, total // 20))
-    results = bounded_process_map(
-        task_function,  # type: ignore[arg-type]
-        tasks,
-        workers=workers,
+    pool = WorkerPool(
+        max_workers=max(1, int(workers)),
         initializer=initializer,  # type: ignore[arg-type]
         initargs=initargs,
-        cancel_event=cancel_event,
     )
     try:
+        results = pool.map(
+            task_function,  # type: ignore[arg-type]
+            tasks,
+            cancel_event=cancel_event,
+        )
         for index, result in enumerate(results, start=1):
             processed_bytes += int(result.get("bytes", 0))
             processed_chunks += int(result.get("source_chunks", 1))
@@ -1067,6 +1069,8 @@ def _run_process_tasks(
         if str(exc) == "任务已取消。":
             raise RechunkExecutionError(str(exc)) from exc
         raise
+    finally:
+        pool.close()
 
 
 def _stage1_time_tasks(info: DatasetInfo) -> Iterator[tuple[str, int]]:
@@ -1354,18 +1358,21 @@ def _measure_benchmark_tasks(
     started = time.perf_counter()
     monitor_thread.start()
     logical_bytes = 0
+    pool = WorkerPool(
+        max_workers=max(1, int(workers)),
+        initializer=initializer,
+        initargs=initargs,
+    )
     try:
-        results = bounded_process_map(
+        results = pool.map(
             task_function,
             tasks,
-            workers=max(1, int(workers)),
-            initializer=initializer,
-            initargs=initargs,
             cancel_event=cancel_event,
         )
         for result in results:
             logical_bytes += int(result.get("bytes", 0))
     finally:
+        pool.close()
         stop.set()
         monitor_thread.join(timeout=1.0)
         rss_samples.append(_rss_bytes())

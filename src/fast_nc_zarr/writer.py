@@ -21,7 +21,7 @@ from .models import (
 )
 from .online_controller import OnlineController
 from .selection import selected_output_logical_bytes
-from .runtime import bounded_process_map
+from .worker_pool import WorkerPool
 
 _OUTPUT_GROUP = None
 _SOURCE_CACHE = None
@@ -931,16 +931,18 @@ def direct_write(
     monitor.start()
     if progress:
         print(progress_line(0, total_batches, 0, 0.0), end="", flush=True)
+    pool = WorkerPool(
+        max_workers=worker_count,
+        initializer=_worker_init,
+        initargs=(str(output), inventory.source_engine, cache_limit),
+    )
     try:
-        results = bounded_process_map(
+        results = pool.map(
             _write_batch,
             tasks,
-            workers=worker_count,
-            initializer=_worker_init,
-            initargs=(str(output), inventory.source_engine, cache_limit),
-            cancel_event=cancel_event,
             max_pending=pending_limit,
             pending_limit_fn=_pending_limit_fn,
+            cancel_event=cancel_event,
         )
         for completed, result in enumerate(results, 1):
             logical_bytes += result.logical_bytes
@@ -993,6 +995,7 @@ def direct_write(
                 f"直接写入仅完成 {chunks_written}/{total_chunks} 个物理 chunks。"
             )
     finally:
+        pool.close()
         if worker_count == 1:
             _close_worker_sources()
         stop.set()

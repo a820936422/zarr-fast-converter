@@ -48,7 +48,7 @@ from .planner import (
 )
 from .system import EffectiveResourceBudget, effective_resource_budget
 from .publication import make_staging_path, preflight_writable, publish_staging, validate_publish_target
-from .runtime import bounded_process_map
+from .worker_pool import WorkerPool
 from .writer import _monitor, compressor_from_spec, make_compressor, progress_line
 from .selection import effective_output_dtype, selected_output_logical_bytes
 
@@ -1304,20 +1304,25 @@ def inspect_filename_inventory(
                 else f"准备读取结构：复用 {len(records_by_path)} 个，待检查 {len(changed_tasks)} 个文件"
             ),
         )
-    for record in bounded_process_map(
-        _inspect_filename_file,
-        validation_tasks,
-        workers=min(worker_count, max(1, len(validation_tasks))),
-        cancel_event=cancel_event,
-    ):
-        records_by_path[record.path] = record
-        completed_changed += 1
-        if progress_callback is not None and (completed_changed == len(validation_tasks) or completed_changed % report_every == 0):
-            progress_callback(
-                completed_changed,
-                total_changed,
-                f"读取文件结构：{completed_changed}/{len(validation_tasks)}",
-            )
+    pool = WorkerPool(
+        max_workers=min(worker_count, max(1, len(validation_tasks)))
+    )
+    try:
+        for record in pool.map(
+            _inspect_filename_file,
+            validation_tasks,
+            cancel_event=cancel_event,
+        ):
+            records_by_path[record.path] = record
+            completed_changed += 1
+            if progress_callback is not None and (completed_changed == len(validation_tasks) or completed_changed % report_every == 0):
+                progress_callback(
+                    completed_changed,
+                    total_changed,
+                    f"读取文件结构：{completed_changed}/{len(validation_tasks)}",
+                )
+    finally:
+        pool.close()
     if fast_mode:
         for task in changed_tasks:
             if task[0] not in validation_paths:
@@ -1904,26 +1909,28 @@ def filename_direct_write(
             end="",
             flush=True,
         )
+    pool = WorkerPool(
+        max_workers=worker_count,
+        initializer=_filename_worker_init,
+        initargs=(
+            str(output),
+            inventory.source_engine,
+            {name: inventory.variables[name] for name in selection.variables},
+            transforms,
+            effective_for_workers,
+            selection.lat_start,
+            selection.lon_start,
+            ny,
+            nx,
+            output_layout is not None and "lat" in output_layout.axis_reversals,
+            output_layout is not None and "lon" in output_layout.axis_reversals,
+            variable_names,
+        ),
+    )
     try:
-        results = bounded_process_map(
+        results = pool.map(
             _filename_write_task,
             write_tasks(),
-            workers=worker_count,
-            initializer=_filename_worker_init,
-            initargs=(
-                str(output),
-                inventory.source_engine,
-                {name: inventory.variables[name] for name in selection.variables},
-                transforms,
-                effective_for_workers,
-                selection.lat_start,
-                selection.lon_start,
-                ny,
-                nx,
-                output_layout is not None and "lat" in output_layout.axis_reversals,
-                output_layout is not None and "lon" in output_layout.axis_reversals,
-                variable_names,
-            ),
             cancel_event=cancel_event,
         )
         for completed, amount in enumerate(results, 1):
@@ -1952,6 +1959,7 @@ def filename_direct_write(
                     flush=True,
                 )
     finally:
+        pool.close()
         stop.set()
         monitor.join(timeout=2)
     elapsed = time.perf_counter() - started

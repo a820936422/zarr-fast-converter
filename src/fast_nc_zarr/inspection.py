@@ -10,9 +10,9 @@ from typing import Any
 import numpy as np
 
 from .models import FileRecord, Inventory, VariableSpec
-from .runtime import bounded_process_map
 from .system import effective_resource_budget
 from .time_mapping import FilenameField, TimeRule, resolve_file_times
+from .worker_pool import WorkerPool
 
 SUFFIXES = {".nc", ".nc4", ".nc3", ".cdf", ".hdf"}
 CANONICAL_DIMENSIONS = ("time", "lat", "lon")
@@ -712,21 +712,26 @@ def inspect_dataset(
         min(64, (len(changed_files) + max(1, worker_count) * 16 - 1) // (max(1, worker_count) * 16)),
     )
     task_batches = batched(tasks, task_batch_size)
-    for batch_records in bounded_process_map(
-        _inspect_file_batch,
-        task_batches,
-        workers=min(worker_count, max(1, len(changed_files))),
-        cancel_event=cancel_event,
-    ):
-        for record in batch_records:
-            records_by_path[record.path] = record
-        completed_changed += len(batch_records)
-        if progress_callback is not None and (completed_changed == len(changed_files) or completed_changed % report_every == 0):
-            progress_callback(
-                completed_changed,
-                total_changed,
-                f"读取文件结构：{len(records_by_path)}/{len(files)}",
-            )
+    pool = WorkerPool(
+        max_workers=min(worker_count, max(1, len(changed_files)))
+    )
+    try:
+        for batch_records in pool.map(
+            _inspect_file_batch,
+            task_batches,
+            cancel_event=cancel_event,
+        ):
+            for record in batch_records:
+                records_by_path[record.path] = record
+            completed_changed += len(batch_records)
+            if progress_callback is not None and (completed_changed == len(changed_files) or completed_changed % report_every == 0):
+                progress_callback(
+                    completed_changed,
+                    total_changed,
+                    f"读取文件结构：{len(records_by_path)}/{len(files)}",
+                )
+    finally:
+        pool.close()
     records = [records_by_path[path] for path in files]
     reference = records[0]
     reference_variables = _variable_signatures(reference.variables)
