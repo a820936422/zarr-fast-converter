@@ -13,7 +13,9 @@ from fast_nc_zarr.hardware import (  # noqa: E402
     StorageBenchmark,
     benchmark_storage_path,
     build_hardware_profile,
+    detect_core_capacities,
     detect_numa_nodes,
+    detect_performance_efficiency_cores,
     load_cached_profile,
     save_cached_profile,
 )
@@ -38,6 +40,18 @@ class HardwareProfileTests(unittest.TestCase):
         if nodes is not None:
             for node in nodes:
                 self.assertGreater(len(node), 0)
+
+    def test_core_capacity_detection_returns_none_or_mapping(self) -> None:
+        capacities = detect_core_capacities()
+        if capacities is not None:
+            self.assertGreater(len(capacities), 0)
+
+    def test_pe_detection_returns_none_or_pair(self) -> None:
+        result = detect_performance_efficiency_cores()
+        if result is not None:
+            performance, efficiency = result
+            self.assertTrue(performance)
+            self.assertTrue(efficiency)
 
     def test_profile_roundtrip_with_numa(self) -> None:
         profile = HardwareProfile(

@@ -63,6 +63,8 @@ class HardwareProfile:
     memory_available_bytes: int
     storage: dict[str, StorageBenchmark]
     numa_nodes: tuple[tuple[int, ...], ...] | None = None
+    performance_cores: tuple[int, ...] | None = None
+    efficiency_cores: tuple[int, ...] | None = None
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, object]:
@@ -81,12 +83,24 @@ class HardwareProfile:
                 if self.numa_nodes is not None
                 else None
             ),
+            "performance_cores": (
+                list(self.performance_cores)
+                if self.performance_cores is not None
+                else None
+            ),
+            "efficiency_cores": (
+                list(self.efficiency_cores)
+                if self.efficiency_cores is not None
+                else None
+            ),
             "created_at": self.created_at,
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "HardwareProfile":
         numa = payload.get("numa_nodes")
+        perf = payload.get("performance_cores")
+        eff = payload.get("efficiency_cores")
         return cls(
             cpu_physical=int(payload["cpu_physical"]),
             cpu_logical=int(payload["cpu_logical"]),
@@ -102,6 +116,12 @@ class HardwareProfile:
                 tuple(tuple(int(cpu) for cpu in node) for node in numa)
                 if numa is not None
                 else None
+            ),
+            performance_cores=(
+                tuple(int(cpu) for cpu in perf) if perf is not None else None
+            ),
+            efficiency_cores=(
+                tuple(int(cpu) for cpu in eff) if eff is not None else None
             ),
             created_at=float(payload.get("created_at", time.time())),
         )
@@ -143,6 +163,52 @@ def detect_numa_nodes() -> tuple[tuple[int, ...], ...] | None:
         if cpus:
             nodes.append(tuple(cpus))
     return tuple(nodes) or None
+
+
+def detect_core_capacities() -> dict[int, int] | None:
+    """Return ``{cpu_id: capacity}`` from sysfs when available.
+
+    Hybrid x86/ARM systems expose ``cpu_capacity``; homogeneous systems often
+    do not, in which case ``None`` is returned.
+    """
+    base = Path("/sys/devices/system/cpu")
+    if not base.is_dir():
+        return None
+    capacities: dict[int, int] = {}
+    for entry in base.glob("cpu[0-9]*"):
+        try:
+            cpu_id = int(entry.name[3:])
+        except ValueError:
+            continue
+        capacity_path = entry / "cpu_capacity"
+        if not capacity_path.exists():
+            return None
+        try:
+            capacity = int(capacity_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
+        capacities[cpu_id] = capacity
+    return capacities or None
+
+
+def detect_performance_efficiency_cores() -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """Return ``(performance_cores, efficiency_cores)`` when heterogeneous.
+
+    Uses ``cpu_capacity`` from sysfs; homogeneous systems return ``None``.
+    """
+    capacities = detect_core_capacities()
+    if not capacities:
+        return None
+    maximum = max(capacities.values())
+    performance = tuple(
+        sorted(cpu for cpu, capacity in capacities.items() if capacity == maximum)
+    )
+    efficiency = tuple(
+        sorted(cpu for cpu, capacity in capacities.items() if capacity < maximum)
+    )
+    if not efficiency:
+        return None
+    return performance, efficiency
 
 
 def _measure_seq_write(directory: Path, sample_mib: int) -> tuple[float, float]:
@@ -305,6 +371,7 @@ def build_hardware_profile(
         benchmark = benchmark_storage_path(path, sample_mib=sample_mib)
         if benchmark is not None:
             storage[role] = benchmark
+    pe_cores = detect_performance_efficiency_cores()
     profile = HardwareProfile(
         cpu_physical=cpu.physical_count,
         cpu_logical=cpu.logical_count,
@@ -314,6 +381,8 @@ def build_hardware_profile(
         memory_available_bytes=memory.effective_available_bytes,
         storage=storage,
         numa_nodes=detect_numa_nodes(),
+        performance_cores=pe_cores[0] if pe_cores is not None else None,
+        efficiency_cores=pe_cores[1] if pe_cores is not None else None,
     )
     if use_cache and paths:
         save_cached_profile(paths, profile)

@@ -262,7 +262,7 @@ pixi run release-candidate
 | Rust 核心测试 | ✅ 14 个通过 |
 | Rust 桌面测试 | ✅ 22 个通过 |
 | 前端 typecheck / build | ✅ 通过 |
-| Python 测试 | ✅ 249 passed，35 subtests passed，1 warning |
+| Python 测试 | ✅ 251 passed，35 subtests passed，1 warning |
 | `cross-backend-test` | ✅ 42 passed, 4 subtests passed |
 | sidecar-check | ✅ 已重建并校验通过（v1.7.8） |
 | Filename A/B smoke | ✅ 合成数据可重复执行 |
