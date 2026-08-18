@@ -193,6 +193,23 @@ fn dtype(value: &NcVariableType) -> (String, bool) {
     }
 }
 
+fn is_native_data_dtype(dtype: &str, attrs: &Map<String, Value>) -> bool {
+    if matches!(dtype, "float32" | "float64") {
+        return true;
+    }
+    let standard_integer = matches!(
+        dtype,
+        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+    );
+    // Unpacked integers are written as raw values.  Packed integer variables
+    // (scale_factor/add_offset) stay on the Python compatibility path so the
+    // decoded physical-value semantics never diverge.
+    standard_integer
+        && !["scale_factor", "add_offset"]
+            .iter()
+            .any(|key| attrs.contains_key(*key))
+}
+
 pub fn inspect_netcdf(path: &Path) -> Result<NetcdfSummary, String> {
     let file = netcdf::open(path)
         .map_err(|error| format!("cannot open NetCDF {}: {error}", path.display()))?;
@@ -235,10 +252,10 @@ pub fn inspect_netcdf(path: &Path) -> Result<NetcdfSummary, String> {
             || (!is_coordinate_name
                 && (variable_dimensions
                     != vec!["time".to_owned(), "lat".to_owned(), "lon".to_owned()]
-                    || !matches!(dtype.as_str(), "float32" | "float64")))
+                    || !is_native_data_dtype(&dtype, &variable_attributes)))
         {
             limitations.push(format!(
-                "variable {name} is outside the native numeric time/lat/lon float subset"
+                "variable {name} is outside the native numeric time/lat/lon subset"
             ));
         }
         variables.push(NetcdfVariableSummary {
@@ -259,11 +276,15 @@ pub fn inspect_netcdf(path: &Path) -> Result<NetcdfSummary, String> {
     }
     let supported_subset = standard_coordinates
         && variables.iter().any(|item| {
-            item.dimensions.len() == 3 && matches!(item.dtype.as_str(), "float32" | "float64")
+            item.dimensions.len() == 3
+                && is_native_data_dtype(item.dtype.as_str(), &item.attributes)
         })
         && limitations.is_empty();
     if !supported_subset && limitations.is_empty() {
-        limitations.push("requires at least one float32/float64 three-dimensional variable".into());
+        limitations.push(
+            "requires at least one float32/float64 or unpacked integer three-dimensional variable"
+                .into(),
+        );
     }
     Ok(NetcdfSummary {
         path: path.to_string_lossy().into_owned(),
@@ -504,11 +525,58 @@ fn store_f64_array(
 }
 
 #[allow(clippy::too_many_arguments)]
+trait FromF64Fill: Copy {
+    fn from_f64_fill(value: f64) -> Self;
+}
+
+impl FromF64Fill for i8 {
+    fn from_f64_fill(value: f64) -> Self {
+        value as i8
+    }
+}
+impl FromF64Fill for i16 {
+    fn from_f64_fill(value: f64) -> Self {
+        value as i16
+    }
+}
+impl FromF64Fill for i32 {
+    fn from_f64_fill(value: f64) -> Self {
+        value as i32
+    }
+}
+impl FromF64Fill for i64 {
+    fn from_f64_fill(value: f64) -> Self {
+        value as i64
+    }
+}
+impl FromF64Fill for u8 {
+    fn from_f64_fill(value: f64) -> Self {
+        value as u8
+    }
+}
+impl FromF64Fill for u16 {
+    fn from_f64_fill(value: f64) -> Self {
+        value as u16
+    }
+}
+impl FromF64Fill for u32 {
+    fn from_f64_fill(value: f64) -> Self {
+        value as u32
+    }
+}
+impl FromF64Fill for u64 {
+    fn from_f64_fill(value: f64) -> Self {
+        value as u64
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn store_integer_array<
     T: Copy
         + Default
         + netcdf::NcTypeDescriptor
         + zarrs::array::Element
+        + FromF64Fill
         + Into<zarrs::array::builder::ArrayBuilderFillValue>,
 >(
     store: std::sync::Arc<zarrs_filesystem::FilesystemStore>,
@@ -528,7 +596,12 @@ fn store_integer_array<
     let total_bytes = elements
         .checked_mul(std::mem::size_of::<T>() as u64)
         .ok_or_else(|| "native NetCDF logical byte count overflows u64".to_owned())?;
-    let (data_type, fill_value) = data_type_and_fill_value;
+    let (data_type, default_fill_value) = data_type_and_fill_value;
+    // Prefer the source _FillValue so missing markers survive the round trip;
+    // fall back to the caller's default (0) when the attribute is absent.
+    let fill_value = numeric_attribute(attrs, "_FillValue")
+        .map(FromF64Fill::from_f64_fill)
+        .unwrap_or(default_fill_value);
     let chunks = shape
         .iter()
         .map(|value| (*value).clamp(1, 64))
@@ -845,10 +918,10 @@ fn convert_netcdf_to_zarr_inner(
     if summary.variables.iter().any(|item| {
         let coordinate = matches!(item.name.as_str(), "time" | "lat" | "lon")
             && item.dimensions == vec![item.name.clone()];
-        !coordinate && !matches!(item.dtype.as_str(), "float32" | "float64")
+        !coordinate && !is_native_data_dtype(item.dtype.as_str(), &item.attributes)
     }) {
         return Err(
-            "native conversion supports float32/float64 time-lat-lon data variables and numeric standard coordinates".into(),
+            "native conversion supports float32/float64 and unpacked standard integer time-lat-lon data variables, plus numeric standard coordinates".into(),
         );
     }
     std::fs::create_dir_all(output).map_err(|error| error.to_string())?;

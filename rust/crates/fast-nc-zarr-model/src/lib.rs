@@ -156,8 +156,8 @@ impl BackendCapability {
                     ],
                     "raw.netcdf.convert" => &[
                         "NetCDF-4/classic",
-                        "float32/float64 data variables",
-                        "decoded physical float output",
+                        "float32/float64 and unpacked standard integer data variables",
+                        "decoded physical float output, raw integer output",
                         "source_* packing metadata",
                         "staged Zarr v3 output",
                     ],
@@ -241,8 +241,8 @@ impl BackendCapability {
                 "raw.netcdf.convert",
                 &[
                     "NetCDF-4/classic",
-                    "float32/float64 time-lat-lon data variables",
-                    "decoded physical float output",
+                    "float32/float64 and unpacked integer time-lat-lon data variables",
+                    "decoded physical float output, raw integer output",
                     "source_* packing metadata",
                     "numeric standard coordinates",
                     "staged Zarr v3 output",

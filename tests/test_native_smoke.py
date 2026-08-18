@@ -153,6 +153,78 @@ class RustNetcdfInspectTests(unittest.TestCase):
                 self.assertEqual(result["lon"].dtype, np.dtype("int32"))
                 self.assertEqual(result["value"].attrs["long_name"], "relative humidity")
 
+    def test_convert_unpacked_int16_data_variable(self) -> None:
+        import netCDF4
+
+        with tempfile.TemporaryDirectory(prefix="fast-nc-zarr-int16-") as directory:
+            path = Path(directory) / "int16.nc"
+            target = Path(directory) / "int16.zarr"
+            values = np.arange(12, dtype="int16").reshape(2, 2, 3)
+            with netCDF4.Dataset(path, "w", format="NETCDF4") as dataset:
+                for name, size in (("time", 2), ("lat", 2), ("lon", 3)):
+                    dataset.createDimension(name, size)
+                time = dataset.createVariable("time", "i4", ("time",))
+                time.units = "days since 2000-01-01"
+                time[:] = [0, 1]
+                dataset.createVariable("lat", "f4", ("lat",))[:] = [10, 20]
+                dataset.createVariable("lon", "f4", ("lon",))[:] = [100, 110, 120]
+                value = dataset.createVariable(
+                    "value",
+                    "i2",
+                    ("time", "lat", "lon"),
+                    fill_value=np.int16(-9999),
+                )
+                value.units = "K"
+                value[:] = values
+            summary = inspect_netcdf_native(path)
+            self.assertTrue(summary["supported_subset"])
+            variable = next(
+                item for item in summary["variables"] if item["name"] == "value"
+            )
+            self.assertEqual(variable["dtype"], "int16")
+            native = importlib.import_module("fast_nc_zarr._native")
+            metrics = json.loads(native.convert_netcdf_json(str(path), str(target)))
+            self.assertEqual(metrics["variables"], ["time", "lat", "lon", "value"])
+            with xr.open_zarr(
+                target,
+                consolidated=False,
+                chunks=None,
+                decode_times=False,
+                mask_and_scale=False,
+            ) as result:
+                np.testing.assert_array_equal(result["value"].values, values)
+                self.assertEqual(result["value"].dtype, np.dtype("int16"))
+                self.assertEqual(result["value"].encoding["fill_value"], -9999)
+                self.assertEqual(result["value"].attrs["_FillValue"], -9999)
+
+    def test_inspect_packed_int16_remains_outside_native_subset(self) -> None:
+        import netCDF4
+
+        with tempfile.TemporaryDirectory(prefix="fast-nc-zarr-packed-int16-") as directory:
+            path = Path(directory) / "packed-int16.nc"
+            with netCDF4.Dataset(path, "w", format="NETCDF4") as dataset:
+                for name, size in (("time", 2), ("lat", 2), ("lon", 3)):
+                    dataset.createDimension(name, size)
+                time = dataset.createVariable("time", "i4", ("time",))
+                time.units = "days since 2000-01-01"
+                time[:] = [0, 1]
+                dataset.createVariable("lat", "f4", ("lat",))[:] = [10, 20]
+                dataset.createVariable("lon", "f4", ("lon",))[:] = [100, 110, 120]
+                value = dataset.createVariable(
+                    "value",
+                    "i2",
+                    ("time", "lat", "lon"),
+                    fill_value=np.int16(-9999),
+                )
+                value.scale_factor = np.float32(0.01)
+                value.add_offset = np.float32(0.0)
+                value[:] = np.arange(12, dtype="int16").reshape(2, 2, 3)
+            summary = inspect_netcdf_native(path)
+            self.assertFalse(summary["supported_subset"])
+            self.assertTrue(
+                any("outside the native numeric" in item for item in summary["limitations"])
+            )
+
     def test_convert_preserves_packed_float_semantics(self) -> None:
         import netCDF4
 
