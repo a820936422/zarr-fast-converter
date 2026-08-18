@@ -173,9 +173,15 @@ def initial_plan(
             1,
             budget.memory_budget_bytes // max(256 * MIB, chunk_bytes * 4),
         )
+        kind = workload_kind(inventory)
+        same_device = "source+output" in budget.same_device_roles
+        storage_workers = min(
+            budget.worker_ceiling,
+            storage_aware_worker_limit(budget, kind, same_device=same_device),
+        )
         return ConversionPlan(
             "dask",
-            min(budget.worker_ceiling, int(memory_workers)),
+            min(storage_workers, int(memory_workers)),
             chunk_time,
             cy,
             cx,
@@ -321,13 +327,6 @@ def fixed_layout_candidate_plans(
     cpu_limit = int(budget.worker_ceiling)
     if max_workers is not None:
         cpu_limit = min(cpu_limit, int(max_workers))
-    else:
-        kind = workload_kind(inventory)
-        same_device = "source+output" in budget.same_device_roles
-        cpu_limit = min(
-            cpu_limit,
-            storage_aware_worker_limit(budget, kind, same_device=same_device),
-        )
     largest_item = max(
         inventory.variables[name].itemsize for name in selection.variables
     )
@@ -344,8 +343,7 @@ def fixed_layout_candidate_plans(
     worker_limit = max(1, min(cpu_limit, int(memory_limit)))
 
     # Fixed layouts must expose every safe worker count to the benchmark;
-    # storage profiles are context, not a static cap.  Automatic plans still
-    # apply a storage-aware ceiling to avoid HDD seek thrash.
+    # storage profiles are context, not a static cap.
     worker_values = set(range(1, worker_limit + 1))
 
     _, ny, nx = selection.shape
@@ -406,15 +404,6 @@ def candidate_plans(
     cpu_limit = int(budget.worker_ceiling)
     if max_workers is not None:
         cpu_limit = min(cpu_limit, int(max_workers))
-    else:
-        kind = workload_kind(inventory)
-        source = budget.source_storage or storage_profile(inventory.input_dir)
-        destination = budget.output_storage or storage_profile(output)
-        same_device = source.device != "unknown" and source.device == destination.device
-        cpu_limit = min(
-            cpu_limit,
-            storage_aware_worker_limit(budget, kind, same_device=same_device),
-        )
     worker_values = list(range(1, max(1, cpu_limit) + 1))
 
     kind = workload_kind(inventory)
