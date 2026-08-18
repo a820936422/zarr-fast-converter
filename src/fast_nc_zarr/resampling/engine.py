@@ -19,6 +19,7 @@ import zarr
 
 from .._backend import resolve_backend
 from ..metadata import sanitize_cf_references
+from ..online_controller import OnlineController
 from ..rechunking.models import DatasetInfo, VariableInfo
 from ..publication import preflight_writable, publish_staging
 from ..writer import compressor_from_spec
@@ -1590,6 +1591,36 @@ def _execute_serial_tile(
                 pass
 
 
+def _rss_bytes() -> int:
+    try:
+        import psutil
+
+        root = psutil.Process()
+        processes = [root, *root.children(recursive=True)]
+        seen: set[int] = set()
+        total = 0
+        for process in processes:
+            if process.pid in seen:
+                continue
+            seen.add(process.pid)
+            try:
+                total += int(process.memory_info().rss)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return total
+    except (ImportError, AttributeError, OSError):
+        return 0
+
+
+def _cpu_percent() -> float:
+    try:
+        import psutil
+
+        return float(psutil.cpu_percent(interval=None))
+    except (ImportError, AttributeError, OSError):
+        return 0.0
+
+
 def _run_parallel_tiles(
     source_path: Path,
     staging: Path,
@@ -1634,6 +1665,10 @@ def _run_parallel_tiles(
     owner_buffer_bytes = 0
     owner_buffer_peak_bytes = 0
     owner_memmap_bytes = 0
+    current_pending_limit = max(1, int(plan.space_workers)) * 2
+    online_controller = OnlineController(stage="resample", memory_budget_bytes=0)
+    last_online_action = "none"
+    wall_started = time.perf_counter()
     try:
         while pending or not cancelled:
             if cancel_event is not None and cancel_event.is_set():
@@ -1643,7 +1678,7 @@ def _run_parallel_tiles(
                 if not pending:
                     raise ResampleExecutionError("任务已取消，未生成输出。")
 
-            while not cancelled and len(pending) < max(1, int(plan.space_workers)) * 2:
+            while not cancelled and len(pending) < current_pending_limit:
                 try:
                     task = next(task_iter)
                 except StopIteration:
@@ -1716,6 +1751,38 @@ def _run_parallel_tiles(
                     or completed % max(1, total_tasks // 20) == 0
                 ):
                     print(_format_tile_progress(completed, total_tasks, metrics), flush=True)
+                if (
+                    completed == 1
+                    or completed == total_tasks
+                    or completed % max(1, total_tasks // 20) == 0
+                ):
+                    elapsed = max(time.perf_counter() - wall_started, 1e-9)
+                    throughput = (
+                        owner_buffer_bytes + owner_memmap_bytes
+                    ) / 1024**2 / elapsed
+                    action = online_controller.decide(
+                        throughput_mib_s=throughput,
+                        cpu_percent=_cpu_percent(),
+                        rss_bytes=_rss_bytes(),
+                    )
+                    if action != "none" and action != last_online_action:
+                        online_controller.record(
+                            action=action,
+                            reason="runtime heuristic",
+                            throughput_mib_s=throughput,
+                            cpu_percent=_cpu_percent(),
+                            rss_bytes=_rss_bytes(),
+                        )
+                        last_online_action = action
+                        if action == "spill_memory":
+                            current_pending_limit = max(1, current_pending_limit - 1)
+                        elif action == "reduce_workers":
+                            current_pending_limit = max(1, current_pending_limit - 1)
+                        elif action == "increase_batch":
+                            current_pending_limit = min(
+                                max(1, int(plan.space_workers)) * 4,
+                                current_pending_limit + 1,
+                            )
             if cancelled:
                 raise ResampleExecutionError("任务已取消，未生成输出。")
     except BaseException:
@@ -1745,6 +1812,9 @@ def _run_parallel_tiles(
         "owner_buffer_peak_bytes": owner_buffer_peak_bytes,
         "owner_memmap_bytes": owner_memmap_bytes,
         "worker_lifecycle": lifecycle.to_dict(),
+        "online_adjustments": [
+            event.__dict__ for event in online_controller.events
+        ],
     }
 
 
@@ -2923,6 +2993,7 @@ def run_resample(
             "owner_buffer_bytes": 0,
             "owner_buffer_peak_bytes": 0,
             "owner_memmap_bytes": 0,
+            "online_adjustments": [],
         }
         if total_tiles and runtime_plan.method == "nearest_d2s":
             full_regridder, full_weight_path = _build_regridder(
@@ -3098,6 +3169,9 @@ def run_resample(
             "logical_write_amplification": 1.0,
             "space_workers": min(runtime_plan.space_workers, total_tiles),
             "compute_workers_per_space_worker": runtime_plan.compute_workers,
+            "online_adjustments": list(
+                tile_timing.get("online_adjustments", [])
+            ),
             "memory_plan": (
                 {
                     "available_bytes": runtime_plan.auto_tile.available_bytes,

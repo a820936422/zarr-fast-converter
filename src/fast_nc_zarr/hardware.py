@@ -31,6 +31,68 @@ DEFAULT_SAMPLE_MIB = 64
 DEFAULT_RANDOM_IOPS_SAMPLES = 256
 
 
+def _format_cpu_list(cpus: list[int]) -> str:
+    """Format sorted CPU ids as compact ranges, e.g. ``0-5,8,10-11``."""
+    parts: list[str] = []
+    start = prev = cpus[0]
+    for cpu in cpus[1:]:
+        if cpu == prev + 1:
+            prev = cpu
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = cpu
+    parts.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(parts)
+
+
+def affinity_spec_from_profile(profile: "HardwareProfile") -> str | None:
+    """Build a CPU affinity spec that prefers performance cores.
+
+    When the profile knows performance cores and they cover the worker
+    ceiling, the returned spec restricts to those cores.  Otherwise the spec
+    covers all logical CPUs so the OS scheduler remains free.  Returns
+    ``None`` only when no core topology is available.
+    """
+    ceiling = max(1, int(profile.worker_ceiling))
+    perf = profile.performance_cores
+    if perf:
+        cpus = sorted(int(cpu) for cpu in perf)
+        if len(cpus) >= ceiling:
+            return _format_cpu_list(cpus)
+    logical = list(range(max(1, int(profile.cpu_logical))))
+    return _format_cpu_list(logical)
+
+
+def storage_initial_workers(
+    profile: "HardwareProfile",
+    kind: str,
+    *,
+    same_device: bool,
+) -> int:
+    """Return a storage-aware initial worker hint from measured bandwidth.
+
+    HDD/network start conservative.  When the measured sequential write
+    bandwidth is high (for example a fast HDD or an NVMe-backed mount that
+    reports ``hdd``), the initial hint is raised so the tuning stage starts
+    closer to the optimum while still exploring the full safe worker range.
+    """
+    ceiling = max(1, int(profile.worker_ceiling))
+    benchmark = profile.storage.get("output") or profile.storage.get("source")
+    medium = benchmark.medium if benchmark is not None else "unknown"
+    if medium == "hdd":
+        if kind == "many-small-files":
+            initial = 8
+        else:
+            initial = 4
+        if benchmark is not None and float(benchmark.seq_write_mib_s) >= 150.0:
+            initial = 8
+    elif medium == "network":
+        initial = 2 if same_device else 4
+    else:
+        initial = ceiling
+    return max(1, min(ceiling, initial))
+
+
 @dataclass(frozen=True)
 class StorageBenchmark:
     """Measured storage performance for one role (source/temporary/output)."""

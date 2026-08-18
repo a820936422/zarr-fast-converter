@@ -1202,6 +1202,12 @@ def _run_zarr_pipeline(
             ),
         }
         manifest["logical_io"] = logical_io
+        manifest["online_adjustments"] = [
+            event
+            for metrics in (resample_metrics, finalization_metrics)
+            if isinstance(metrics, dict)
+            for event in metrics.get("online_adjustments", [])
+        ]
         manifest["status"] = "succeeded"
         manifest["elapsed"] = time.perf_counter() - started
         lifecycle.finish("completed")
@@ -1753,6 +1759,12 @@ def run_pipeline(
             ),
         }
         manifest["logical_io"] = logical_io
+        manifest["online_adjustments"] = [
+            event
+            for metrics in (conversion_metrics, resample_metrics, rechunk_metrics)
+            if isinstance(metrics, dict)
+            for event in metrics.get("online_adjustments", [])
+        ]
         manifest["status"] = "succeeded"
         manifest["elapsed"] = time.perf_counter() - started
         lifecycle.finish("completed")

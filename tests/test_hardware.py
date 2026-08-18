@@ -11,6 +11,7 @@ sys.path.insert(0, str(PROJECT / "src"))
 from fast_nc_zarr.hardware import (  # noqa: E402
     HardwareProfile,
     StorageBenchmark,
+    affinity_spec_from_profile,
     benchmark_storage_path,
     build_hardware_profile,
     detect_core_capacities,
@@ -18,6 +19,7 @@ from fast_nc_zarr.hardware import (  # noqa: E402
     detect_performance_efficiency_cores,
     load_cached_profile,
     save_cached_profile,
+    storage_initial_workers,
 )
 
 
@@ -123,6 +125,89 @@ class HardwareProfileTests(unittest.TestCase):
                 sample_mib=1,
             )
             self.assertEqual(first.to_dict(), second.to_dict())
+
+    def test_affinity_spec_prefers_performance_cores(self) -> None:
+        profile = HardwareProfile(
+            cpu_physical=8,
+            cpu_logical=16,
+            cpu_effective=16,
+            worker_ceiling=8,
+            memory_total_bytes=32 * 1024**3,
+            memory_available_bytes=20 * 1024**3,
+            storage={},
+            performance_cores=(0, 2, 4, 6, 8, 10, 12, 14),
+            efficiency_cores=(1, 3, 5, 7, 9, 11, 13, 15),
+        )
+        self.assertEqual(affinity_spec_from_profile(profile), "0,2,4,6,8,10,12,14")
+
+    def test_affinity_spec_falls_back_to_all_logical(self) -> None:
+        profile = HardwareProfile(
+            cpu_physical=6,
+            cpu_logical=12,
+            cpu_effective=12,
+            worker_ceiling=6,
+            memory_total_bytes=32 * 1024**3,
+            memory_available_bytes=20 * 1024**3,
+            storage={},
+        )
+        self.assertEqual(affinity_spec_from_profile(profile), "0-11")
+
+    def test_storage_initial_workers_fast_hdd_raises_hint(self) -> None:
+        profile = HardwareProfile(
+            cpu_physical=6,
+            cpu_logical=12,
+            cpu_effective=12,
+            worker_ceiling=12,
+            memory_total_bytes=32 * 1024**3,
+            memory_available_bytes=20 * 1024**3,
+            storage={
+                "output": StorageBenchmark(
+                    "hdd", "ext4", 180.0, 200.0, 120.0, 64, 1.0
+                )
+            },
+        )
+        self.assertEqual(
+            storage_initial_workers(profile, "large-files", same_device=True),
+            8,
+        )
+
+    def test_storage_initial_workers_slow_hdd_stays_conservative(self) -> None:
+        profile = HardwareProfile(
+            cpu_physical=6,
+            cpu_logical=12,
+            cpu_effective=12,
+            worker_ceiling=12,
+            memory_total_bytes=32 * 1024**3,
+            memory_available_bytes=20 * 1024**3,
+            storage={
+                "output": StorageBenchmark(
+                    "hdd", "ext4", 80.0, 70.0, 100.0, 64, 1.0
+                )
+            },
+        )
+        self.assertEqual(
+            storage_initial_workers(profile, "large-files", same_device=True),
+            4,
+        )
+
+    def test_storage_initial_workers_ssd_uses_ceiling(self) -> None:
+        profile = HardwareProfile(
+            cpu_physical=6,
+            cpu_logical=12,
+            cpu_effective=12,
+            worker_ceiling=12,
+            memory_total_bytes=32 * 1024**3,
+            memory_available_bytes=20 * 1024**3,
+            storage={
+                "output": StorageBenchmark(
+                    "ssd", "ext4", 1800.0, 1500.0, 40000.0, 64, 1.0
+                )
+            },
+        )
+        self.assertEqual(
+            storage_initial_workers(profile, "large-files", same_device=False),
+            12,
+        )
 
 
 if __name__ == "__main__":

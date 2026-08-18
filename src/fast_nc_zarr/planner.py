@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .hardware import load_cached_profile
+from .hardware import load_cached_profile, storage_initial_workers
 from .models import ConversionPlan, Inventory, OutputLayout, Selection
 from .performance_model import keep_full_worker_sweep, rank_candidates
 from .system import EffectiveResourceBudget, effective_resource_budget, storage_profile
@@ -130,6 +130,22 @@ def storage_aware_initial_workers(
     return max(1, min(ceiling, initial))
 
 
+def _profile_storage_initial_workers(
+    budget: EffectiveResourceBudget,
+    kind: str,
+    *,
+    same_device: bool,
+    profile,
+) -> int:
+    """Prefer measured-bandwidth hints from a cached HardwareProfile."""
+    if profile is not None:
+        return min(
+            budget.worker_ceiling,
+            storage_initial_workers(profile, kind, same_device=same_device),
+        )
+    return storage_aware_initial_workers(budget, kind, same_device=same_device)
+
+
 def _source_medium(budget: EffectiveResourceBudget, fallback: Path) -> str:
     source = budget.source_storage
     return source.medium if source is not None else "unknown"
@@ -181,6 +197,7 @@ def initial_plan(
         output=output,
         reserve_memory_bytes=int(max(0.0, float(reserve_gib)) * 1024**3),
     )
+    profile = load_cached_profile((inventory.input_dir, output))
     compatible, reason = direct_compatible(inventory, selection)
     if not compatible:
         chunk_time = min(selection.shape[0], 16)
@@ -195,7 +212,9 @@ def initial_plan(
         same_device = "source+output" in budget.same_device_roles
         storage_workers = min(
             budget.worker_ceiling,
-            storage_aware_initial_workers(budget, kind, same_device=same_device),
+            _profile_storage_initial_workers(
+                budget, kind, same_device=same_device, profile=profile
+            ),
         )
         return ConversionPlan(
             "dask",
@@ -213,7 +232,9 @@ def initial_plan(
     cpus = max(1, int(budget.worker_ceiling))
     storage_workers = min(
         cpus,
-        storage_aware_initial_workers(budget, kind, same_device=same_device),
+        _profile_storage_initial_workers(
+            budget, kind, same_device=same_device, profile=profile
+        ),
     )
     nt, _, _ = selection.shape
     rationale = [f"输入形态：{kind}"]
@@ -221,6 +242,8 @@ def initial_plan(
         rationale.append(f"源存储 profile：{source.medium}/{source.filesystem}")
     if same_device:
         rationale.append("源和目标同设备；自动计划采用存储感知 worker 上限")
+    if profile is not None:
+        rationale.append("使用缓存 HardwareProfile 实测带宽作为初始 worker 提示")
     if storage_workers < cpus:
         rationale.append(f"存储感知 worker 上限：{storage_workers}")
 

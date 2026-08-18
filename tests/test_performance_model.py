@@ -27,7 +27,11 @@ from fast_nc_zarr.performance_model import (  # noqa: E402
     prune_candidates,
     rank_candidates,
 )
-from fast_nc_zarr.planner import candidate_plans, performance_model_enabled  # noqa: E402
+from fast_nc_zarr.planner import (  # noqa: E402
+    candidate_plans,
+    initial_plan,
+    performance_model_enabled,
+)
 from fast_nc_zarr.system import EffectiveResourceBudget, StorageProfile  # noqa: E402
 
 
@@ -317,6 +321,60 @@ class PerformanceModelTests(unittest.TestCase):
                 os.environ["FAST_NC_ZARR_PERF_MODEL"] = previous
         self.assertTrue(set(range(1, 17)).issubset({plan.workers for plan in pruned}))
         self.assertLess(len(pruned), len(unpruned))
+
+    def test_initial_plan_uses_profile_bandwidth_for_storage_workers(self) -> None:
+        inventory = _planner_inventory()
+        selection = Selection(("gpp",), 0, 8, 0, 100, 0, 100)
+        budget = _budget()
+        fast_hdd = HardwareProfile(
+            cpu_physical=8,
+            cpu_logical=16,
+            cpu_effective=16,
+            worker_ceiling=16,
+            memory_total_bytes=32 * 1024**3,
+            memory_available_bytes=24 * 1024**3,
+            storage={
+                "output": StorageBenchmark(
+                    "hdd", "ext4", 180.0, 200.0, 120.0, 64, 1.0
+                )
+            },
+        )
+        slow_hdd = HardwareProfile(
+            cpu_physical=8,
+            cpu_logical=16,
+            cpu_effective=16,
+            worker_ceiling=16,
+            memory_total_bytes=32 * 1024**3,
+            memory_available_bytes=24 * 1024**3,
+            storage={
+                "output": StorageBenchmark(
+                    "hdd", "ext4", 80.0, 70.0, 100.0, 64, 1.0
+                )
+            },
+        )
+        with patch(
+            "fast_nc_zarr.planner.load_cached_profile", return_value=fast_hdd
+        ):
+            fast_plan = initial_plan(
+                inventory,
+                selection,
+                Path("/out"),
+                reserve_gib=2.0,
+                resource_budget=budget,
+            )
+        with patch(
+            "fast_nc_zarr.planner.load_cached_profile", return_value=slow_hdd
+        ):
+            slow_plan = initial_plan(
+                inventory,
+                selection,
+                Path("/out"),
+                reserve_gib=2.0,
+                resource_budget=budget,
+            )
+        self.assertEqual(fast_plan.workers, 8)
+        self.assertEqual(slow_plan.workers, 4)
+        self.assertIn("实测带宽", " ".join(fast_plan.rationale))
 
 
 if __name__ == "__main__":

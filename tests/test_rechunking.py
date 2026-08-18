@@ -494,7 +494,7 @@ class RechunkingTests(unittest.TestCase):
         output = ROOT / "parallel_time.zarr"
         info = inspect_store(source)
         plan = plan_chunks(info, "time", target_mib=32, workers=2)
-        run_rechunk(
+        metrics = run_rechunk(
             source,
             output,
             info,
@@ -503,6 +503,7 @@ class RechunkingTests(unittest.TestCase):
             workers=2,
             progress=False,
         )
+        self.assertIsInstance(metrics["online_adjustments"], list)
         with xr.open_zarr(output, consolidated=False, chunks=None) as result:
             np.testing.assert_array_equal(
                 result["float_value"].values,

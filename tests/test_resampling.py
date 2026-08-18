@@ -691,6 +691,10 @@ class ResamplingTests(unittest.TestCase):
         metrics = run_resample(config, owner_plan, progress=False)
 
         self.assertEqual(metrics["space_workers"], 2)
+        self.assertIsInstance(metrics["online_adjustments"], list)
+        self.assertIsInstance(
+            metrics["tile_timing"]["online_adjustments"], list
+        )
         self.assertEqual(int(metrics["tile_timing"]["tiles"]), 4)
         self.assertEqual(metrics["owner_buffer"]["physical_chunks"], 8)
         self.assertEqual(

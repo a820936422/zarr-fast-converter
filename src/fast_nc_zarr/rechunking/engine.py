@@ -21,6 +21,7 @@ import zarr
 
 from ..metadata import sanitize_cf_references
 from ..models import StorageProfile
+from ..online_controller import OnlineController
 from ..planner import storage_aware_initial_workers
 from ..publication import preflight_writable, publish_staging
 from ..system import EffectiveResourceBudget, RuntimeResourceSnapshot, effective_resource_budget, runtime_resource_snapshot, storage_profile
@@ -1032,6 +1033,7 @@ def _run_process_tasks(
     progress: bool,
     stage_label: str,
     cancel_event=None,
+    online_events: list | None = None,
 ) -> None:
     """Run bounded process tasks and report aggregate throughput."""
 
@@ -1041,6 +1043,13 @@ def _run_process_tasks(
     # Keep progress output useful without turning hundreds of process
     # completions into another serialization bottleneck.
     progress_interval = max(1, min(32, total // 20))
+    current_pending_limit = max(1, int(workers)) * 2
+    online_controller = OnlineController(stage=stage_label, memory_budget_bytes=0)
+    last_online_action = "none"
+
+    def _pending_limit_fn() -> int:
+        return current_pending_limit
+
     pool = WorkerPool(
         max_workers=max(1, int(workers)),
         initializer=initializer,  # type: ignore[arg-type]
@@ -1051,6 +1060,7 @@ def _run_process_tasks(
             task_function,  # type: ignore[arg-type]
             tasks,
             cancel_event=cancel_event,
+            pending_limit_fn=_pending_limit_fn,
         )
         for index, result in enumerate(results, start=1):
             processed_bytes += int(result.get("bytes", 0))
@@ -1065,12 +1075,42 @@ def _run_process_tasks(
                     f"处理源 chunk {processed_chunks}；吞吐 {rate:.1f} MiB/s",
                     flush=True,
                 )
+            if index % progress_interval == 0 or index == total:
+                elapsed = max(time.perf_counter() - started, 1e-9)
+                throughput = processed_bytes / 1024**2 / elapsed
+                action = online_controller.decide(
+                    throughput_mib_s=throughput,
+                    cpu_percent=_cpu_percent(),
+                    rss_bytes=_rss_bytes(),
+                )
+                if action != "none" and action != last_online_action:
+                    online_controller.record(
+                        action=action,
+                        reason="runtime heuristic",
+                        throughput_mib_s=throughput,
+                        cpu_percent=_cpu_percent(),
+                        rss_bytes=_rss_bytes(),
+                    )
+                    last_online_action = action
+                    if action == "spill_memory":
+                        current_pending_limit = max(1, current_pending_limit - 1)
+                    elif action == "reduce_workers":
+                        current_pending_limit = max(1, current_pending_limit - 1)
+                    elif action == "increase_batch":
+                        current_pending_limit = min(
+                            max(1, int(workers)) * 4,
+                            current_pending_limit + 1,
+                        )
     except RuntimeError as exc:
         if str(exc) == "任务已取消。":
             raise RechunkExecutionError(str(exc)) from exc
         raise
     finally:
         pool.close()
+    if online_events is not None:
+        online_events.extend(
+            event.__dict__ for event in online_controller.events
+        )
 
 
 def _stage1_time_tasks(info: DatasetInfo) -> Iterator[tuple[str, int]]:
@@ -1334,6 +1374,13 @@ def _rss_bytes() -> int:
         return total
     except (AttributeError, OSError, psutil.Error):
         return 0
+
+
+def _cpu_percent() -> float:
+    try:
+        return float(psutil.cpu_percent(interval=None))
+    except (AttributeError, OSError, psutil.Error):
+        return 0.0
 
 
 def _measure_benchmark_tasks(
@@ -1703,6 +1750,7 @@ def _populate_intermediate_parallel(
     progress: bool,
     stage_label: str = "阶段 1/2：",
     cancel_event=None,
+    online_events: list | None = None,
 ) -> None:
     total_tasks = _stage1_time_task_count(info)
     if total_tasks == 0:
@@ -1718,6 +1766,7 @@ def _populate_intermediate_parallel(
         progress=progress,
         stage_label=stage_label,
         cancel_event=cancel_event,
+        online_events=online_events,
     )
 
 
@@ -1732,6 +1781,7 @@ def _populate_final_parallel(
     workers: int,
     progress: bool,
     cancel_event=None,
+    online_events: list | None = None,
 ) -> None:
     total_tasks = _stage2_task_count(info, plan, intermediate_chunks, region_chunks)
     if total_tasks == 0:
@@ -1747,6 +1797,7 @@ def _populate_final_parallel(
         progress=progress,
         stage_label="阶段 2/2：",
         cancel_event=cancel_event,
+        online_events=online_events,
     )
 
 
@@ -1761,6 +1812,7 @@ def _populate_intermediate(
     stage_label: str = "阶段 1/2：",
     parallel: bool = False,
     cancel_event=None,
+    online_events: list | None = None,
 ) -> None:
     """Read each physical source chunk once and scatter it to an intermediate store."""
 
@@ -1775,6 +1827,7 @@ def _populate_intermediate(
             progress=progress,
             stage_label=stage_label,
             cancel_event=cancel_event,
+            online_events=online_events,
         )
         return
 
@@ -2389,6 +2442,7 @@ def run_rechunk(
     stage_budget = max(0.0, tune_budget)
     preflight_writable(target.parent, "重分块输出")
     started = time.perf_counter()
+    online_events: list[dict[str, object]] = []
     execution_path = "two_stage"
     dataset = None
     intermediate_dataset = None
@@ -2705,6 +2759,7 @@ def run_rechunk(
                 source_path=source_path,
                 parallel=parallel_stage1,
                 cancel_event=cancel_event,
+                online_events=online_events,
             )
             if cancel_event is not None and cancel_event.is_set():
                 raise RechunkExecutionError("任务已取消。")
@@ -2782,6 +2837,7 @@ def run_rechunk(
                     workers=stage2_workers,
                     progress=progress,
                     cancel_event=cancel_event,
+                    online_events=online_events,
                 )
             else:
                 _populate_final_from_intermediate(
@@ -2842,6 +2898,7 @@ def run_rechunk(
             "tuning_objective": tuning_objective,
             "compression_tuning": compression_tuning,
             "selected_compression": compression.to_dict(),
+            "online_adjustments": online_events,
         }
     except Exception as exc:
         if dataset is not None:
