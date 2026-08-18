@@ -14,6 +14,7 @@ import xarray as xr
 
 from fast_nc_zarr.filename_mode import (
     FilenameTimeError,
+    _hdf_eos_grid_values,
     convert_filename,
     filename_direct_write,
     inspect_filename_inventory,
@@ -379,6 +380,84 @@ class FilenameModeTests(unittest.TestCase):
         self.assertEqual(inventory.lon_values.shape, (3,))
         self.assertEqual(inventory.variables["value"].attrs["_FillValue"], -1)
         self.assertEqual(inventory.variables["value"].attrs["scale_factor"], 0.01)
+
+    def test_hdf_eos_grid_filename_conversion_reconstructs_coordinates(self) -> None:
+        from netCDF4 import Dataset
+
+        folder = ROOT / "low-level-hdf-convert"
+        folder.mkdir()
+        metadata = (
+            "GROUP=GridStructure\n"
+            "UpperLeftPointMtrs=(-180000000,90000000)\n"
+            "LowerRightMtrs=(180000000,-90000000)\n"
+        )
+        for index, doy in enumerate(("001", "005")):
+            path = folder / f"product_2001{doy}.hdf"
+            with Dataset(path, "w", format="NETCDF4") as dataset:
+                dataset.createDimension("YDim:TEST", 2)
+                dataset.createDimension("XDim:TEST", 3)
+                dataset.setncattr("StructMetadata.0", metadata)
+                variable = dataset.createVariable(
+                    "value", "i4", ("YDim:TEST", "XDim:TEST"), fill_value=-1
+                )
+                variable.setncattr("scale_factor", 0.01)
+                variable[:] = index
+
+        scan = scan_filename_times(folder)
+        inventory = inspect_filename_inventory(
+            scan, requested_engine="netcdf4", workers=1, progress=False
+        )
+        np.testing.assert_allclose(inventory.lat_values, [45.0, -45.0])
+        np.testing.assert_allclose(inventory.lon_values, [-120.0, 0.0, 120.0])
+
+        output = ROOT / "low-level-hdf-convert-output.zarr"
+        convert_filename(
+            inventory,
+            make_selection(inventory),
+            output,
+            plan=ConversionPlan("file", 1, 1, 2, 3),
+            auto_tune=False,
+            progress=False,
+            validate=True,
+        )
+        with xr.open_zarr(
+            output, consolidated=False, chunks=None, decode_times=False
+        ) as result:
+            np.testing.assert_allclose(result["lat"].values, [45.0, -45.0])
+            np.testing.assert_allclose(result["lon"].values, [-120.0, 0.0, 120.0])
+            self.assertEqual(result["value"].shape, (2, 2, 3))
+
+    def test_hdf_eos_grid_values_parses_meters_and_degrees(self) -> None:
+        meters = (
+            "GROUP=GridStructure\n"
+            "UpperLeftPointMtrs=(-180000000,90000000)\n"
+            "LowerRightMtrs=(180000000,-90000000)\n"
+        )
+        lat = _hdf_eos_grid_values(meters, 2, "lat")
+        lon = _hdf_eos_grid_values(meters, 3, "lon")
+        assert lat is not None and lon is not None
+        np.testing.assert_allclose(lat, [45.0, -45.0])
+        np.testing.assert_allclose(lon, [-120.0, 0.0, 120.0])
+
+        degrees = (
+            "GROUP=GridStructure\n"
+            "UpperLeftPointMtrs=(-90,45)\n"
+            "LowerRightMtrs=(90,-45)\n"
+        )
+        lat_deg = _hdf_eos_grid_values(degrees, 2, "lat")
+        assert lat_deg is not None
+        np.testing.assert_allclose(lat_deg, [22.5, -22.5])
+
+    def test_hdf_eos_grid_values_falls_back_without_bounds(self) -> None:
+        self.assertIsNone(_hdf_eos_grid_values("GROUP=GridStructure\n", 4, "lat"))
+        self.assertIsNone(
+            _hdf_eos_grid_values(
+                "UpperLeftPointMtrs=(not-a-number,90)\n"
+                "LowerRightMtrs=(180,-90)\n",
+                4,
+                "lon",
+            )
+        )
 
     def test_rasterio_fallback_signature_includes_crs_and_transform(self) -> None:
         from fast_nc_zarr import filename_mode
