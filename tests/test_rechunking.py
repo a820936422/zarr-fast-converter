@@ -604,6 +604,16 @@ class WorkerAutotuneTests(unittest.TestCase):
         self.assertEqual(worker_candidates(1), (1,))
         self.assertEqual(worker_candidates(6), (1, 2, 3, 4, 5, 6))
 
+    def test_candidates_with_initial_places_initial_first_but_keeps_full_range(self) -> None:
+        self.assertEqual(
+            worker_candidates(6, initial_workers=4),
+            (4, 1, 2, 3, 5, 6),
+        )
+        self.assertEqual(
+            worker_candidates(6, initial_workers=8),
+            (6, 1, 2, 3, 4, 5),
+        )
+
     def test_cpu_bound_sample_selects_two_or_more(self) -> None:
         trials = tuple(
             WorkerTrial(

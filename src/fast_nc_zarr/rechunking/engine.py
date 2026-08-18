@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Iterable, Iterator, Mapping
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ import zarr
 
 from ..metadata import sanitize_cf_references
 from ..models import StorageProfile
+from ..planner import storage_aware_initial_workers
 from ..publication import preflight_writable, publish_staging
 from ..runtime import bounded_process_map
 from ..system import EffectiveResourceBudget, RuntimeResourceSnapshot, effective_resource_budget, runtime_resource_snapshot, storage_profile
@@ -265,6 +267,37 @@ def _parallel_workers(
         f"same_device={same_device}"
     )
     return base, f"存储 profile 仅作为实测上下文（{context}），未静态限制 worker"
+
+
+def _storage_initial_workers(
+    source: Path,
+    target_parent: Path,
+    safe: int,
+    *,
+    source_profile: StorageProfile | None = None,
+    target_profile: StorageProfile | None = None,
+) -> int:
+    """Return a storage-aware initial worker hint for worker tuning.
+
+    This is a starting point only; ``worker_candidates`` still exposes the
+    full ``1..safe`` range to the benchmark.
+    """
+    source_profile = source_profile or storage_profile(source)
+    target_profile = target_profile or storage_profile(target_parent)
+    same_device = (
+        source_profile.device != "unknown"
+        and target_profile.device != "unknown"
+        and source_profile.device == target_profile.device
+    )
+    budget_like = SimpleNamespace(
+        worker_ceiling=max(1, int(safe)),
+        source_storage=source_profile,
+    )
+    return storage_aware_initial_workers(
+        budget_like,
+        "large-files",
+        same_device=same_device,
+    )
 
 
 def _json_signature(value: object) -> str:
@@ -1465,7 +1498,14 @@ def _tune_source_workers(
     sample_count = min(max(1, owner_count), max(8, safe * 4), 32)
     tasks = _stage1_benchmark_tasks(info, sample_count)
     safe = min(safe, max(1, len(tasks)))
-    candidates = worker_candidates(safe)
+    initial_workers = _storage_initial_workers(
+        source_path,
+        target_profile_path,
+        safe,
+        source_profile=source_profile,
+        target_profile=target_profile,
+    )
+    candidates = worker_candidates(safe, initial_workers=initial_workers)
     tune_root = store_root / f".{source_path.stem}.{stage}-worker-tune-{uuid4().hex}.tmp"
     tune_root.mkdir(parents=True, exist_ok=True)
 
@@ -1591,7 +1631,14 @@ def _tune_stage2_workers(
             selected_reason="显式 workers 是硬上限，未运行自动实测",
             objective=objective,
         ), sample_regions
-    candidates = worker_candidates(safe)
+    initial_workers = _storage_initial_workers(
+        intermediate,
+        staging_parent,
+        safe,
+        source_profile=source_profile,
+        target_profile=target_profile,
+    )
+    candidates = worker_candidates(safe, initial_workers=initial_workers)
     tune_root = staging_parent / f".{staging_parent.name}.stage2-worker-tune-{uuid4().hex}.tmp"
     tune_root.mkdir(parents=True, exist_ok=True)
 

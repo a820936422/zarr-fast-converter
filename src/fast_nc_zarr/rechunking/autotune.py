@@ -48,11 +48,24 @@ class WorkerTuneReport:
         return payload
 
 
-def worker_candidates(safe_ceiling: int) -> tuple[int, ...]:
-    """Expose every safe worker count to the real benchmark."""
+def worker_candidates(
+    safe_ceiling: int,
+    initial_workers: int | None = None,
+) -> tuple[int, ...]:
+    """Expose every safe worker count to the real benchmark.
+
+    The optional ``initial_workers`` is a storage-aware starting point.  It
+    is placed first so a short tuning budget still evaluates the heuristic
+    best guess, while the full ``1..safe_ceiling`` range remains available
+    for the benchmark to discover a better concurrency level.
+    """
 
     ceiling = max(1, int(safe_ceiling))
-    return tuple(range(1, ceiling + 1))
+    values = list(range(1, ceiling + 1))
+    if initial_workers is not None:
+        initial = max(1, min(ceiling, int(initial_workers)))
+        values = [initial] + [value for value in values if value != initial]
+    return tuple(values)
 
 
 def select_worker_trial(

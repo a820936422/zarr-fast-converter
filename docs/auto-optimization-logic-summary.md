@@ -1,7 +1,7 @@
 # Fast NC Zarr 自动优化代码逻辑汇总
 
 - **文档更新**：2026-08-18
-- **当前版本**：v1.7.8
+- **当前版本**：v1.7.9
 - **关联文档**：[v1.7.8 后端优化分析](v1.7.8-backend-optimization-analysis.md)、[v1.7.9 后端处理逻辑优化方案](v1.7.9-backend-optimization-plan.md)、[维护文档](MAINTENANCE.md)
 
 本文档汇总当前程序中所有“自动优化 / 自动调参”相关代码逻辑，作为后续优化方案的基线。内容以当前工作区源码为准。
@@ -55,14 +55,16 @@ staging 校验 → 原子发布 → manifest/event 记录
 | 模块 | 职责 | 关键函数 / 入口 | 自动优化内容 | 关键参数 / 默认值 |
 |---|---|---|---|---|
 | `src/fast_nc_zarr/system.py` | 资源探测与预算 | `runtime_resource_snapshot()`、`effective_resource_budget()`、`storage_profile()` | CPU 物理/逻辑/affinity/cgroup；内存；存储介质；同设备关系；FD 限制 | `worker_ceiling = min(physical, effective)`；`memory_per_worker_bytes=512MiB`；`FD_PER_WORKER=64` |
-| `src/fast_nc_zarr/planner.py` | 转换计划生成 | `workload_kind()`、`initial_plan()`、`candidate_plans()`、`fixed_layout_candidate_plans()`、`storage_aware_initial_workers()` | 策略选择（file/chunk/dask）、chunk 尺寸、worker 初始值、task_batch、codec 候选 | `target_mib`：large=64 / balanced=32 / many-small=4；HDD 初始 worker：large/balanced=4、many-small=8；HDD `task_batch=4` |
+| `src/fast_nc_zarr/hardware.py` | 硬件画像（v1.7.9 新增） | `build_hardware_profile()`、`benchmark_storage_path()`、`load/save_cached_profile()` | 存储顺序读/写带宽、随机 4K IOPS、缓存 | `DEFAULT_SAMPLE_MIB=64`；缓存目录 `~/.cache/fast-nc-zarr/hardware-profiles/` |
+| `src/fast_nc_zarr/performance_model.py` | 性能模型（v1.7.9 新增） | `estimate_plan()`、`rank_candidates()`、`prune_candidates()` | 候选耗时估算与排序/剪枝 | `DEFAULT_READ_MIB_S=100`；`DEFAULT_WRITE_MIB_S=100`；`SPAWN_SECONDS_PER_WORKER=0.5` |
+| `src/fast_nc_zarr/planner.py` | 转换计划生成 | `workload_kind()`、`initial_plan()`、`candidate_plans()`、`fixed_layout_candidate_plans()`、`storage_aware_initial_workers()` | 策略选择（file/chunk/dask）、chunk 尺寸、worker 初始值、task_batch、codec 候选；`FAST_NC_ZARR_PERF_MODEL=1` 时按性能模型排序候选 | `target_mib`：large=64 / balanced=32 / many-small=4；HDD 初始 worker：large/balanced=4、many-small=8；HDD `task_batch=4` |
 | `src/fast_nc_zarr/benchmark.py` | 转换实测调优 | `tune()`、`representative_selections()`、`drop_source_page_cache()` | 分层样本、候选 round-robin、预算控制、目标选择、磁盘可行性 | `budget_seconds=60`；`max_samples=3`；`near_best_threshold=0.95`；objective：`speed/balanced/compact` |
 | `src/fast_nc_zarr/writer.py` | 直接写入执行 | `direct_write()`、`_task_batches()`、`source_cache_limit()` | 进程池并发、有界 pending、源文件 LRU、batch 局部性、CPU/RSS 监控 | `SOURCE_CACHE_HARD_LIMIT=64`；`TASK_BATCH_HARD_LIMIT=64`；`pending_limit=workers` |
 | `src/fast_nc_zarr/engine.py` | 转换 Dask 回退 | `convert()`、`_dask_write()` | 不兼容变量回退到 Dask processes；磁盘估算 | `dask scheduler=processes`；`num_workers=plan.workers` |
 | `src/fast_nc_zarr/resampling/autotune.py` | 重采样自动参数 | `resolve_auto_space_workers()`、`resolve_auto_time_block()`、`resolve_auto_tile_size()`、`resolve_owner_buffer_budget()` | 空间 worker、时间批、tile、owner buffer 的内存模型选择 | `ESMF_WORKER_BASELINE_BYTES=4GiB`；`MAX_AUTO_TIME_BLOCK=64`；`MIN/MAX_TILE_SIZE=16/1024`；全局线程预算 `space×compute ≤ effective_cpus` |
 | `src/fast_nc_zarr/resampling/engine.py` | 重采样执行 | `plan_resample()`、`run_resample()`、`_resample_tile_variable()` | 自动 tile/worker 候选探测；native 快速路径 | `compute_workers=2`；`space_workers=auto`；`tune_budget=60`；native 仅 float32 规则网格 nearest/bilinear |
-| `src/fast_nc_zarr/rechunking/autotune.py` | 重分块 worker 调优 | `worker_candidates()`、`benchmark_worker_candidates()`、`select_worker_trial()` | 全范围 worker 实测、预算控制、目标选择 | `worker_candidates = 1..safe_ceiling`；objective：`speed/balanced/compact` |
-| `src/fast_nc_zarr/rechunking/engine.py` | 重分块执行 | `_tune_source_workers()`、`_tune_stage2_workers()`、`_parallel_workers()` | 两阶段 worker 调优；存储 profile 作为上下文（当前不静态限制） | `stage_peak_bytes` 估算；`requested=auto` 时自动实测 |
+| `src/fast_nc_zarr/rechunking/autotune.py` | 重分块 worker 调优 | `worker_candidates()`、`benchmark_worker_candidates()`、`select_worker_trial()` | 全范围 worker 实测、预算控制、目标选择；支持 `initial_workers` 优先评估 | `worker_candidates = 1..safe_ceiling`（初始值可置首）；objective：`speed/balanced/compact` |
+| `src/fast_nc_zarr/rechunking/engine.py` | 重分块执行 | `_tune_source_workers()`、`_tune_stage2_workers()`、`_parallel_workers()`、`_storage_initial_workers()` | 两阶段 worker 调优；存储感知初始值 + 全范围实测 | `stage_peak_bytes` 估算；`requested=auto` 时自动实测；HDD 初始值 4 |
 | `src/fast_nc_zarr/rechunking/compression.py` | 压缩自动选择 | `generate_compression_candidates()`、`benchmark_compression_candidates()`、`select_compression_candidate()` | dtype 剪枝候选；真实写/耐久/读基准；Pareto + 对数评分 | profile：`fast/balanced/maximum/compact`；`max_candidates`；objective 权重 |
 | `src/fast_nc_zarr/pipeline/planner.py` | 流水线自动决策 | `build_pipeline_plan()`、`build_zarr_pipeline_plan()`、`_final_layout()` | 同网格检测、转换 chunk 与目标布局融合、是否独立最终化 | `finalization_required = compression_auto or !direct_layout or !chunk_ownership_safe` |
 | `src/fast_nc_zarr/runtime.py` | 进程调度 | `bounded_process_map()`、`configure_process_runtime()` | 有界 pending、单 worker 串行、spawn 上下文、线程环境约束 | `FAST_NC_ZARR_THREADS_PER_WORKER=1`（OMP/BLAS/NUMEXPR 默认 1） |

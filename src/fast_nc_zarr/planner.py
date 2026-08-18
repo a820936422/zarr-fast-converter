@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import math
+import os
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
+from .hardware import load_cached_profile
 from .models import ConversionPlan, Inventory, OutputLayout, Selection
+from .performance_model import rank_candidates
 from .system import EffectiveResourceBudget, effective_resource_budget, storage_profile
 
 MIB = 1024**2
@@ -491,6 +494,19 @@ def candidate_plans(
         if key not in seen:
             seen.add(key)
             unique.append(item)
+    # Optional performance-model reordering: when a cached HardwareProfile is
+    # available and FAST_NC_ZARR_PERF_MODEL=1, order candidates by estimated
+    # wall time (fastest first) without dropping any candidate.  This lets a
+    # short tuning budget evaluate promising plans earlier.
+    if os.environ.get("FAST_NC_ZARR_PERF_MODEL") == "1":
+        profile = load_cached_profile((inventory.input_dir, output))
+        if profile is not None:
+            unique = [
+                estimate.plan
+                for estimate in rank_candidates(
+                    unique, inventory, selection, profile
+                )
+            ]
     # Never truncate the 1..worker-ceiling parallelism sweep; the budget
     # controls how many trials run, while the manifest must expose all safe
     # worker candidates.  Only orthogonal layout candidates are compacted.
