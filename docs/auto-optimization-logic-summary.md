@@ -69,7 +69,7 @@ staging 校验 → 原子发布 → manifest/event 记录
 | `src/fast_nc_zarr/rechunking/autotune.py` | 重分块 worker 调优 | `worker_candidates()`、`benchmark_worker_candidates()`、`select_worker_trial()` | 全范围 worker 实测、预算控制、目标选择；支持 `initial_workers` 优先评估 | `worker_candidates = 1..safe_ceiling`（初始值可置首）；objective：`speed/balanced/compact` |
 | `src/fast_nc_zarr/rechunking/engine.py` | 重分块执行 | `_tune_source_workers()`、`_tune_stage2_workers()`、`_parallel_workers()`、`_storage_initial_workers()` | 两阶段 worker 调优；存储感知初始值 + 全范围实测 | `stage_peak_bytes` 估算；`requested=auto` 时自动实测；HDD 初始值 4 |
 | `src/fast_nc_zarr/rechunking/compression.py` | 压缩自动选择 | `generate_compression_candidates()`、`benchmark_compression_candidates()`、`select_compression_candidate()` | dtype 剪枝候选；真实写/耐久/读基准；Pareto + 对数评分 | profile：`fast/balanced/maximum/compact`；`max_candidates`；objective 权重 |
-| `src/fast_nc_zarr/pipeline/planner.py` | 流水线自动决策 | `build_pipeline_plan()`、`build_zarr_pipeline_plan()`、`_final_layout()` | 同网格检测、转换 chunk 与目标布局融合、是否独立最终化 | `finalization_required = compression_auto or !direct_layout or !chunk_ownership_safe` |
+| `src/fast_nc_zarr/pipeline/planner.py` | 流水线自动决策 | `build_pipeline_plan()`、`build_zarr_pipeline_plan()`、`_final_layout()` | 同网格检测、转换 chunk 与目标布局融合、是否独立最终化、`streaming_fusion_eligible` 标记 | `finalization_required = compression_auto or !direct_layout or !chunk_ownership_safe` |
 | `src/fast_nc_zarr/runtime.py` | 进程调度 | `bounded_process_map()`、`configure_process_runtime()` | 有界 pending、单 worker 串行、spawn 上下文、线程环境约束 | `FAST_NC_ZARR_THREADS_PER_WORKER=1`（OMP/BLAS/NUMEXPR 默认 1） |
 
 ---

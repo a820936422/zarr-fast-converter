@@ -1220,5 +1220,8 @@ def build_pipeline_plan(inspection, config: PipelineConfig) -> PipelinePlan | Za
         output_layout=output_layout,
         direct_finalization=not finalization_required,
         finalization_required=finalization_required,
+        streaming_fusion_eligible=bool(
+            needs_resample and not finalization_required and direct_layout
+        ),
         operation_decisions=decisions,
     )

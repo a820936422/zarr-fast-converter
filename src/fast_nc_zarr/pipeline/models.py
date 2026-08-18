@@ -192,6 +192,7 @@ class PipelinePlan:
     output_layout: OutputLayout | None = None
     direct_finalization: bool = False
     finalization_required: bool = False
+    streaming_fusion_eligible: bool = False
     operation_decisions: tuple[OperationDecision, ...] = ()
 
     def decision(self, operation: OperationName) -> OperationDecision:
