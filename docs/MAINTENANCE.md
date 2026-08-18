@@ -171,6 +171,8 @@ pixi run benchmark-conservative-resample-ab -- --output-root <out_root>
 pixi run benchmark-scaling -- --synthetic --output-root <out_root>
 # 或真实源：
 pixi run benchmark-scaling -- --input <source_dir> --output-root <out_root>
+# 对比跨设备 staging 收益（HDD 读写分离）：
+pixi run benchmark-scaling -- --synthetic --compare-staging --output-root <out_root>
 
 # scaling smoke 门禁（发布前快速验证，非正吞吐即失败）
 pixi run scaling-check

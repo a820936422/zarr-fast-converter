@@ -2012,6 +2012,7 @@ def convert_filename(
     overwrite: bool = False,
     validate: bool = True,
     progress: bool = True,
+    staging_root: Path | None = None,
     progress_callback=None,
 ) -> tuple[ConversionPlan, dict[str, float | int]]:
     """Tune and write one 2-D source file per reconstructed time coordinate."""
@@ -2138,7 +2139,7 @@ def convert_filename(
         print("正式执行计划：" + plan.label())
         for reason in plan.rationale:
             print("  - " + reason)
-    staging = make_staging_path(output, "filename-convert")
+    staging = make_staging_path(output, "filename-convert", staging_root)
     try:
         metrics = filename_direct_write(
             inventory,

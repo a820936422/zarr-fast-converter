@@ -1422,6 +1422,7 @@ def run_pipeline(
             output_layout=plan.output_layout if conversion_is_final else None,
             overwrite=False,
             validate=config.validate,
+            staging_root=paths.root,
         )
         conversion_logical_total = selected_output_logical_bytes(
             inspection.source_inventory,

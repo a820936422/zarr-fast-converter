@@ -26,6 +26,7 @@ import numpy as np
 
 from fast_nc_zarr.inspection import inspect_dataset
 from fast_nc_zarr.models import ConversionPlan
+from fast_nc_zarr.publication import make_staging_path, publish_staging
 from fast_nc_zarr.selection import make_selection
 from fast_nc_zarr.validation import validate_output
 from fast_nc_zarr.writer import direct_write
@@ -111,6 +112,8 @@ def _run_one(
     output: Path,
     workers: int,
     compression: str,
+    *,
+    staging_root: Path | None = None,
 ) -> dict[str, object]:
     output.parent.mkdir(parents=True, exist_ok=True)
     plan = ConversionPlan(
@@ -124,6 +127,9 @@ def _run_one(
         compression_level=1,
         shuffle="noshuffle",
     )
+    write_target = output
+    if staging_root is not None:
+        write_target = make_staging_path(output, "scaling", staging_root)
     samples = [_rss_bytes()]
     stop = threading.Event()
 
@@ -138,10 +144,12 @@ def _run_one(
         metrics = direct_write(
             inventory,
             selection,
-            output,
+            write_target,
             plan,
             progress=False,
         )
+        if staging_root is not None:
+            publish_staging(write_target, output, "scaling", overwrite=True)
     finally:
         stop.set()
         monitor_thread.join(timeout=2.0)
@@ -158,6 +166,7 @@ def _run_one(
         "peak_rss_bytes": max(samples, default=0),
         "chunks_written": int(metrics.get("chunks_written", 0)),
         "source_opens": int(metrics.get("source_opens", 0)),
+        "staging_root": str(staging_root) if staging_root is not None else None,
     }
 
 
@@ -170,6 +179,7 @@ def benchmark(
     validate: bool = True,
     synthetic: bool = False,
     synthetic_shape: tuple[int, int, int] = FULL_SHAPE,
+    compare_staging: bool = False,
 ) -> dict[str, object]:
     source = source.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
@@ -181,14 +191,46 @@ def benchmark(
         inventory,
         variables=tuple(inventory.variables),
     )
+    scratch = output_root / ".scaling-scratch"
     runs: list[dict[str, object]] = []
+    comparisons: list[dict[str, object]] = []
     for worker_count in workers:
         output = output_root / f"run-w{worker_count}.zarr"
         shutil.rmtree(output, ignore_errors=True)
-        runs.append(_run_one(inventory, selection, output, worker_count, compression))
+        baseline = _run_one(
+            inventory, selection, output, worker_count, compression
+        )
         if validate:
             validate_output(inventory, selection, output, points=5)
         shutil.rmtree(output, ignore_errors=True)
+        runs.append(baseline)
+        if compare_staging:
+            shutil.rmtree(output, ignore_errors=True)
+            staged = _run_one(
+                inventory,
+                selection,
+                output,
+                worker_count,
+                compression,
+                staging_root=scratch,
+            )
+            if validate:
+                validate_output(inventory, selection, output, points=5)
+            shutil.rmtree(output, ignore_errors=True)
+            comparisons.append(
+                {
+                    "workers": worker_count,
+                    "baseline_throughput_mib_s": baseline["throughput_mib_s"],
+                    "staged_throughput_mib_s": staged["throughput_mib_s"],
+                    "delta_mib_s": round(
+                        float(staged["throughput_mib_s"])
+                        - float(baseline["throughput_mib_s"]),
+                        4,
+                    ),
+                    "baseline_elapsed_seconds": baseline["elapsed_seconds"],
+                    "staged_elapsed_seconds": staged["elapsed_seconds"],
+                }
+            )
     report = {
         "tool": "benchmark_scaling.py",
         "source": str(source),
@@ -198,7 +240,9 @@ def benchmark(
         "variables": list(selection.variables),
         "workers": list(workers),
         "compression": compression,
+        "compare_staging": compare_staging,
         "runs": runs,
+        "staging_comparisons": comparisons,
     }
     report_path = output_root / "scaling-report.json"
     report_path.write_text(
@@ -231,6 +275,7 @@ def main() -> int:
     parser.add_argument("--no-validate", action="store_true", help="skip output validation")
     parser.add_argument("--synthetic", action="store_true", help="generate a synthetic NetCDF source")
     parser.add_argument("--shape", default=",".join(str(item) for item in FULL_SHAPE))
+    parser.add_argument("--compare-staging", action="store_true", help="每个 worker 额外跑一次跨设备 staging 并报告收益")
     parser.add_argument("--smoke", action="store_true", help="tiny run used by scaling-check gate")
     args = parser.parse_args()
     try:
@@ -242,6 +287,7 @@ def main() -> int:
         workers = SMOKE_WORKERS
         shape = SMOKE_SHAPE
         args.synthetic = True
+        args.compare_staging = True
     if args.synthetic is False and args.input is None:
         parser.error("必须提供 --input 或 --synthetic")
     try:
@@ -253,6 +299,7 @@ def main() -> int:
             validate=not args.no_validate,
             synthetic=args.synthetic,
             synthetic_shape=shape,
+            compare_staging=args.compare_staging,
         )
     except Exception as exc:  # noqa: BLE001 - gate must fail loudly
         print(f"scaling benchmark failed: {exc}", file=sys.stderr)

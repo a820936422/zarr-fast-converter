@@ -274,6 +274,7 @@ class ConversionConfig:
     output_layout: OutputLayout | None = None
     overwrite: bool = False
     validate: bool = True
+    staging_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -765,6 +766,7 @@ def run_conversion(
             progress=True,
             progress_callback=progress_callback,
             cancel_event=cancel_event,
+            staging_root=config.staging_root,
         )
     else:
         result = core_convert(
@@ -786,6 +788,7 @@ def run_conversion(
             output_layout=config.output_layout,
             cancel_event=cancel_event,
             progress_callback=progress_callback,
+            staging_root=config.staging_root,
         )
     _assert_source_inventory_stable(preview.inventory)
     return result
