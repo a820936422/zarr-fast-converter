@@ -198,7 +198,7 @@ pixi run benchmark-conservative-resample-ab -- --output-root <out_root>
    - 更新本维护文档的“当前版本”“版本状态”“版本历史”。
    - 如架构、命令、模块或发布范围变化，同步更新本维护文档。
    - 如有重大审查/路线图，更新或新增 `docs/` 下对应文档。
-   - 如 v1.7.7 优化方案变更，同步更新 `docs/v1.7.7-optimization-plan.md`。
+   - 如有待办/路线图变更，同步更新 `docs/v1.8.0-development.md`。
 3. **运行完整检查**：
 
 ```bash
@@ -249,7 +249,7 @@ pixi run release-candidate
 
 ## 6. 当前版本状态与已知问题
 
-以下为当前工作区状态（v1.7.8 真实数据测试已完成），后续版本更新时需同步复核。
+以下为当前工作区状态（v1.7.9 后端优化实施中），后续版本更新时需同步复核。
 
 ### 6.1 已验证状态
 
@@ -277,18 +277,18 @@ pixi run release-candidate
 1. ~~CI workflow 引用未定义的 pixi 任务~~ 已修复：`pixi.toml` 已新增 `cross-backend-test`，本地运行通过。
 2. ~~本地 sidecar 过期~~ 已修复：已执行 `pixi run desktop-sidecar` 并重新校验通过。
 3. ~~前端浏览器预览 fallback 版本号为 1.7.5~~ 已修复：`App.tsx` 改为从 `package.json` 读取版本。
-4. **文档/维护状态**：`docs/v1.7.7-optimization-roadmap.md` 当前工作区已删除；当前活跃文档为 `docs/project-review.md`、`docs/MAINTENANCE.md`、`docs/v1.7.7-optimization-plan.md`、`docs/p2-evaluation.md` 和 `docs/v1.7.8-test-plan.md`。
+4. **文档/维护状态**：历史版本专项文档已整合清理；当前活跃文档为 `docs/MAINTENANCE.md`、`docs/README.md` 和 `docs/v1.8.0-development.md`。
 5. **Python 可维护性**：`ruff`/`python-lint` 已落地并修复 F/E9 问题；大模块拆分仍作为后续 backlog。
 6. ~~`validate-raw` 对 FLUXSATv2 float32 经纬度网格误报“不规则网格”~~ 已修复：`raw_validation._axis_report` 容差改为按坐标 dtype 自适应（float32 0.05° 网格通过）；新增单测 `test_axis_report_accepts_float32_regular_grid`。
 
-> 详细评估与建议见 [项目评估报告](project-review.md)。
+> 后续待处理内容统一记录在 [v1.8.0 开发文档](v1.8.0-development.md)。
 
 ### 6.3 发布状态（开发阶段）
 
 - **v1.7.7 修改已提交并同步远程**：当前 `develop` 分支已包含 v1.7.7 全部修改，远程已手动推送；本地 tag `v1.7.7` 已创建。
-- **v1.7.8 真实数据测试已完成**：版本已提升至 1.7.8，L0/L1 与 `validate-raw` 全树验证通过，回归门禁保持绿色；详见 [v1.7.8 真实数据测试方案](v1.7.8-test-plan.md)。
-- **v1.7.8 后端优化分析已完成，P0 代码优化已落地**：存储感知 worker/batch **初始值**（仅作起始猜测，调优仍探索完整 worker 范围）、重采样全局线程预算已实现并通过测试，详见 [后端优化分析](v1.7.8-backend-optimization-analysis.md)。
-- **v1.7.9 后端优化方案已拟订并开始实施**：自动优化代码逻辑汇总见 [自动优化逻辑汇总](auto-optimization-logic-summary.md)，优化方案见 [v1.7.9 后端优化方案](v1.7.9-backend-optimization-plan.md)。当前已完成 HardwareProfile（含 NUMA）、PerformanceModel、重分块存储感知初始值、WorkerPool 工具类、文件亲和排序、OnlineController 可观测与保守调整、CPU affinity；PipelineFusion/native 扩展等继续推进。
+- **v1.7.8 真实数据测试已完成**：版本已提升至 1.7.8，L0/L1 与 `validate-raw` 全树验证通过，回归门禁保持绿色。
+- **v1.7.8 后端优化分析已完成，P0 代码优化已落地**：存储感知 worker/batch **初始值**（仅作起始猜测，调优仍探索完整 worker 范围）、重采样全局线程预算已实现并通过测试。
+- **v1.7.9 后端优化已实施**：已完成 HardwareProfile（含 NUMA/P/E）、PerformanceModel、重分块存储感知初始值、WorkerPool 工具类、文件亲和排序、OnlineController 可观测与保守调整、CPU affinity、PipelineFusion eligibility 标记；剩余项列入 [v1.8.0 开发文档](v1.8.0-development.md)。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。
@@ -309,9 +309,9 @@ pixi run release-candidate
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
-| 1.7.9 | 2026-08-18 | 版本提升至 1.7.9；开始实施后端优化方案：新增 HardwareProfile 存储微基准与缓存、PerformanceModel 候选排序、重分块 worker 初始值（全范围实测保留）；P1 其余项与 P2 继续推进；开发阶段暂不打包上传，详见 `docs/v1.7.9-backend-optimization-plan.md` |
-| 1.7.8 | 2026-08-18 | 版本提升至 1.7.8；完成 FLUXSATv2 + GLASS-EVI 真实数据测试（L0/L1、`validate-raw` 全树 1240 文件通过）；修复 `validate-raw` float32 坐标容差；落地后端自适应优化 P0（存储感知 worker/batch 初始值、重采样全局线程预算）；sidecar 已按 v1.7.8 重建并校验；开发阶段暂不打包上传，详见 `docs/v1.7.8-test-plan.md`、`docs/v1.7.8-backend-optimization-analysis.md` |
+| 1.7.9 | 2026-08-18 | 版本提升至 1.7.9；开始实施后端优化方案：新增 HardwareProfile 存储微基准与缓存、PerformanceModel 候选排序、重分块 worker 初始值（全范围实测保留）；P1 其余项与 P2 继续推进；开发阶段暂不打包上传，剩余项见 `docs/v1.8.0-development.md` |
+| 1.7.8 | 2026-08-18 | 版本提升至 1.7.8；完成 FLUXSATv2 + GLASS-EVI 真实数据测试（L0/L1、`validate-raw` 全树 1240 文件通过）；修复 `validate-raw` float32 坐标容差；落地后端自适应优化 P0（存储感知 worker/batch 初始值、重采样全局线程预算）；sidecar 已按 v1.7.8 重建并校验；开发阶段暂不打包上传 |
 | 1.7.6 | 2026-08-18 | 当前基线：native-first 能力矩阵、Tauri 桌面、pipeline/resample/rechunk 能力；本文档首次建立 |
-| 1.7.7 | 2026-08-18 | 版本提升至 1.7.7；P0、P1、P2 已完成；M6 发布门禁与发布准备完成（deb 候选包已收集）；修改已提交并同步远程（tag `v1.7.7`）；当前处于开发阶段，暂不打包安装包、暂不上传发布资产，详见 `docs/v1.7.7-optimization-plan.md`、`docs/p2-evaluation.md` |
+| 1.7.7 | 2026-08-18 | 版本提升至 1.7.7；P0、P1、P2 已完成；M6 发布门禁与发布准备完成（deb 候选包已收集）；修改已提交并同步远程（tag `v1.7.7`）；当前处于开发阶段，暂不打包安装包、暂不上传发布资产 |
 
 > 后续每个版本发布时，在表格顶部插入新行，并更新“当前版本”与“当前版本状态”。
