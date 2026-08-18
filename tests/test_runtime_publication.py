@@ -12,6 +12,7 @@ import numpy as np
 from fast_nc_zarr.engine import convert
 from fast_nc_zarr.models import FileRecord, Inventory, Selection, VariableSpec
 from fast_nc_zarr.publication import (
+    make_staging_path,
     preflight_writable,
     publish_staging,
     validate_publish_target,
@@ -178,7 +179,7 @@ class RuntimePublicationTests(unittest.TestCase):
         self.assertTrue((target / "old").is_file())
         self.assertTrue(staging.is_dir())
 
-    def test_publish_rejects_cross_filesystem_staging(self) -> None:
+    def test_publish_rejects_cross_filesystem_staging_when_disabled(self) -> None:
         staging_parent = ROOT / "staging-parent"
         target_parent = ROOT / "target-parent"
         staging_parent.mkdir()
@@ -199,10 +200,54 @@ class RuntimePublicationTests(unittest.TestCase):
 
         with patch.object(path_type, "stat", autospec=True, side_effect=fake_stat):
             with self.assertRaisesRegex(OSError, "同一文件系统"):
-                publish_staging(staging, target, "cross-device")
+                publish_staging(
+                    staging,
+                    target,
+                    "cross-device",
+                    allow_cross_device=False,
+                )
 
         self.assertTrue(staging.is_dir())
         self.assertFalse(target.exists())
+
+    def test_publish_cross_device_copies_then_publishes(self) -> None:
+        staging_parent = ROOT / "staging-parent"
+        target_parent = ROOT / "target-parent"
+        staging_parent.mkdir()
+        target_parent.mkdir()
+        staging = staging_parent / "output.zarr"
+        target = target_parent / "output.zarr"
+        _zarr_marker(staging)
+        (staging / "payload.bin").write_bytes(b"cross-device-payload")
+
+        path_type = type(staging_parent)
+        original_stat = path_type.stat
+        def fake_stat(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if str(path).endswith("staging-parent"):
+                values = list(result)
+                values[2] += 1
+                return os.stat_result(values)
+            return result
+
+        with patch.object(path_type, "stat", autospec=True, side_effect=fake_stat):
+            publish_staging(staging, target, "cross-device")
+
+        self.assertFalse(staging.exists())
+        self.assertTrue((target / "zarr.json").is_file())
+        self.assertEqual(
+            (target / "payload.bin").read_bytes(),
+            b"cross-device-payload",
+        )
+        self.assertFalse(list(target_parent.glob(".output.zarr.cross-device-import-*")))
+
+    def test_make_staging_path_honors_staging_root(self) -> None:
+        target = ROOT / "output.zarr"
+        staging_root = ROOT / "scratch"
+        staging = make_staging_path(target, "convert", staging_root)
+        self.assertTrue(str(staging).startswith(str(staging_root.resolve())))
+        self.assertTrue(staging.name.startswith(".output.zarr.convert-"))
+        self.assertFalse(staging.exists())
 
     def test_target_validation_rejects_symlink_and_plain_directory(self) -> None:
         plain = ROOT / "plain"
@@ -282,6 +327,70 @@ class RuntimePublicationTests(unittest.TestCase):
 
         self.assertEqual((target / "sentinel").read_text(encoding="utf-8"), "original")
         self.assertFalse(list(ROOT.glob(".existing.zarr.convert-*.tmp")))
+
+    def test_convert_with_staging_root_publishes_and_cleans_staging(self) -> None:
+        input_dir = ROOT / "staging-root-input"
+        input_dir.mkdir()
+        source = input_dir / "day.nc"
+        source.touch()
+        spec = VariableSpec("value", ("time", "lat", "lon"), "float32", (2, 2), None)
+        record = FileRecord(
+            source,
+            1,
+            (np.datetime64("2001-01-01", "ns"),),
+            ("2001-01-01",),
+            "lat",
+            "lon",
+            2,
+            2,
+            (spec,),
+        )
+        inventory = Inventory(
+            input_dir=input_dir,
+            files=[record],
+            lat_values=np.asarray([1.0, 0.0]),
+            lon_values=np.asarray([0.0, 1.0]),
+            times=np.asarray([np.datetime64("2001-01-01", "ns")]),
+            time_keys=("2001-01-01",),
+            variables={"value": spec},
+            source_engine="h5netcdf",
+            source_dimensions=("time", "lat", "lon"),
+            frequency="daily",
+            gaps=[],
+            total_bytes=1,
+        )
+        selection = Selection(("value",), 0, 1, 0, 2, 0, 2)
+        scratch = ROOT / "scratch"
+        target = ROOT / "staged-output.zarr"
+
+        def fake_write(_inventory, _selection, staging, *_args, **_kwargs):
+            _zarr_marker(Path(staging))
+            (Path(staging) / "payload.bin").write_bytes(b"staged")
+            return {
+                "elapsed": 0.001,
+                "logical_bytes": 4,
+                "throughput_mib_s": 1.0,
+                "chunks_written": 1,
+                "planned_chunks": 1,
+                "workers": 1,
+            }
+
+        with patch("fast_nc_zarr.engine.direct_write", side_effect=fake_write):
+            _, metrics = convert(
+                inventory,
+                selection,
+                target,
+                auto_tune=False,
+                overwrite=True,
+                validate=False,
+                progress=False,
+                staging_root=scratch,
+            )
+
+        self.assertEqual(metrics["workers"], 1)
+        self.assertTrue((target / "zarr.json").is_file())
+        self.assertEqual((target / "payload.bin").read_bytes(), b"staged")
+        self.assertEqual(list(scratch.glob(".staged-output.zarr.convert-*.tmp")), [])
 
 
 if __name__ == "__main__":

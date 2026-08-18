@@ -274,6 +274,7 @@ def convert(
     validate: bool = True,
     progress: bool = True,
     output_layout: OutputLayout | None = None,
+    staging_root: Path | None = None,
     cancel_event=None,
     progress_callback=None,
 ) -> tuple[ConversionPlan, dict]:
@@ -389,7 +390,7 @@ def convert(
         print("正式执行计划：" + plan.label())
         for reason in plan.rationale:
             print("  - " + reason)
-    staging = make_staging_path(output, "convert")
+    staging = make_staging_path(output, "convert", staging_root)
     try:
         if plan.strategy == "dask":
             metrics = _dask_write(

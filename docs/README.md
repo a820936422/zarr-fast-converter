@@ -37,6 +37,14 @@ pixi run convert -- \
   --step-days 1 --continue-missing
 ```
 
+跨设备 staging（HDD 读写分离）：转换写入 scratch 设备，发布时复制回输出设备：
+
+```bash
+pixi run convert -- \
+  --input /data/source --output /data/result.zarr \
+  --staging-root /fast-ssd/scratch
+```
+
 核心服务位于 `fast_nc_zarr.application.services`：
 
 - `inspect_source(SourceInspectionConfig(...))`
