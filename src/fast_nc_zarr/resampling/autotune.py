@@ -104,7 +104,12 @@ def resolve_auto_space_workers(
     maximum: int | None = None,
     resource_budget: EffectiveResourceBudget | None = None,
 ) -> int:
-    """Choose spatial workers from effective resources, not storage type."""
+    """Choose spatial workers from effective resources, not storage type.
+
+    The returned count also obeys a global CPU budget: each spatial worker
+    may run ``compute_workers`` nested threads, so the result is capped so
+    ``space_workers * compute_workers <= effective_cpus``.
+    """
 
     detected_available, detected_total = _memory_limits()
     available = max(
@@ -137,6 +142,9 @@ def resolve_auto_space_workers(
     )
     if maximum is not None:
         cpu_limit = min(cpu_limit, max(1, int(maximum)))
+    compute_workers = max(1, int(compute_workers))
+    if compute_workers > 1:
+        cpu_limit = max(1, int(cpu_limit // compute_workers))
     per_process = (4.0 + 0.25 * max(0, int(compute_workers) - 1)) * GIB
     memory_limit = max(1, int((available * 0.60) / per_process))
     total_limit = max(1, int((total * 0.50) / per_process))

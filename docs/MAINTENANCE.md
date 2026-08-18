@@ -262,7 +262,7 @@ pixi run release-candidate
 | Rust 核心测试 | ✅ 14 个通过 |
 | Rust 桌面测试 | ✅ 22 个通过 |
 | 前端 typecheck / build | ✅ 通过 |
-| Python 测试 | ✅ 226 passed，35 subtests passed，1 warning |
+| Python 测试 | ✅ 232 passed，35 subtests passed，1 warning |
 | `cross-backend-test` | ✅ 42 passed, 4 subtests passed |
 | sidecar-check | ✅ 已重建并校验通过（v1.7.8） |
 | Filename A/B smoke | ✅ 合成数据可重复执行 |
@@ -270,6 +270,7 @@ pixi run release-candidate
 | L0 真实数据受控样本 | ✅ 2/2 passed（FLUXSATv2 + GLASS-EVI） |
 | L1 真实数据专项 | ✅ T1–T5 全部 passed，T6 `validate-raw` 全树通过 |
 | `validate-raw` 全树 | ✅ 1240 文件 / 2 数据集 passed |
+| 后端自适应优化 | ✅ 存储感知 worker/batch 默认值 + 重采样全局线程预算已落地 |
 
 ### 6.2 已知问题
 
@@ -286,7 +287,7 @@ pixi run release-candidate
 
 - **v1.7.7 修改已提交并同步远程**：当前 `develop` 分支已包含 v1.7.7 全部修改，远程已手动推送；本地 tag `v1.7.7` 已创建。
 - **v1.7.8 真实数据测试已完成**：版本已提升至 1.7.8，L0/L1 与 `validate-raw` 全树验证通过，回归门禁保持绿色；详见 [v1.7.8 真实数据测试方案](v1.7.8-test-plan.md)。
-- **v1.7.8 后端优化分析已完成**：已输出后端处理逻辑优化空间与自适应设计，见 [后端优化分析](v1.7.8-backend-optimization-analysis.md)。
+- **v1.7.8 后端优化分析已完成，P0 代码优化已落地**：存储感知 worker/batch 默认值、重采样全局线程预算已实现并通过测试，详见 [后端优化分析](v1.7.8-backend-optimization-analysis.md)。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。
@@ -307,7 +308,7 @@ pixi run release-candidate
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
-| 1.7.8 | 2026-08-18 | 版本提升至 1.7.8；完成 FLUXSATv2 + GLASS-EVI 真实数据测试（L0/L1、`validate-raw` 全树 1240 文件通过）；修复 `validate-raw` float32 坐标容差；sidecar 已按 v1.7.8 重建并校验；开发阶段暂不打包上传，详见 `docs/v1.7.8-test-plan.md` |
+| 1.7.8 | 2026-08-18 | 版本提升至 1.7.8；完成 FLUXSATv2 + GLASS-EVI 真实数据测试（L0/L1、`validate-raw` 全树 1240 文件通过）；修复 `validate-raw` float32 坐标容差；落地后端自适应优化 P0（存储感知 worker/batch、重采样全局线程预算）；sidecar 已按 v1.7.8 重建并校验；开发阶段暂不打包上传，详见 `docs/v1.7.8-test-plan.md`、`docs/v1.7.8-backend-optimization-analysis.md` |
 | 1.7.6 | 2026-08-18 | 当前基线：native-first 能力矩阵、Tauri 桌面、pipeline/resample/rechunk 能力；本文档首次建立 |
 | 1.7.7 | 2026-08-18 | 版本提升至 1.7.7；P0、P1、P2 已完成；M6 发布门禁与发布准备完成（deb 候选包已收集）；修改已提交并同步远程（tag `v1.7.7`）；当前处于开发阶段，暂不打包安装包、暂不上传发布资产，详见 `docs/v1.7.7-optimization-plan.md`、`docs/p2-evaluation.md` |
 

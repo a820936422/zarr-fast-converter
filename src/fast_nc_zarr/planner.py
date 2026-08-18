@@ -83,6 +83,40 @@ def direct_compatible(inventory: Inventory, selection: Selection) -> tuple[bool,
     return True, "所选变量支持直接 chunk 写入"
 
 
+def storage_aware_worker_limit(
+    budget: EffectiveResourceBudget,
+    kind: str,
+    *,
+    same_device: bool,
+) -> int:
+    """Return a storage-aware default worker ceiling for automatic plans.
+
+    HDD/network devices prefer fewer concurrent workers to avoid seek and
+    round-trip contention.  SSD and unknown media keep the CPU/memory ceiling.
+    Explicit ``max_workers`` remains authoritative in callers.
+    """
+    ceiling = max(1, int(budget.worker_ceiling))
+    source = budget.source_storage
+    medium = source.medium if source is not None else "unknown"
+    if medium == "hdd":
+        if kind == "large-files":
+            cap = 2 if same_device else 4
+        elif kind == "many-small-files":
+            cap = 6 if same_device else 8
+        else:
+            cap = 4 if same_device else 6
+    elif medium == "network":
+        cap = 2 if same_device else 4
+    else:
+        cap = ceiling
+    return max(1, min(ceiling, cap))
+
+
+def _source_medium(budget: EffectiveResourceBudget, fallback: Path) -> str:
+    source = budget.source_storage
+    return source.medium if source is not None else "unknown"
+
+
 def _common_native(inventory: Inventory, dim: str, fallback: int) -> int:
     values = []
     for spec in inventory.variables.values():
@@ -153,33 +187,39 @@ def initial_plan(
     destination = budget.output_storage or storage_profile(output)
     same_device = source.device != "unknown" and source.device == destination.device
     cpus = max(1, int(budget.worker_ceiling))
+    storage_workers = min(
+        cpus,
+        storage_aware_worker_limit(budget, kind, same_device=same_device),
+    )
     nt, _, _ = selection.shape
     rationale = [f"输入形态：{kind}"]
     if source.medium:
         rationale.append(f"源存储 profile：{source.medium}/{source.filesystem}")
     if same_device:
-        rationale.append("源和目标同设备；仅作为 benchmark context，不静态限制 worker")
+        rationale.append("源和目标同设备；自动计划采用存储感知 worker 上限")
+    if storage_workers < cpus:
+        rationale.append(f"存储感知 worker 上限：{storage_workers}")
 
     if kind == "many-small-files":
         chunk_time = 1
         strategy = "file"
         target_mib = 4
-        workers = cpus
+        workers = storage_workers
         batch = 4
     elif kind == "large-files":
         native_t = _common_native(inventory, "time", 16)
         chunk_time = min(nt, max(8, min(64, native_t)))
         strategy = "chunk"
         target_mib = 64
-        workers = cpus
-        batch = 1
+        workers = storage_workers
+        batch = 4 if source.medium == "hdd" else 1
     else:
         typical_t = max(1, inventory.median_times_per_file)
         chunk_time = min(nt, max(1, min(32, typical_t)))
         strategy = "chunk"
         target_mib = 32
-        workers = cpus
-        batch = 1
+        workers = storage_workers
+        batch = 4 if source.medium == "hdd" else 1
 
     cy, cx = spatial_chunks(inventory, selection, chunk_time, target_mib)
     chunk_bytes = chunk_time * cy * cx * max(
@@ -281,6 +321,13 @@ def fixed_layout_candidate_plans(
     cpu_limit = int(budget.worker_ceiling)
     if max_workers is not None:
         cpu_limit = min(cpu_limit, int(max_workers))
+    else:
+        kind = workload_kind(inventory)
+        same_device = "source+output" in budget.same_device_roles
+        cpu_limit = min(
+            cpu_limit,
+            storage_aware_worker_limit(budget, kind, same_device=same_device),
+        )
     largest_item = max(
         inventory.variables[name].itemsize for name in selection.variables
     )
@@ -297,7 +344,8 @@ def fixed_layout_candidate_plans(
     worker_limit = max(1, min(cpu_limit, int(memory_limit)))
 
     # Fixed layouts must expose every safe worker count to the benchmark;
-    # storage profiles are context, not a static cap.
+    # storage profiles are context, not a static cap.  Automatic plans still
+    # apply a storage-aware ceiling to avoid HDD seek thrash.
     worker_values = set(range(1, worker_limit + 1))
 
     _, ny, nx = selection.shape
@@ -358,9 +406,19 @@ def candidate_plans(
     cpu_limit = int(budget.worker_ceiling)
     if max_workers is not None:
         cpu_limit = min(cpu_limit, int(max_workers))
+    else:
+        kind = workload_kind(inventory)
+        source = budget.source_storage or storage_profile(inventory.input_dir)
+        destination = budget.output_storage or storage_profile(output)
+        same_device = source.device != "unknown" and source.device == destination.device
+        cpu_limit = min(
+            cpu_limit,
+            storage_aware_worker_limit(budget, kind, same_device=same_device),
+        )
     worker_values = list(range(1, max(1, cpu_limit) + 1))
 
     kind = workload_kind(inventory)
+    source_medium = _source_medium(budget, inventory.input_dir)
     if kind == "many-small-files":
         time_values = [1]
         targets = [2, 4, 8, 16]
@@ -369,11 +427,11 @@ def candidate_plans(
         native_t = _common_native(inventory, "time", base.chunk_time)
         time_values = sorted({min(selection.shape[0], value) for value in (native_t, 16, 32, 64) if value})
         targets = [32, 64, 128, 256]
-        batches = [1]
+        batches = [1, 4] if source_medium == "hdd" else [1]
     else:
         time_values = sorted({min(selection.shape[0], value) for value in (1, 8, 16, 32)})
         targets = [16, 32, 64, 128]
-        batches = [1]
+        batches = [1, 4] if source_medium == "hdd" else [1]
 
     candidates: list[ConversionPlan] = [
         replace(base, workers=workers) for workers in worker_values
