@@ -10,7 +10,7 @@ import numpy as np
 import xarray as xr
 import zarr
 
-from fast_nc_zarr._backend import BackendUnavailableError, resolve_backend, rust_capability
+from fast_nc_zarr._backend import resolve_backend, rust_capability
 from fast_nc_zarr.inspection import inspect_netcdf_native
 from fast_nc_zarr.rechunking.native import (
     RustMultiRechunkPlan,
@@ -656,7 +656,7 @@ class RustZarrCrossBackendTests(unittest.TestCase):
         xr.Dataset({"value": (("time", "lat", "lon"), values)}).to_zarr(
             source, mode="w", consolidated=False, zarr_format=3
         )
-        metrics = run_rust_rechunk(
+        run_rust_rechunk(
             RustRechunkPlan(
                 source=Path(source),
                 target=Path(target),

@@ -30,6 +30,8 @@ jobs:
         run: pixi run version-check
       - name: Validate protocol schemas and fixtures
         run: pixi run contract-check
+      - name: Check Python lint
+        run: pixi run python-lint
       - name: Check native environment
         run: pixi run native-check
 

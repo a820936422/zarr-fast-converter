@@ -11,7 +11,6 @@ import re
 import sys
 import signal
 from threading import Event as ThreadEvent, Thread
-import time
 from typing import Any, TextIO
 
 from .protocol import (

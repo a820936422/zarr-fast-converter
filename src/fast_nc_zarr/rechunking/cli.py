@@ -12,7 +12,6 @@ from .engine import RechunkExecutionError, next_available_output, run_rechunk
 from .inspection import RechunkInspectionError, format_inspection, inspect_store
 from .planning import (
     DEFAULT_TARGET_MIB,
-    default_workers,
     format_plan,
     plan_chunks,
 )

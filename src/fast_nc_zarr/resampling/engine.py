@@ -36,10 +36,10 @@ from .autotune import (
     resolve_auto_time_block,
 )
 from .grid import RESAMPLING_METHODS, build_target_grid, output_chunks
-from .environment import validate_resampling_environment
 from .inspection import inspect_resample_input
 from .models import (
     ComputeDType,
+    GridInfo,
     ResampleConfig,
     ResampleVariableOptions,
     ResampleInspection,

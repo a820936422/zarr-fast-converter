@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { version as appVersion } from "../package.json";
 import {
   getBackendInfo,
   getNativeCapabilities,
@@ -630,6 +631,62 @@ function eventText(event: TaskEvent): string {
   }
   return event.stage || "任务事件";
 }
+
+function TaskDiagnosticsCard({ event }: { event: TaskEvent | null }) {
+  const [copied, setCopied] = useState(false);
+  if (!event) {
+    return (
+      <section className="surface event-card">
+        <div className="surface-title compact">
+          <div><span className="section-kicker">TASK DIAGNOSTICS</span><h2>诊断详情</h2></div>
+          <Icon name="terminal" size={18} />
+        </div>
+        <p className="surface-description">暂无事件，启动任务后这里会显示 backend、checkpoint 和进度指标。</p>
+      </section>
+    );
+  }
+  const payload = event.payload || {};
+  const backend = asRecord(payload.backend);
+  const requested = typeof backend?.requested === "string" ? backend.requested : typeof payload.requested_backend === "string" ? payload.requested_backend : null;
+  const resolved = typeof backend?.resolved === "string" ? backend.resolved : typeof payload.resolved_backend === "string" ? payload.resolved_backend : null;
+  const fallback = typeof backend?.fallback_reason === "string" ? backend.fallback_reason : typeof payload.fallback_reason === "string" ? payload.fallback_reason : null;
+  const checkpoint = typeof payload.stage_checkpoint === "string" ? payload.stage_checkpoint : null;
+  const manifest = typeof payload.manifest === "string" ? payload.manifest : null;
+  const logical = typeof payload.logical_bytes === "number" ? payload.logical_bytes : null;
+  const temporary = typeof payload.temporary_bytes === "number" ? payload.temporary_bytes : null;
+  const eta = typeof payload.eta_seconds === "number" && Number.isFinite(payload.eta_seconds) ? payload.eta_seconds : null;
+
+  const copyDiagnostics = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(event, null, 2));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <section className="surface event-card">
+      <div className="surface-title compact">
+        <div><span className="section-kicker">TASK DIAGNOSTICS</span><h2>诊断详情</h2></div>
+        <button className="quiet-button" type="button" onClick={() => void copyDiagnostics()}>{copied ? "已复制" : "复制 JSON"}</button>
+      </div>
+      <div className="policy-list">
+        <div><span className="policy-dot native" />请求后端：<strong>{requested || "—"}</strong></div>
+        <div><span className="policy-dot safe" />实际后端：<strong>{resolved || "—"}</strong></div>
+        {fallback ? <div><span className="policy-dot safe" />回退原因：<strong>{fallback}</strong></div> : null}
+        {checkpoint ? <div><span className="policy-dot safe" />Checkpoint：<strong>{checkpoint}</strong></div> : null}
+        {manifest ? <div><span className="policy-dot trace" />Manifest：<small className="manifest-path">{manifest}</small></div> : null}
+        {logical !== null ? <div><span className="policy-dot trace" />逻辑字节：<strong>{formatBytes(logical)}</strong></div> : null}
+        {temporary !== null ? <div><span className="policy-dot trace" />临时观测：<strong>{formatBytes(temporary)}</strong></div> : null}
+        {eta !== null ? <div><span className="policy-dot trace" />ETA：<strong>{Math.ceil(eta)}s</strong></div> : null}
+      </div>
+      <p className="surface-description">{eventText(event)}</p>
+    </section>
+  );
+}
+
 function pathBaseName(value: string): string {
   const trimmed = value.replace(/[\\/]+$/, "");
   return trimmed.split(/[\\/]/).pop() || "output";
@@ -735,7 +792,7 @@ function App() {
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) {
-      setBackend({ app: "fast-nc-zarr", version: "1.7.5", runtime: "browser-preview" });
+      setBackend({ app: "fast-nc-zarr", version: appVersion, runtime: "browser-preview" });
       return;
     }
     void getBackendInfo().then(setBackend).catch((reason: unknown) => setBackendError(reasonText(reason)));
@@ -1629,7 +1686,7 @@ function App() {
           {view === "tasks" && (
             <>
               <div className="page-heading"><div><span className="section-kicker">OBSERVABILITY</span><h1>任务中心</h1><p>所有任务、进度、资源和恢复点都集中在这里。</p></div><div className="task-summary"><strong>{tasks.length}</strong><span>历史任务</span></div></div>
-              <div className="tasks-layout"><section className="surface tasks-surface"><div className="surface-title"><div><span className="section-kicker">RUN HISTORY</span><h2>执行记录</h2></div><div className="surface-actions"><span className="live-label"><span />LIVE</span><button className="quiet-button" type="button" disabled={!tasks.some((task) => task.status === "finished" || task.status === "failed" || task.status === "cancelled")} onClick={() => void clearTaskHistory()}>清理记录</button></div></div>{tasks.length === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="activity" size={24} /></div><strong>还没有任务</strong><p>完成一次数据检查后，可以从处理流程启动任务。</p><button className="primary-button" type="button" onClick={() => setView("inspection")}>开始检查</button></div> : <div className="task-table"><div className="task-table-head"><span>任务</span><span>状态</span><span>资源</span><span>操作</span></div>{tasks.map((task) => <div className="task-table-row" key={task.taskId}><div className="task-name"><span className={`task-icon ${task.status}`}><Icon name={task.command === "native_task" ? "spark" : "layers"} size={15} /></span><div><strong>{formatCommand(task.command)}</strong><small>{task.taskId}</small>{task.manifest && <small className="manifest-path"><Icon name="archive" size={11} />{task.manifest}</small>}</div></div><span className={`task-state ${task.status}`}>{formatTaskStatus(task.status)}</span><span className="task-resource">{task.resource ? `${task.resource.logicalCpus} CPU · ${formatBytes(task.resource.memoryAvailableBytes)}` : "—"}</span><div>{(task.status === "running" || task.status === "cancelling") && <button className="table-action" type="button" onClick={() => void cancel(task.taskId)}><Icon name="refresh" size={14} />取消</button>}</div></div>)}</div>}</section><aside className="tasks-side"><section className="surface recovery-card"><div className="surface-title compact"><div><span className="section-kicker">CHECKPOINT RECOVERY</span><h2>恢复任务</h2></div><Icon name="refresh" size={18} /></div><p className="surface-description">输入保留的临时目录，检查 checkpoint 后恢复到新的输出位置。</p><label className="field-label" htmlFor="recovery-path">临时任务目录</label><div className="input-with-action"><Icon name="folder" size={16} /><input id="recovery-path" value={recoveryPath} onChange={(event) => setRecoveryPath(event.target.value)} placeholder="/tmp/.../pipeline-..." /><button className="field-action" type="button" disabled={!recoveryPath || busy} onClick={() => void inspectRecovery()}>检查</button></div>{recoveryInspection && <div className="recovery-result"><span className="result-icon"><Icon name="spark" size={14} /></span><div><strong>恢复点可读取</strong><p>{recoveryInspection.report}</p></div></div>}<button className="primary-button full-button" type="button" disabled={!recoveryInspection || busy} onClick={() => void resumeRecovery()}><Icon name="refresh" size={15} />恢复到新输出</button></section><section className="surface event-card"><div className="surface-title compact"><div><span className="section-kicker">EVENT STREAM</span><h2>实时事件</h2></div><span className="event-count">{events.length}</span></div><div className="event-stream">{events.length ? events.slice(-8).reverse().map((event) => <div className="event-item" key={`${event.request_id}-${event.sequence}`}><span className={`event-dot ${event.event}`} /><div><strong>{event.event}</strong><small>{eventText(event)}</small></div><time>{event.sequence.toString().padStart(2, "0")}</time></div>) : <p className="empty-event">暂无事件流</p>}</div></section></aside></div>
+              <div className="tasks-layout"><section className="surface tasks-surface"><div className="surface-title"><div><span className="section-kicker">RUN HISTORY</span><h2>执行记录</h2></div><div className="surface-actions"><span className="live-label"><span />LIVE</span><button className="quiet-button" type="button" disabled={!tasks.some((task) => task.status === "finished" || task.status === "failed" || task.status === "cancelled")} onClick={() => void clearTaskHistory()}>清理记录</button></div></div>{tasks.length === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="activity" size={24} /></div><strong>还没有任务</strong><p>完成一次数据检查后，可以从处理流程启动任务。</p><button className="primary-button" type="button" onClick={() => setView("inspection")}>开始检查</button></div> : <div className="task-table"><div className="task-table-head"><span>任务</span><span>状态</span><span>资源</span><span>操作</span></div>{tasks.map((task) => <div className="task-table-row" key={task.taskId}><div className="task-name"><span className={`task-icon ${task.status}`}><Icon name={task.command === "native_task" ? "spark" : "layers"} size={15} /></span><div><strong>{formatCommand(task.command)}</strong><small>{task.taskId}</small>{task.manifest && <small className="manifest-path"><Icon name="archive" size={11} />{task.manifest}</small>}</div></div><span className={`task-state ${task.status}`}>{formatTaskStatus(task.status)}</span><span className="task-resource">{task.resource ? `${task.resource.logicalCpus} CPU · ${formatBytes(task.resource.memoryAvailableBytes)}` : "—"}</span><div>{(task.status === "running" || task.status === "cancelling") && <button className="table-action" type="button" onClick={() => void cancel(task.taskId)}><Icon name="refresh" size={14} />取消</button>}</div></div>)}</div>}</section><aside className="tasks-side"><section className="surface recovery-card"><div className="surface-title compact"><div><span className="section-kicker">CHECKPOINT RECOVERY</span><h2>恢复任务</h2></div><Icon name="refresh" size={18} /></div><p className="surface-description">输入保留的临时目录，检查 checkpoint 后恢复到新的输出位置。</p><label className="field-label" htmlFor="recovery-path">临时任务目录</label><div className="input-with-action"><Icon name="folder" size={16} /><input id="recovery-path" value={recoveryPath} onChange={(event) => setRecoveryPath(event.target.value)} placeholder="/tmp/.../pipeline-..." /><button className="field-action" type="button" disabled={!recoveryPath || busy} onClick={() => void inspectRecovery()}>检查</button></div>{recoveryInspection && <div className="recovery-result"><span className="result-icon"><Icon name="spark" size={14} /></span><div><strong>恢复点可读取</strong><p>{recoveryInspection.report}</p></div></div>}<button className="primary-button full-button" type="button" disabled={!recoveryInspection || busy} onClick={() => void resumeRecovery()}><Icon name="refresh" size={15} />恢复到新输出</button></section><TaskDiagnosticsCard event={lastEvent} /><section className="surface event-card"><div className="surface-title compact"><div><span className="section-kicker">EVENT STREAM</span><h2>实时事件</h2></div><span className="event-count">{events.length}</span></div><div className="event-stream">{events.length ? events.slice(-8).reverse().map((event) => <div className="event-item" key={`${event.request_id}-${event.sequence}`}><span className={`event-dot ${event.event}`} /><div><strong>{event.event}</strong><small>{eventText(event)}</small></div><time>{event.sequence.toString().padStart(2, "0")}</time></div>) : <p className="empty-event">暂无事件流</p>}</div></section></aside></div>
             </>
           )}
 

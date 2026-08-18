@@ -27,7 +27,6 @@ from ..filename_mode import (
     scan_filename_times,
 )
 from ..inspection import (
-    DimensionMappingRequired,
     inspect_dataset,
     inventory_summary,
 )

@@ -8,7 +8,6 @@ time coordinate is reconstructed from the filename.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 import contextlib
@@ -49,7 +48,7 @@ from .planner import (
 )
 from .system import EffectiveResourceBudget, effective_resource_budget
 from .publication import make_staging_path, preflight_writable, publish_staging, validate_publish_target
-from .runtime import bounded_process_map, spawn_context
+from .runtime import bounded_process_map
 from .writer import _monitor, compressor_from_spec, make_compressor, progress_line
 from .selection import effective_output_dtype, selected_output_logical_bytes
 

@@ -16,8 +16,6 @@ import numpy as np
 from ..application.services import (
     ConversionConfig,
     RechunkConfig,
-    inspect_resample,
-    preview_rechunk,
     run_conversion,
     run_rechunk,
     run_resample,

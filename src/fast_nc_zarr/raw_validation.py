@@ -233,7 +233,6 @@ def validate_raw_tree(
     }
     time_field_overrides = time_field_overrides or {}
     for source in datasets:
-        started = time.perf_counter()
         time_inspection = inspect_time_metadata(source)
         time_rule = time_inspection.suggested_rule
         if source.name in time_field_overrides:
