@@ -158,7 +158,7 @@ pixi run contract-check
 pixi run native-check
 ```
 
-### 4.6 性能基准（P1 A/B）
+### 4.6 性能基准（P1 A/B 与 scaling）
 
 ```bash
 # Filename chunk-owner writer 与 partial-region baseline A/B
@@ -166,6 +166,14 @@ pixi run benchmark-filename-ab -- <source_dir> --output-root <out_root>
 
 # Conservative 与 conservative_normed 重采样 A/B（合成数据可重复）
 pixi run benchmark-conservative-resample-ab -- --output-root <out_root>
+
+# 转换写入 scaling 基准（合成或真实 NetCDF，workers 1/2/4/8/12）
+pixi run benchmark-scaling -- --synthetic --output-root <out_root>
+# 或真实源：
+pixi run benchmark-scaling -- --input <source_dir> --output-root <out_root>
+
+# scaling smoke 门禁（发布前快速验证，非正吞吐即失败）
+pixi run scaling-check
 ```
 
 ---
@@ -271,6 +279,8 @@ pixi run release-candidate
 | L1 真实数据专项 | ✅ T1–T5 全部 passed，T6 `validate-raw` 全树通过 |
 | `validate-raw` 全树 | ✅ 1240 文件 / 2 数据集 passed |
 | 后端自适应优化 | ✅ 存储感知 worker/batch 初始值（非硬上限）+ 重采样全局线程预算已落地 |
+| WorkerPool 全路径接入 | ✅ `direct_write`、文件名写入/检查、inspection、重分块两阶段与调参、重采样空间并行已接入；完整回归 261 passed |
+| scaling smoke 门禁 | ✅ `pixi run scaling-check` 通过（合成数据，workers 1/2） |
 
 ### 6.2 已知问题
 
