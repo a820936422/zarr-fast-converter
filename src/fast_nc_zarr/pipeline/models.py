@@ -25,6 +25,10 @@ class PipelineGeneralConfig:
     lon_max: float = 180.0
     cleanup_intermediate: bool = False
     overwrite: bool = False
+    # When True (default), an eligible in-memory single-pass fusion may replace
+    # the on-disk conversion intermediate.  Disable it to force the classic
+    # intermediate-Zarr path with resume/checkpoint semantics.
+    fusion: bool = True
     source_storage: Literal["auto", "ssd", "hdd", "network"] = "auto"
     temporary_storage: Literal["auto", "ssd", "hdd", "network"] = "auto"
     output_storage: Literal["auto", "ssd", "hdd", "network"] = "auto"

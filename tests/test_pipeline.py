@@ -581,10 +581,14 @@ class PipelineTests(unittest.TestCase):
             )
         )
         output = ROOT / "result.zarr"
-        plan = preview_pipeline(inspection, self._config(output))
+        base = self._config(output)
+        # Force the on-disk intermediate path: this test inspects the written
+        # source-crop checkpoint and its on-disk math-validation reference.
+        config = replace(base, general=replace(base.general, fusion=False))
+        plan = preview_pipeline(inspection, config)
         self.assertEqual(plan.conversion_chunks, (1, 6, 6))
         self.assertTrue(plan.direct_finalization)
-        result = run_pipeline(inspection, self._config(output), progress=False)
+        result = run_pipeline(inspection, config, progress=False)
         self.assertTrue(result["needs_resample"])
         self.assertGreater(result["resampling"]["logical_bytes"], 0)
         self.assertGreater(result["mathematical_validation"]["comparisons"], 0)
@@ -781,10 +785,99 @@ class PipelineTests(unittest.TestCase):
         manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
         self.assertEqual(manifest["fusion"]["eligible"], True)
         self.assertEqual(manifest["fusion"]["stage"], "conversion->resampling")
+        self.assertEqual(manifest["fusion"]["intermediate_validation_skipped"], True)
+        self.assertEqual(manifest["stages"]["conversion"]["status"], "fused_in_memory")
+        self.assertTrue(manifest["logical_io"]["write_amplification"] == 1.0)
+
+    def test_fusion_single_pass_skips_intermediate_store(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        config = replace(
+            self._config(ROOT / "fusion-single-pass.zarr"),
+            operations=PipelineOperations(resample=True),
+        )
+        plan = preview_pipeline(inspection, config)
+        self.assertTrue(plan.streaming_fusion_eligible)
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        # The fused conversion never writes an intermediate crop store: the
+        # source-crop.zarr sibling of this pipeline's manifest must not exist.
+        pipeline_root = Path(result["manifest"]).parent
+        crop_store = pipeline_root / "source-crop.zarr"
+        self.assertFalse(
+            crop_store.exists(),
+            "融合单遍不应创建中间 source-crop.zarr",
+        )
+        self.assertEqual(manifest["stages"]["conversion"]["metrics"]["fused"], True)
+        self.assertEqual(manifest["stages"]["conversion"]["metrics"]["intermediate_store"], None)
+        self.assertEqual(manifest["stages"]["conversion"]["status"], "fused_in_memory")
+        self.assertEqual(
+            manifest["logical_io"]["temporary_write_bytes"],
+            0,
+            "融合单遍不应有中间逻辑写入",
+        )
+        self.assertEqual(manifest["logical_io"]["write_amplification"], 1.0)
+        # Output must still be a correct, publishable Zarr v3 product.
+        group = zarr.open_group(config.general.output, mode="r")
+        self.assertTrue(group["value"].chunks)
+        output = xr.open_zarr(config.general.output, consolidated=False)
+        try:
+            self.assertEqual(output.sizes["time"], 2)
+            self.assertIn("value", output.data_vars)
+            fused_values = output["value"].values.copy()
+        finally:
+            output.close()
+        # The fused single-pass product must equal the on-disk intermediate
+        # path value-for-value (run the same config with fusion disabled).
+        twin_base = self._config(ROOT / "fusion-single-pass-twin.zarr")
+        twin = replace(
+            twin_base,
+            operations=PipelineOperations(resample=True),
+            general=replace(twin_base.general, fusion=False),
+        )
+        result_twin = run_pipeline(inspection, twin, progress=False)
+        twin_manifest = json.loads(
+            Path(result_twin["manifest"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(twin_manifest["stages"]["conversion"]["status"], "validated")
+        twin_output = xr.open_zarr(twin.general.output, consolidated=False)
+        try:
+            np.testing.assert_allclose(
+                twin_output["value"].values,
+                fused_values,
+                rtol=0.0,
+                atol=1e-6,
+            )
+        finally:
+            twin_output.close()
+
+    def test_fusion_falls_back_to_intermediate_for_parallel_resampling(self) -> None:
+        inspection = inspect_source(
+            SourceInspectionConfig(ROOT, mode="complete", engine="h5netcdf", workers=1)
+        )
+        config = replace(
+            self._config(ROOT / "fusion-fallback.zarr"),
+            operations=PipelineOperations(resample=True),
+            resampling=replace(
+                self._config(ROOT / "x").resampling,
+                space_workers=4,
+            ),
+        )
+        plan = preview_pipeline(inspection, config)
+        self.assertTrue(plan.streaming_fusion_eligible)
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        # Explicitly-requested parallel resampling disables in-memory fusion;
+        # the conversion crop is written and validated on disk as before.
         self.assertEqual(manifest["fusion"]["intermediate_validation_skipped"], False)
         self.assertEqual(manifest["stages"]["conversion"]["status"], "validated")
-        self.assertIsInstance(manifest["fusion"]["write_amplification"], (int, float))
-        self.assertGreaterEqual(manifest["fusion"]["write_amplification"], 1.0)
+        self.assertGreaterEqual(manifest["logical_io"]["write_amplification"], 1.0)
+        pipeline_root = Path(result["manifest"]).parent
+        self.assertTrue(
+            (pipeline_root / "source-crop.zarr").exists(),
+            "回退路径应保留中间 source-crop.zarr",
+        )
 
     def test_auto_pipeline_conversion_time_chunk_uses_resampling_batch(self) -> None:
         inspection = inspect_source(
@@ -1057,6 +1150,10 @@ class PipelineTests(unittest.TestCase):
             )
         )
         config = self._config(ROOT / "retained-checkpoint-result.zarr")
+        config = replace(
+            config,
+            general=replace(config.general, fusion=False),
+        )
         result = run_pipeline(inspection, config, progress=False)
         manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
         root = Path(manifest["temporary_root"])
@@ -1235,7 +1332,13 @@ class PipelineTests(unittest.TestCase):
         )
         temporary = ROOT / "failed-stage-temporary"
         base = self._config(ROOT / "failed-stage-output.zarr")
-        config = replace(base, general=replace(base.general, temporary_dir=temporary))
+        # Force the on-disk intermediate path: this test verifies that the
+        # validated conversion crop is retained for a failed resampling stage,
+        # which requires a resumable on-disk checkpoint.
+        config = replace(
+            base,
+            general=replace(base.general, temporary_dir=temporary, fusion=False),
+        )
         with (
             patch("fast_nc_zarr.pipeline.engine.validate_resampling_environment"),
             patch(
@@ -1269,6 +1372,7 @@ class PipelineTests(unittest.TestCase):
                 base.general,
                 temporary_dir=temporary,
                 cleanup_intermediate=True,
+                fusion=False,
             ),
         )
         with (
@@ -1329,7 +1433,10 @@ class PipelineTests(unittest.TestCase):
         )
         temporary = ROOT / "escape-recovery-temporary"
         config = self._config(ROOT / "escape-recovery-output.zarr")
-        config = replace(config, general=replace(config.general, temporary_dir=temporary))
+        config = replace(
+            config,
+            general=replace(config.general, temporary_dir=temporary, fusion=False),
+        )
         with patch(
             "fast_nc_zarr.pipeline.engine.run_resample",
             side_effect=RuntimeError("simulated recovery source failure"),

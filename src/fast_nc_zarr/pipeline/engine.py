@@ -17,6 +17,7 @@ from ..application.services import (
     ConversionConfig,
     RechunkConfig,
     run_conversion,
+    run_fused_conversion,
     run_rechunk,
     run_resample,
 )
@@ -485,6 +486,24 @@ def _raw_storage_estimate(inspection, plan: PipelinePlan) -> tuple[int, int]:
     return temporary_estimate, final_estimate
 
 
+# In-memory single-pass fusion holds the converted crop in RAM instead of
+# writing an intermediate Zarr store.  A conservative cap keeps the memory
+# footprint of the fused dataset bounded; larger crops fall back to the
+# on-disk intermediate path.
+_FUSION_MAX_CROP_BYTES = 2 * 1024**3
+
+
+def _fusion_crop_bytes(inspection, plan: PipelinePlan) -> int:
+    """Return the raw in-memory byte footprint of the fused conversion crop."""
+    inventory = inspection.source_inventory
+    itemsize = max(
+        (inventory.variables[name].itemsize for name in plan.source_selection.variables),
+        default=4,
+    )
+    nt, nlat, nlon = plan.source_selection.shape
+    return int(nt) * int(nlat) * int(nlon) * int(itemsize)
+
+
 def _check_raw_storage_capacity(inspection, plan: PipelinePlan, paths: PipelinePaths) -> None:
     temporary_estimate, final_estimate = _raw_storage_estimate(inspection, plan)
     temporary_base = paths.root.parent
@@ -581,6 +600,7 @@ def validate_resample_samples(
     cancel_event=None,
     progress: bool = True,
     replacement_statistics: dict[str, object] | None = None,
+    source_dataset=None,
 ) -> dict[str, object]:
     """Check samples with bounded local xESMF reference calculations.
 
@@ -597,16 +617,22 @@ def validate_resample_samples(
     # variable renames, fill-value replacement and scale factors.  Reopening
     # the raw collection here would duplicate conversion semantics, can force
     # a full multi-file metadata combine, and previously made validation look
-    # stalled after resampling had already completed.
+    # stalled after resampling had already completed.  In the single-pass
+    # fusion path the conversion crop never materializes on disk, so the
+    # caller passes the same in-memory Dataset directly.
     del inspection
-    source = xr.open_zarr(
-        source_path,
-        consolidated=False,
-        chunks=None,
-        decode_times=False,
-        mask_and_scale=False,
-    )
-    reference_mode = "converted-source-crop"
+    if source_dataset is not None:
+        source = source_dataset
+        reference_mode = "fused-in-memory-source-crop"
+    else:
+        source = xr.open_zarr(
+            source_path,
+            consolidated=False,
+            chunks=None,
+            decode_times=False,
+            mask_and_scale=False,
+        )
+        reference_mode = "converted-source-crop"
     output = xr.open_zarr(
         output_path,
         consolidated=False,
@@ -799,7 +825,8 @@ def validate_resample_samples(
                         except OSError:
                             pass
     finally:
-        source.close()
+        if source_dataset is None:
+            source.close()
         output.close()
     return {
         "comparisons": comparisons,
@@ -1387,10 +1414,22 @@ def run_pipeline(
     started = time.perf_counter()
     current = paths.converted
     current_stage = "preparation"
+    source_ds = None
+    fused = False
     try:
         conversion = config.conversion
         conversion_is_final = not plan.needs_resample and not plan.finalization_required
         resampling_is_final = plan.needs_resample and not plan.finalization_required
+        fused = (
+            config.general.fusion
+            and plan.streaming_fusion_eligible
+            and (
+                config.resampling.space_workers == 1
+                or config.resampling.space_workers == "auto"
+            )
+            and inspection.source_inventory.source_mode != "filename"
+            and _fusion_crop_bytes(inspection, plan) <= _FUSION_MAX_CROP_BYTES
+        )
         final_target = Path(config.general.output).expanduser().resolve()
         if conversion_is_final or resampling_is_final:
             validate_publish_target(
@@ -1459,15 +1498,26 @@ def run_pipeline(
             logical_total=conversion_logical_total,
             progress_callback=progress_callback,
         ) as stage_report:
-            conversion_plan, conversion_metrics = run_conversion(
-                inspection,
-                conversion_config,
-                cancel_event=cancel_event,
-                progress_callback=_stage_progress_callback(
-                    stage_report,
-                    conversion_logical_total,
-                ),
-            )
+            if fused:
+                conversion_plan, conversion_metrics, source_ds = run_fused_conversion(
+                    inspection,
+                    conversion_config,
+                    cancel_event=cancel_event,
+                    progress_callback=_stage_progress_callback(
+                        stage_report,
+                        conversion_logical_total,
+                    ),
+                )
+            else:
+                conversion_plan, conversion_metrics = run_conversion(
+                    inspection,
+                    conversion_config,
+                    cancel_event=cancel_event,
+                    progress_callback=_stage_progress_callback(
+                        stage_report,
+                        conversion_logical_total,
+                    ),
+                )
         conversion_metrics = dict(conversion_metrics)
         conversion_metrics.update(
             {
@@ -1477,8 +1527,17 @@ def run_pipeline(
                 "protocol_version": None,
             }
         )
+        if fused:
+            conversion_metrics["fused"] = True
+            conversion_metrics["intermediate_store"] = None
         manifest["stages"]["conversion"] = {
-            "status": "validated_staging" if conversion_is_final else "validated",
+            "status": (
+                "fused_in_memory"
+                if fused
+                else "validated_staging"
+                if conversion_is_final
+                else "validated"
+            ),
             "metrics": conversion_metrics,
             "plan": asdict(conversion_plan),
         }
@@ -1487,7 +1546,7 @@ def run_pipeline(
         manifest["selection"]["conversion"] = conversion_metrics.get("tuning", {}).get("selection_reason")
         manifest["resolved_plans"]["conversion"] = asdict(conversion_plan)
         _write_event(paths.events, "tuning", _stage_event_payload(manifest, "conversion", {"selection": manifest["selection"]["conversion"]}, checkpoint="source-crop.zarr" if not conversion_is_final else "output", terminal_status="running"))
-        if not conversion_is_final:
+        if not conversion_is_final and not fused:
             manifest["resume"]["checkpoints"]["conversion"] = {
                 "path": "source-crop.zarr",
                 "status": "validated",
@@ -1578,6 +1637,7 @@ def run_pipeline(
                         stage_report,
                         _logical_output_bytes(plan),
                     ),
+                    source_dataset=source_ds if fused else None,
                 )
             manifest["stages"]["resampling"] = {
                 "status": "validating_math_samples",
@@ -1606,6 +1666,7 @@ def run_pipeline(
                     cancel_event=cancel_event,
                     progress=progress,
                     replacement_statistics=resample_metrics.get("replacement_statistics"),
+                    source_dataset=source_ds if fused else None,
                 )
             manifest["stages"]["resampling"] = {
                 "status": "validated",
@@ -1626,7 +1687,9 @@ def run_pipeline(
             _write_event(paths.events, "tuning", _stage_event_payload(manifest, "resampling", {"selection": manifest["selection"]["resampling"]}, checkpoint="resampled.zarr" if not resampling_is_final else "output", terminal_status="running"))
             _write_manifest(paths.manifest, manifest)
             current = resample_output
-            if config.general.cleanup_intermediate:
+            if config.general.cleanup_intermediate and not fused:
+                # A fused run never materializes the intermediate crop store,
+                # so there is nothing to clean up on disk.
                 shutil.rmtree(paths.converted)
                 manifest["stages"]["conversion"]["status"] = "validated_and_cleaned"
                 _write_manifest(paths.manifest, manifest)
@@ -1742,7 +1805,8 @@ def run_pipeline(
         manifest["semantic_validation"] = semantic_validation
         final_logical_bytes = _logical_output_bytes(plan)
         temporary_logical_writes = 0
-        if not conversion_is_final:
+        if not conversion_is_final and not fused:
+            # A fused conversion never writes an intermediate crop store.
             temporary_logical_writes += int(conversion_metrics.get("logical_bytes", 0))
         if plan.needs_resample:
             temporary_logical_writes += int(
@@ -1771,6 +1835,7 @@ def run_pipeline(
         }
         manifest["logical_io"] = logical_io
         manifest["fusion"]["write_amplification"] = logical_io["write_amplification"]
+        manifest["fusion"]["intermediate_validation_skipped"] = bool(fused)
         manifest["online_adjustments"] = [
             event
             for metrics in (conversion_metrics, resample_metrics, rechunk_metrics)
@@ -1826,3 +1891,9 @@ def run_pipeline(
         raise PipelineExecutionError(
             f"一条龙处理失败；任务临时目录保留用于排查：{paths.root}\n{exc}"
         ) from exc
+    finally:
+        if source_ds is not None:
+            try:
+                source_ds.close()
+            except Exception:
+                pass

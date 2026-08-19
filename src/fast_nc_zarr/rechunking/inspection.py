@@ -46,6 +46,68 @@ def _compressors(variable: xr.DataArray) -> tuple[Any, ...]:
     return tuple(compressors)
 
 
+def dataset_info_from_dataset(
+    dataset: xr.Dataset,
+    path: str | Path,
+    *,
+    zarr_format: int = 3,
+    require_latlon_time: bool = True,
+) -> DatasetInfo:
+    """Build a :class:`DatasetInfo` from an already-open xarray dataset.
+
+    Shared by the on-disk ``inspect_store`` and the single-pass fusion path,
+    where the "store" is an in-memory xarray Dataset rather than a real Zarr
+    directory.
+    """
+
+    dimensions = {name: int(size) for name, size in dataset.sizes.items()}
+    if require_latlon_time:
+        missing_dims = [name for name in REQUIRED_DIMS if name not in dimensions]
+        if missing_dims:
+            raise RechunkInspectionError(
+                "输入数据集缺少标准维度："
+                + ", ".join(missing_dims)
+                + "；第一版只支持完整 (time, lat, lon) 数据。"
+            )
+
+    variables: list[VariableInfo] = []
+    coordinate_names = set(dataset.coords)
+    for name, variable in dataset.variables.items():
+        dims = tuple(str(dim) for dim in variable.dims)
+        if not variable.ndim:
+            # Scalar metadata variables do not affect chunk strategy.
+            pass
+        elif name not in coordinate_names and set(dims) != set(REQUIRED_DIMS):
+            raise RechunkInspectionError(
+                f"数据变量 {name!r} 的维度为 {dims}，"
+                "第一版要求每个非标量数据变量同时包含 time/lat/lon。"
+            )
+        variables.append(
+            VariableInfo(
+                name=name,
+                dims=dims,
+                shape=tuple(int(size) for size in variable.shape),
+                dtype=variable.dtype,
+                chunks=_array_chunks(variable),
+                is_coord=name in coordinate_names,
+                attrs=dict(variable.attrs),
+                compressors=_compressors(variable),
+            )
+        )
+    data_variables = tuple(item for item in variables if not item.is_coord)
+    if not any(item.ndim == 3 for item in data_variables):
+        raise RechunkInspectionError(
+            "输入数据集没有包含 time/lat/lon 的三维数据变量。"
+        )
+    return DatasetInfo(
+        path=Path(path),
+        dimensions=dimensions,
+        variables=tuple(variables),
+        attrs=dict(dataset.attrs),
+        zarr_format=zarr_format,
+    )
+
+
 def inspect_store(path: str | Path) -> DatasetInfo:
     """Read only metadata and validate a complete three-dimensional Zarr v3 store."""
 
@@ -71,51 +133,7 @@ def inspect_store(path: str | Path) -> DatasetInfo:
         raise RechunkInspectionError(f"无法打开输入 Zarr：{source}") from exc
 
     try:
-        dimensions = {name: int(size) for name, size in dataset.sizes.items()}
-        missing_dims = [name for name in REQUIRED_DIMS if name not in dimensions]
-        if missing_dims:
-            raise RechunkInspectionError(
-                "输入 Zarr 缺少标准维度："
-                + ", ".join(missing_dims)
-                + "；第一版只支持完整 (time, lat, lon) 数据。"
-            )
-
-        variables: list[VariableInfo] = []
-        coordinate_names = set(dataset.coords)
-        for name, variable in dataset.variables.items():
-            dims = tuple(str(dim) for dim in variable.dims)
-            if not variable.ndim:
-                # Scalar metadata variables do not affect chunk strategy.
-                pass
-            elif name not in coordinate_names and set(dims) != set(REQUIRED_DIMS):
-                raise RechunkInspectionError(
-                    f"数据变量 {name!r} 的维度为 {dims}，"
-                    "第一版要求每个非标量数据变量同时包含 time/lat/lon。"
-                )
-            variables.append(
-                VariableInfo(
-                    name=name,
-                    dims=dims,
-                    shape=tuple(int(size) for size in variable.shape),
-                    dtype=variable.dtype,
-                    chunks=_array_chunks(variable),
-                    is_coord=name in coordinate_names,
-                    attrs=dict(variable.attrs),
-                    compressors=_compressors(variable),
-                )
-            )
-        data_variables = tuple(item for item in variables if not item.is_coord)
-        if not any(item.ndim == 3 for item in data_variables):
-            raise RechunkInspectionError(
-                "输入 Zarr 没有包含 time/lat/lon 的三维数据变量。"
-            )
-        return DatasetInfo(
-            path=source,
-            dimensions=dimensions,
-            variables=tuple(variables),
-            attrs=dict(dataset.attrs),
-            zarr_format=zarr_format,
-        )
+        return dataset_info_from_dataset(dataset, source, zarr_format=zarr_format)
     finally:
         dataset.close()
 

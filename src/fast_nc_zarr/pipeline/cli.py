@@ -71,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="替换表达式统计策略。",
     )
     parser.add_argument("--cleanup-intermediate", action="store_true")
+    parser.add_argument(
+        "--no-fusion",
+        action="store_true",
+        help="禁用内存单遍融合（强制写入磁盘中间 Zarr，保留 checkpoint/恢复语义）。",
+    )
     parser.add_argument("--no-tune", action="store_true")
     parser.add_argument("--tune-budget", type=float, default=60.0)
     parser.add_argument(
@@ -187,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             lon_max=args.lon[1],
             cleanup_intermediate=args.cleanup_intermediate,
             overwrite=args.overwrite,
+            fusion=not args.no_fusion,
             source_storage=args.source_storage,
             temporary_storage=args.temporary_storage,
             output_storage=args.output_storage,

@@ -794,6 +794,42 @@ def run_conversion(
     return result
 
 
+def run_fused_conversion(
+    inspection: InspectionResult,
+    config: ConversionConfig,
+    *,
+    cancel_event=None,
+    progress_callback=None,
+) -> tuple[Any, dict[str, Any], Any]:
+    """Build the single-pass fusion conversion dataset without writing Zarr.
+
+    The conversion "output" is a lazy in-memory xarray Dataset handed directly
+    to resampling, so the intermediate Zarr store is never written to disk.
+    Only the non-filename (complete/auto) source mode is eligible; filename
+    mode follows its own read/write scheduling and is not fused here.
+    """
+
+    from ..engine import convert_fused as core_convert_fused
+
+    preview = preview_conversion(inspection, config)
+    _assert_source_inventory_stable(preview.inventory)
+    if preview.inventory.source_mode == "filename":
+        raise ValueError("融合转换不支持 filename 模式。")
+    result = core_convert_fused(
+        preview.inventory,
+        preview.selection,
+        variable_transforms=config.variable_transforms,
+        variable_names=config.variable_names,
+        chunks=config.chunks,
+        output_layout=config.output_layout,
+        cancel_event=cancel_event,
+        progress=False,
+        progress_callback=progress_callback,
+    )
+    _assert_source_inventory_stable(preview.inventory)
+    return result
+
+
 def preview_rechunk(config: RechunkConfig, info: DatasetInfo | None = None) -> RechunkPreview:
     info = info or inspect_store(config.input)
     rechunk_enabled = bool(config.rechunk)
@@ -928,7 +964,20 @@ def run_resample(
     *,
     cancel_event=None,
     progress_callback=None,
+    source_dataset=None,
 ) -> dict[str, Any]:
+    if source_dataset is not None:
+        # Single-pass fusion: the conversion crop is an in-memory Dataset, so
+        # the engine plans directly from it (there is no on-disk intermediate
+        # store to inspect).
+        return core_run_resample(
+            config,
+            None,
+            cancel_event=cancel_event,
+            progress=True,
+            progress_callback=progress_callback,
+            source_dataset=source_dataset,
+        )
     preview = preview_resample(config, inspection)
     return core_run_resample(
         config,

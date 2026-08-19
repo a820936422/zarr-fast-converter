@@ -36,7 +36,7 @@ from .autotune import (
     resolve_auto_time_block,
 )
 from .grid import RESAMPLING_METHODS, build_target_grid, output_chunks
-from .inspection import inspect_resample_input
+from .inspection import inspect_resample_dataset, inspect_resample_input
 from .models import (
     ComputeDType,
     GridInfo,
@@ -1821,10 +1821,12 @@ def _run_parallel_tiles(
 def plan_resample(
     config: ResampleConfig,
     inspection: ResampleInspection | None = None,
+    *,
+    allow_inmemory: bool = False,
 ) -> ResamplePlan:
     inspection = inspection or inspect_resample_input(config.input)
     config_path = Path(config.input).expanduser().resolve()
-    if inspection.info.path != config_path:
+    if not allow_inmemory and inspection.info.path != config_path:
         raise ValueError("重采样检查结果与配置中的输入路径不一致，请重新检查输入。")
     resource_budget = config.resource_budget or effective_resource_budget(
         source=config_path,
@@ -2224,7 +2226,17 @@ def _validate_output(
         np.testing.assert_allclose(target.lat.values, plan.target.lat, rtol=0, atol=1e-10)
         np.testing.assert_allclose(target.lon.values, plan.target.lon, rtol=0, atol=1e-10)
         if "time" in source.coords and "time" in target.coords:
-            np.testing.assert_array_equal(target.time.values, source.time.values)
+            if source.time.dtype.kind == "M" and target.time.dtype.kind in "iu":
+                # The in-memory fused source carries a decoded datetime64 time
+                # axis, while the raw output store is CF-encoded (integer
+                # units).  Decode the output time before comparing so the
+                # round-trip is validated against the same reference.
+                decoded_time = xr.decode_cf(
+                    xr.Dataset({"__fused_time": target["time"]})
+                )["__fused_time"].values
+                np.testing.assert_array_equal(decoded_time, source.time.values)
+            else:
+                np.testing.assert_array_equal(target.time.values, source.time.values)
     except (AssertionError, KeyError, ValueError) as exc:
         raise ResampleExecutionError(f"输出结构或坐标校验失败：{exc}") from exc
     finally:
@@ -2686,6 +2698,7 @@ def _run_native_regular_resample(
     *,
     cancel_event=None,
     progress_callback=None,
+    source_dataset: xr.Dataset | None = None,
 ) -> dict[str, object]:
     source_path = Path(config.input).expanduser().resolve()
     target_path = Path(config.output).expanduser().resolve()
@@ -2695,7 +2708,7 @@ def _run_native_regular_resample(
         )
     _prepare_target(target_path, config.overwrite)
     preflight_writable(target_path.parent, "重采样输出")
-    source = xr.open_zarr(
+    source = source_dataset if source_dataset is not None else xr.open_zarr(
         source_path,
         consolidated=False,
         chunks=None,
@@ -2860,6 +2873,26 @@ def _run_native_regular_resample(
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def _resolve_fused_plan(
+    config: ResampleConfig,
+    plan: ResamplePlan | None,
+    source_dataset: xr.Dataset | None,
+) -> tuple[xr.Dataset | None, ResamplePlan]:
+    """Resolve the resample plan for an on-disk or in-memory fused source.
+
+    For the single-pass fusion path the conversion crop is an in-memory
+    xarray Dataset, so the plan is built by inspecting that Dataset instead of
+    a nonexistent intermediate Zarr path on disk.
+    """
+
+    if source_dataset is None:
+        return None, plan or plan_resample(config)
+    if plan is None:
+        inspection = inspect_resample_dataset(source_dataset)
+        plan = plan_resample(config, inspection=inspection, allow_inmemory=True)
+    return source_dataset, plan
+
+
 def run_resample(
     config: ResampleConfig,
     plan: ResamplePlan | None = None,
@@ -2867,14 +2900,15 @@ def run_resample(
     cancel_event=None,
     progress: bool = True,
     progress_callback=None,
+    source_dataset: xr.Dataset | None = None,
 ) -> dict[str, object]:
-    plan = plan or plan_resample(config)
+    source_dataset, plan = _resolve_fused_plan(config, plan, source_dataset)
     requested_plan = plan
     source_path = Path(config.input).expanduser().resolve()
     target_path = Path(config.output).expanduser().resolve()
     if source_path == target_path:
         raise ResampleExecutionError("输入和输出不能是同一个目录。")
-    if source_path != plan.inspection.info.path:
+    if source_dataset is None and source_path != plan.inspection.info.path:
         raise ResampleExecutionError("输入检查结果与执行输入路径不一致。")
     native_operation = "resample.nearest" if plan.method.startswith("nearest") else "resample.bilinear"
     if (
@@ -2884,7 +2918,10 @@ def run_resample(
         and not config.before_replacements.rules
         and not config.after_replacements.rules
         and all(item.dims == ("time", "lat", "lon") and str(item.dtype) == "float32" for item in plan.inspection.info.data_variables)
-        and _native_source_has_direct_values(Path(config.input), plan)
+        and (
+            source_dataset is not None
+            or _native_source_has_direct_values(Path(config.input), plan)
+        )
     ):
         try:
             return _run_native_regular_resample(
@@ -2892,6 +2929,7 @@ def run_resample(
                 plan,
                 cancel_event=cancel_event,
                 progress_callback=progress_callback,
+                source_dataset=source_dataset,
             )
         except _NativeResampleFallback:
             pass
@@ -2911,7 +2949,7 @@ def run_resample(
         if cancel_event is not None and cancel_event.is_set():
             raise ResampleExecutionError("任务已取消。")
         workdir.mkdir(parents=True, exist_ok=False)
-        source = xr.open_zarr(
+        source = source_dataset if source_dataset is not None else xr.open_zarr(
             source_path,
             consolidated=False,
             chunks={},
@@ -2922,6 +2960,12 @@ def run_resample(
             source, requested_plan
         )
         runtime_plan = replace(requested_plan, statistics=before_statistics)
+        if source_dataset is not None and int(runtime_plan.space_workers) > 1:
+            # An in-memory source cannot be shared with spawned spatial
+            # workers, so a fused run always executes in-process (serially).
+            # The native fast path already uses a thread pool, which shares
+            # the object safely; only the Python process-pool path is capped.
+            runtime_plan = replace(runtime_plan, space_workers=1)
         processing_plan = runtime_plan
         if requested_plan.after_replacements.data_dependent:
             # Data-dependent post rules require statistics from the unmodified

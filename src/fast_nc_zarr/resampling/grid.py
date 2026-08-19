@@ -79,6 +79,49 @@ def _validate_axis(
     return values, _axis_bounds(values), resolution, bool(values[0] > values[-1]), uniform
 
 
+def inspect_dataset_grid(
+    dataset: xr.Dataset,
+    info: DatasetInfo,
+    *,
+    path: Path | str | None = None,
+) -> GridInfo:
+    """Validate a regular grid from an already-open dataset.
+
+    Used both by the on-disk ``inspect_grid`` and by the single-pass fusion
+    path, where the source is an in-memory xarray Dataset and therefore has no
+    real filesystem path.
+    """
+
+    lat, lat_bounds, lat_resolution, lat_descending, lat_uniform = _validate_axis(
+        dataset, "lat"
+    )
+    lon, lon_bounds, lon_resolution, lon_descending, lon_uniform = _validate_axis(
+        dataset, "lon"
+    )
+    invalid = [
+        variable.name
+        for variable in info.data_variables
+        if variable.ndim and variable.dtype.kind not in "biuf"
+    ]
+    if invalid:
+        raise GridInspectionError(
+            "重采样只支持数值型数据变量，以下变量类型不支持：" + ", ".join(invalid)
+        )
+    return GridInfo(
+        path=Path(path) if path is not None else Path("<fused-in-memory>"),
+        lat=lat,
+        lon=lon,
+        lat_bounds=lat_bounds,
+        lon_bounds=lon_bounds,
+        lat_resolution=lat_resolution,
+        lon_resolution=lon_resolution,
+        lat_descending=lat_descending,
+        lon_descending=lon_descending,
+        lat_uniform=lat_uniform,
+        lon_uniform=lon_uniform,
+    )
+
+
 def inspect_grid(
     path: str | Path,
     info: DatasetInfo | None = None,
@@ -98,37 +141,9 @@ def inspect_grid(
     except Exception as exc:
         raise GridInspectionError(f"无法读取 Zarr 空间坐标：{source}") from exc
     try:
-        lat, lat_bounds, lat_resolution, lat_descending, lat_uniform = _validate_axis(
-            dataset, "lat"
-        )
-        lon, lon_bounds, lon_resolution, lon_descending, lon_uniform = _validate_axis(
-            dataset, "lon"
-        )
+        return info, inspect_dataset_grid(dataset, info, path=source)
     finally:
         dataset.close()
-
-    invalid = [
-        variable.name
-        for variable in info.data_variables
-        if variable.ndim and variable.dtype.kind not in "biuf"
-    ]
-    if invalid:
-        raise GridInspectionError(
-            "重采样只支持数值型数据变量，以下变量类型不支持：" + ", ".join(invalid)
-        )
-    return info, GridInfo(
-        path=source,
-        lat=lat,
-        lon=lon,
-        lat_bounds=lat_bounds,
-        lon_bounds=lon_bounds,
-        lat_resolution=lat_resolution,
-        lon_resolution=lon_resolution,
-        lat_descending=lat_descending,
-        lon_descending=lon_descending,
-        lat_uniform=lat_uniform,
-        lon_uniform=lon_uniform,
-    )
 
 
 def _target_axis(

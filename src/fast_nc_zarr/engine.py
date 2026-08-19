@@ -44,23 +44,24 @@ def _canonicalize_dimensions(ds, source_dimensions: tuple[str, str, str]):
 
 
 
-def _dask_write(
+def _build_dask_dataset(
     inventory: Inventory,
     selection: Selection,
-    output: Path,
     plan: ConversionPlan,
     variable_transforms: dict[str, VariableTransform] | None = None,
     variable_names: dict[str, str] | None = None,
     chunks: tuple[int, int, int] | None = None,
     output_layout: OutputLayout | None = None,
-    cancel_event=None,
-    *,
-    progress: bool = True,
-    progress_callback=None,
-) -> dict:
-    import dask
+) -> object:
+    """Build the lazy conversion dataset described by ``plan``.
+
+    Shared by the on-disk Dask write path and the single-pass fusion path.
+    The returned xarray Dataset is Dask-backed (lazy) and is NOT closed here;
+    the caller owns its lifecycle.  No output, validation or publication
+    happens in this function.
+    """
+
     import xarray as xr
-    from contextlib import nullcontext
 
     paths = [record.path for record in inventory.files]
     ds = xr.open_mfdataset(
@@ -184,6 +185,47 @@ def _dask_write(
                 target_dtype = np.dtype(item.dtype)
                 if np.dtype(variable.dtype) != target_dtype:
                     ds[item.output_name] = variable.astype(target_dtype)
+        if chunks is not None:
+            ds = ds.chunk(
+                {
+                    "time": int(chunks[0]),
+                    "lat": int(chunks[1]),
+                    "lon": int(chunks[2]),
+                }
+            )
+        return ds
+    except Exception:
+        ds.close()
+        raise
+
+
+def _dask_write(
+    inventory: Inventory,
+    selection: Selection,
+    output: Path,
+    plan: ConversionPlan,
+    variable_transforms: dict[str, VariableTransform] | None = None,
+    variable_names: dict[str, str] | None = None,
+    chunks: tuple[int, int, int] | None = None,
+    output_layout: OutputLayout | None = None,
+    cancel_event=None,
+    *,
+    progress: bool = True,
+    progress_callback=None,
+) -> dict:
+    import dask
+    from contextlib import nullcontext
+
+    ds = _build_dask_dataset(
+        inventory,
+        selection,
+        plan,
+        variable_transforms=variable_transforms,
+        variable_names=variable_names,
+        chunks=chunks,
+        output_layout=output_layout,
+    )
+    try:
         compressor = make_compressor(plan.compression, plan.compression_level, plan.shuffle)
         chunk_map = {"time": plan.chunk_time, "lat": plan.chunk_lat, "lon": plan.chunk_lon}
         layout_by_output = (
@@ -254,6 +296,85 @@ def _dask_write(
         }
     finally:
         ds.close()
+
+
+def convert_fused(
+    inventory: Inventory,
+    selection: Selection,
+    *,
+    variable_transforms: dict[str, VariableTransform] | None = None,
+    variable_names: dict[str, str] | None = None,
+    chunks: tuple[int, int, int] | None = None,
+    output_layout: OutputLayout | None = None,
+    cancel_event=None,
+    progress: bool = True,
+    progress_callback=None,
+) -> tuple[ConversionPlan, dict, object]:
+    """Build the single-pass fused conversion dataset without writing Zarr.
+
+    Used by the pipeline fusion path: the conversion "output" is a lazy
+    in-memory xarray Dataset that flows directly into resampling, so no
+    intermediate Zarr store is created on disk (`write_amplification` drops
+    toward 1.0).  No tuning, staging, validation or publication runs here;
+    the returned Dataset is owned by the caller and must be closed.
+    """
+
+    import xarray as xr
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("任务已取消。")
+    fixed_layout = chunks is not None or output_layout is not None
+    plan_chunks = chunks
+    placeholder_output = Path(inventory.input_dir).expanduser().resolve() / ".fused-plan"
+    if plan_chunks is None and output_layout is not None:
+        plan_chunks = output_layout_plan_chunks(selection, output_layout)
+    plan = resolve_conversion_plan(
+        inventory,
+        selection,
+        placeholder_output,
+        chunks=plan_chunks,
+        max_workers=1,
+        reserve_gib=1.0,
+        resource_budget=effective_resource_budget(
+            source=inventory.input_dir,
+            output=placeholder_output,
+            reserve_memory_bytes=0,
+            requested=1 if not fixed_layout else None,
+        ),
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("任务已取消。")
+    started = time.perf_counter()
+    ds = _build_dask_dataset(
+        inventory,
+        selection,
+        plan,
+        variable_transforms=variable_transforms,
+        variable_names=variable_names,
+        chunks=plan_chunks,
+        output_layout=output_layout,
+    )
+    assert isinstance(ds, xr.Dataset)
+    elapsed = time.perf_counter() - started
+    logical = selected_output_logical_bytes(
+        inventory,
+        selection,
+        variable_transforms,
+        output_layout,
+    )
+    if progress_callback is not None:
+        progress_callback(logical, logical, logical, "融合转换：内存数据集已就绪")
+    metrics: dict[str, object] = {
+        "elapsed": elapsed,
+        "logical_bytes": logical,
+        "throughput_mib_s": logical / max(elapsed, 1e-9) / 1024**2,
+        "fused": True,
+        "intermediate_store": None,
+        "backend": "python",
+        "backend_fallback": False,
+        "backend_fallback_reason": None,
+    }
+    return plan, metrics, ds
 
 
 def convert(
