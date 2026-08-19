@@ -85,6 +85,8 @@ pixi run pipeline -- \
 
 每个任务保存 manifest、事件、资源预算、阶段状态和恢复检查点。恢复只接受经过校验的临时任务目录；失败和取消保留临时目录供排查，成功发布后才按策略清理中间结果。
 
+内存单遍融合（默认开启）：当 raw pipeline 满足 `streaming_fusion_eligible`（需要重采样、无需独立最终化、布局直接兼容）且 crop ≤ 2 GiB、非 filename 模式、重采样串行或 `auto` 时，转换以惰性内存 `xr.Dataset` 直入重采样，**不写磁盘中间 `source-crop.zarr`**，manifest 记录 `write_amplification=1.0`、`intermediate_validation_skipped=true`、`stages.conversion.status=fused_in_memory`。需要磁盘 checkpoint/恢复语义、显式并行重采样或大内存窗口时自动回退磁盘中间路径；也可用 `--no-fusion` 显式关闭融合。
+
 ## 3. 空间重采样
 
 入口：
