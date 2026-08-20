@@ -180,6 +180,7 @@ def benchmark(
     synthetic: bool = False,
     synthetic_shape: tuple[int, int, int] = FULL_SHAPE,
     compare_staging: bool = False,
+    staging_root: Path | None = None,
 ) -> dict[str, object]:
     source = source.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
@@ -191,7 +192,9 @@ def benchmark(
         inventory,
         variables=tuple(inventory.variables),
     )
-    scratch = output_root / ".scaling-scratch"
+    scratch = (
+        staging_root.expanduser() if staging_root is not None else output_root / ".scaling-scratch"
+    )
     runs: list[dict[str, object]] = []
     comparisons: list[dict[str, object]] = []
     for worker_count in workers:
@@ -241,6 +244,7 @@ def benchmark(
         "workers": list(workers),
         "compression": compression,
         "compare_staging": compare_staging,
+        "staging_root": str(staging_root) if staging_root is not None else None,
         "runs": runs,
         "staging_comparisons": comparisons,
     }
@@ -276,6 +280,7 @@ def main() -> int:
     parser.add_argument("--synthetic", action="store_true", help="generate a synthetic NetCDF source")
     parser.add_argument("--shape", default=",".join(str(item) for item in FULL_SHAPE))
     parser.add_argument("--compare-staging", action="store_true", help="每个 worker 额外跑一次跨设备 staging 并报告收益")
+    parser.add_argument("--staging-root", type=Path, help="compare-staging 使用的 staging 根目录（默认输出根下的 .scaling-scratch）")
     parser.add_argument("--smoke", action="store_true", help="tiny run used by scaling-check gate")
     args = parser.parse_args()
     try:
@@ -300,6 +305,7 @@ def main() -> int:
             synthetic=args.synthetic,
             synthetic_shape=shape,
             compare_staging=args.compare_staging,
+            staging_root=args.staging_root,
         )
     except Exception as exc:  # noqa: BLE001 - gate must fail loudly
         print(f"scaling benchmark failed: {exc}", file=sys.stderr)

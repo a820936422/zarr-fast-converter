@@ -352,6 +352,8 @@ def _case_glass(spec: dict[str, Any], work_root: Path) -> dict[str, Any]:
         "source_format": "HDF4",
         "variable_dtype": "int16",
         "packing": packing,
+        "native_hdf4_supported": False,
+        "native_fallback_reason": "真实 HDF4 容器读取由 Python/netCDF4 compatibility backend 完成",
         "window": {"time": [0, 2], "lat": [lat0, lat1], "lon": [lon0, lon1]},
         "time_values": actual_days.tolist(),
         "attrs": attrs,
