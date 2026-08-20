@@ -59,6 +59,16 @@ class _NativeResampleFallback(ResampleExecutionError):
 COMPUTE_DTYPES = ("source", "float32")
 MAX_NATIVE_RESAMPLE_VALUES = 4_000_000
 
+_NATIVE_METHODS = {
+    "nearest_s2d": ("resample.nearest", "nearest"),
+    "bilinear": ("resample.bilinear", "bilinear"),
+    "conservative": ("resample.conservative", "conservative"),
+    "conservative_normed": (
+        "resample.conservative_normed",
+        "conservative_normed",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class _OwnerTask:
@@ -977,6 +987,215 @@ def _fill_missing_tile(
     }
 
 
+def _regular_axis_bounds(axis: np.ndarray) -> np.ndarray:
+    coords = np.asarray(axis, dtype="float64")
+    resolution = coords[1] - coords[0]
+    return np.concatenate(
+        (
+            [coords[0] - resolution / 2.0],
+            (coords[:-1] + coords[1:]) / 2.0,
+            [coords[-1] + (coords[-1] - coords[-2]) / 2.0],
+        )
+    )
+
+
+def _aligned_target_bounds_f32(
+    source_axis: np.ndarray, target_axis: np.ndarray
+) -> np.ndarray:
+    source = np.asarray(source_axis, dtype="float32")
+    target = np.asarray(target_axis, dtype="float32")
+    source_bounds = _regular_axis_bounds(source)
+    target_bounds = _regular_axis_bounds(target)
+    target_resolution = abs(float(target[1]) - float(target[0]))
+    source_low = float(np.min(source_bounds))
+    raw_low = float(np.min(target_bounds))
+    aligned_low = (
+        source_low + round((raw_low - source_low) / target_resolution) * target_resolution
+    )
+    if abs(aligned_low - raw_low) <= target_resolution * 1e-4:
+        target_bounds = target_bounds + (aligned_low - raw_low)
+    return target_bounds
+
+
+def _axis_overlap_cells(
+    source_bounds: np.ndarray,
+    low: float,
+    high: float,
+    *,
+    latitude: bool,
+) -> list[tuple[int, float]]:
+    tolerance = max(abs(high - low) * 1e-5, 1e-7)
+    cells = [
+        (
+            min(float(source_bounds[index]), float(source_bounds[index + 1])),
+            max(float(source_bounds[index]), float(source_bounds[index + 1])),
+            index,
+        )
+        for index in range(len(source_bounds) - 1)
+    ]
+    cells.sort(key=lambda item: item[0])
+    cell_low = np.asarray([item[0] for item in cells])
+    cell_high = np.asarray([item[1] for item in cells])
+    start = int(np.searchsorted(cell_high, low - tolerance, side="left"))
+    stop = int(np.searchsorted(cell_low, high + tolerance, side="right"))
+    result: list[tuple[int, float]] = []
+    for offset in range(start, min(stop, len(cells))):
+        overlap_low = max(float(cell_low[offset]), low)
+        overlap_high = min(float(cell_high[offset]), high)
+        if overlap_high > overlap_low:
+            result.append(
+                (
+                    cells[offset][2],
+                    _interval_measure(
+                        overlap_low, overlap_high, latitude=latitude
+                    ),
+                )
+            )
+        elif (
+            abs(float(cell_high[offset]) - low) <= tolerance
+            or abs(float(cell_low[offset]) - high) <= tolerance
+        ):
+            result.append((cells[offset][2], 0.0))
+    return result
+
+
+def _interval_measure(low: float, high: float, *, latitude: bool) -> float:
+    if latitude:
+        return abs(float(np.sin(np.radians(high)) - np.sin(np.radians(low))))
+    return abs(float(np.radians(high - low)))
+
+
+def _conservative_native_values(
+    source_values: np.ndarray,
+    source_lat: np.ndarray,
+    source_lon: np.ndarray,
+    target_lat: np.ndarray,
+    target_lon: np.ndarray,
+    *,
+    normed: bool,
+    skipna: bool,
+    na_thres: float,
+) -> np.ndarray:
+    """Compute deterministic conservative values matching the native kernel.
+
+    xESMF assigns numerical sliver weights to some boundary-touching cells,
+    making its values depend on ESMF internals.  Native conservative instead
+    uses only positive geometric overlap (zero-measure touches contribute to
+    missing propagation but not to the weighted value).  Recomputing the
+    Python-side values with the same rule keeps both backends in parity.
+    """
+    source_lat = np.asarray(source_lat, dtype="float32")
+    source_lon = np.asarray(source_lon, dtype="float32")
+    target_lat = np.asarray(target_lat, dtype="float32")
+    target_lon = np.asarray(target_lon, dtype="float32")
+    time_size = int(source_values.shape[0])
+    output = np.full(
+        (time_size, target_lat.size, target_lon.size), np.nan, dtype="float32"
+    )
+    if (
+        source_lat.size < 2
+        or source_lon.size < 2
+        or target_lat.size < 2
+        or target_lon.size < 2
+    ):
+        return output
+    source_lat_bounds = _regular_axis_bounds(source_lat)
+    source_lon_bounds = _regular_axis_bounds(source_lon)
+    target_lat_bounds = _aligned_target_bounds_f32(source_lat, target_lat)
+    target_lon_bounds = _aligned_target_bounds_f32(source_lon, target_lon)
+
+    lat_cells: list[list[tuple[int, float]]] = []
+    covered_lat: list[float] = []
+    target_lat_measures: list[float] = []
+    for lat_index in range(target_lat.size):
+        lat_low, lat_high = sorted(
+            (
+                float(target_lat_bounds[lat_index]),
+                float(target_lat_bounds[lat_index + 1]),
+            )
+        )
+        cells = _axis_overlap_cells(
+            source_lat_bounds, lat_low, lat_high, latitude=True
+        )
+        lat_cells.append(cells)
+        covered_lat.append(sum(measure for _, measure in cells))
+        target_lat_measures.append(
+            _interval_measure(lat_low, lat_high, latitude=True)
+        )
+    lon_cells: list[list[tuple[int, float]]] = []
+    covered_lon: list[float] = []
+    target_lon_measures: list[float] = []
+    for lon_index in range(target_lon.size):
+        lon_low, lon_high = sorted(
+            (
+                float(target_lon_bounds[lon_index]),
+                float(target_lon_bounds[lon_index + 1]),
+            )
+        )
+        cells = _axis_overlap_cells(
+            source_lon_bounds, lon_low, lon_high, latitude=False
+        )
+        lon_cells.append(cells)
+        covered_lon.append(sum(measure for _, measure in cells))
+        target_lon_measures.append(
+            _interval_measure(lon_low, lon_high, latitude=False)
+        )
+
+    minimum_valid_fraction = float(
+        np.clip(1.0 - float(na_thres), 1e-6, 1.0 - 1e-6)
+    )
+    for time_index in range(time_size):
+        for lat_index in range(target_lat.size):
+            covered_lat_area = covered_lat[lat_index]
+            if covered_lat_area <= 0.0:
+                continue
+            for lon_index in range(target_lon.size):
+                covered = covered_lat_area * covered_lon[lon_index]
+                target_area = (
+                    target_lat_measures[lat_index]
+                    * target_lon_measures[lon_index]
+                )
+                denominator = covered if normed else target_area
+                if covered <= 0.0 or denominator <= 0.0:
+                    continue
+                weighted = 0.0
+                valid_weight = 0.0
+                missing = False
+                strict_boundary_missing = False
+                for lat_cell, lat_measure in lat_cells[lat_index]:
+                    for lon_cell, lon_measure in lon_cells[lon_index]:
+                        value = float(source_values[time_index, lat_cell, lon_cell])
+                        weight = lat_measure * lon_measure / denominator
+                        if weight == 0.0:
+                            if np.isnan(value) and (
+                                not skipna or float(na_thres) <= 0.0
+                            ):
+                                if skipna:
+                                    strict_boundary_missing = True
+                                else:
+                                    missing = True
+                            continue
+                        if np.isnan(value):
+                            missing = True
+                        else:
+                            weighted += value * weight
+                            valid_weight += weight
+                if not skipna:
+                    if not missing:
+                        output[time_index, lat_index, lon_index] = weighted
+                    continue
+                if strict_boundary_missing:
+                    continue
+                valid_fraction = valid_weight * denominator / covered
+                if valid_fraction < minimum_valid_fraction:
+                    continue
+                if valid_weight > 0.0:
+                    output[time_index, lat_index, lon_index] = (
+                        weighted / valid_weight
+                    )
+    return output
+
+
 def _resample_tile_variable(
     source: xr.Dataset,
     item: VariableInfo,
@@ -992,6 +1211,7 @@ def _resample_tile_variable(
     target_tile: TargetGrid | None,
     skipna: bool,
     na_thres: float,
+    method: str,
     time_block: int,
     compute_workers: int,
     compute_dtype: ComputeDType,
@@ -1074,6 +1294,82 @@ def _resample_tile_variable(
                 values = values.compute()
         timing["regrid"] += time.perf_counter() - regrid_started
         values = np.asarray(values, dtype=result_dtype)
+        if method in {"conservative", "conservative_normed"}:
+            target_lat_local = np.asarray(target_chunk.lat, dtype="float32")
+            target_lon_local = np.asarray(target_chunk.lon, dtype="float32")
+            if target_lat_local.size == 1:
+                direction = (
+                    1.0
+                    if target_chunk.lat_bounds[-1] > target_chunk.lat_bounds[0]
+                    else -1.0
+                )
+                target_lat_local = np.asarray(
+                    [
+                        target_lat_local[0],
+                        target_lat_local[0]
+                        + direction * float(target_chunk.lat_resolution),
+                    ],
+                    dtype="float32",
+                )
+            if target_lon_local.size == 1:
+                direction = (
+                    1.0
+                    if target_chunk.lon_bounds[-1] > target_chunk.lon_bounds[0]
+                    else -1.0
+                )
+                target_lon_local = np.asarray(
+                    [
+                        target_lon_local[0],
+                        target_lon_local[0]
+                        + direction * float(target_chunk.lon_resolution),
+                    ],
+                    dtype="float32",
+                )
+            source_lat_bounds = _regular_axis_bounds(
+                np.asarray(source.lat.values, dtype="float32")
+            )
+            source_lon_bounds = _regular_axis_bounds(
+                np.asarray(source.lon.values, dtype="float32")
+            )
+            native_lat_slice = _source_overlap_window(
+                source_lat_bounds,
+                np.asarray(target_chunk.lat_bounds, dtype="float64"),
+                halo=1,
+            )
+            native_lon_slice = _source_overlap_window(
+                source_lon_bounds,
+                np.asarray(target_chunk.lon_bounds, dtype="float64"),
+                halo=1,
+            )
+            if native_lat_slice is not None and native_lon_slice is not None:
+                canonical_values = _conservative_native_values(
+                    np.asarray(
+                        prepared.isel(
+                            time=slice(time_start, time_stop),
+                            lat=native_lat_slice,
+                            lon=native_lon_slice,
+                        ).transpose("time", "lat", "lon").values
+                    ),
+                    np.asarray(source.lat.values)[native_lat_slice],
+                    np.asarray(source.lon.values)[native_lon_slice],
+                    target_lat_local,
+                    target_lon_local,
+                    normed=method == "conservative_normed",
+                    skipna=skipna,
+                    na_thres=na_thres,
+                )
+                canonical_values = canonical_values[
+                    :, : lat_stop - lat_start, : lon_stop - lon_start
+                ]
+                values = np.asarray(
+                    np.transpose(
+                        canonical_values,
+                        tuple(
+                            expected_dims.index(name) for name in ("time", "lat", "lon")
+                        ),
+                    ),
+                    dtype=result_dtype,
+                )
         if after_replacements.rules:
             values = apply_replacement_rules(values, after_replacements, statistics)
         del subset, result
@@ -1263,6 +1559,7 @@ def _process_space_tile(task: _OwnerTask) -> _TileMetrics:
                 target_tile,
                 plan.skipna,
                 plan.na_thres,
+                plan.method,
                 plan.time_block,
                 plan.compute_workers,
                 plan.compute_dtype,
@@ -1410,6 +1707,7 @@ def _execute_serial_tile_variable_overrides(
                 target_tile,
                 options.skipna,
                 options.na_thres,
+                options.method,
                 plan.time_block,
                 plan.compute_workers,
                 options.compute_dtype,
@@ -1550,6 +1848,7 @@ def _execute_serial_tile(
                 target_tile,
                 plan.skipna,
                 plan.na_thres,
+                plan.method,
                 plan.time_block,
                 plan.compute_workers,
                 plan.compute_dtype,
@@ -1833,6 +2132,8 @@ def plan_resample(
         temporary=config.temporary_dir,
         output=Path(config.output).expanduser().resolve().parent,
     )
+    if config.backend not in {"auto", "python", "rust"}:
+        raise ValueError("重采样后端必须是 auto、python 或 rust。")
     if config.method not in RESAMPLING_METHODS:
         raise ValueError(
             "重采样方法必须是：" + ", ".join(RESAMPLING_METHODS)
@@ -2344,6 +2645,58 @@ def _apply_data_dependent_post_replacements(
             )
             array[region] = replaced.astype(array.dtype, copy=False)
     return statistics, mode
+
+def _native_capability_failure(operation: str) -> str | None:
+    try:
+        resolve_backend("rust", operation)
+    except Exception as exc:
+        return f"capability unavailable: {exc}"
+    return None
+
+
+def _native_preflight_reason(
+    config: ResampleConfig,
+    plan: ResamplePlan,
+    *,
+    source_dataset: xr.Dataset | None = None,
+) -> str | None:
+    method_entry = _NATIVE_METHODS.get(plan.method)
+    if method_entry is None:
+        return f"method {plan.method} is not supported by native regular resampling"
+    if plan.variable_options:
+        return "per-variable method or options are not supported"
+    if config.before_replacements.rules or config.after_replacements.rules:
+        return "replacement rules are not supported"
+    if any(
+        "scale_factor" in item.attrs or "add_offset" in item.attrs
+        for item in plan.inspection.info.data_variables
+    ):
+        return "CF packing (scale_factor/add_offset) is not supported"
+    if any(
+        item.dims != ("time", "lat", "lon") or str(item.dtype) != "float32"
+        for item in plan.inspection.info.data_variables
+    ):
+        return "native regular resampling requires float32 (time, lat, lon) variables"
+    if source_dataset is None and not _native_source_has_direct_values(Path(config.input), plan):
+        return "source values require CF decoding or are not a direct Zarr array"
+    return _native_capability_failure(method_entry[0])
+
+
+def _with_python_backend_metrics(
+    metrics: dict[str, object], fallback_reason: str | None
+) -> dict[str, object]:
+    result = dict(metrics)
+    result.update(
+        {
+            "backend": "python",
+            "backend_fallback": fallback_reason is not None,
+            "backend_fallback_reason": fallback_reason,
+            "protocol_version": None,
+        }
+    )
+    return result
+
+
 def _native_source_has_direct_values(path: Path, plan: ResamplePlan) -> bool:
     try:
         zarr.open_group(path, mode="r")
@@ -2464,10 +2817,15 @@ def _native_process_tile(
     started = time.perf_counter()
     lat_start, lat_stop, lon_start, lon_stop = task.region
     tile = _tile_target(plan.target, lat_start, lat_stop, lon_start, lon_stop)
+    window_method = (
+        "bilinear"
+        if plan.method in {"conservative", "conservative_normed"}
+        else plan.method
+    )
     target_tile, source_lat_slice, source_lon_slice = _resolve_local_source_window(
         plan.inspection.grid,
         tile,
-        plan.method,
+        window_method,
     )
     metrics: dict[str, float | int] = {
         "elapsed": 0.0,
@@ -2532,11 +2890,26 @@ def _native_process_tile(
     )
     target_lat_local = np.ascontiguousarray(target_tile.lat, dtype="float32")
     target_lon_local = np.ascontiguousarray(target_tile.lon, dtype="float32")
+    desired_lat_size = int(target_lat_local.size)
+    desired_lon_size = int(target_lon_local.size)
+    if plan.method in {"conservative", "conservative_normed"}:
+        if desired_lat_size == 1:
+            direction = 1.0 if target_tile.lat_bounds[-1] > target_tile.lat_bounds[0] else -1.0
+            target_lat_local = np.asarray(
+                [target_lat_local[0], target_lat_local[0] + direction * target_tile.lat_resolution],
+                dtype="float32",
+            )
+        if desired_lon_size == 1:
+            direction = 1.0 if target_tile.lon_bounds[-1] > target_tile.lon_bounds[0] else -1.0
+            target_lon_local = np.asarray(
+                [target_lon_local[0], target_lon_local[0] + direction * target_tile.lon_resolution],
+                dtype="float32",
+            )
     source_area = int(source_lat_local.size) * int(source_lon_local.size)
     target_area = int(target_lat_local.size) * int(target_lon_local.size)
     if source_area <= 0 or target_area <= 0:
         raise ResampleExecutionError("native resampling region has an empty spatial axis")
-    method = "nearest" if plan.method.startswith("nearest") else "bilinear"
+    method = _NATIVE_METHODS[plan.method][1]
 
     grouped: dict[tuple[int, int], list[VariableInfo]] = {}
     for name in item_names:
@@ -2562,7 +2935,9 @@ def _native_process_tile(
             )
         time_size = int(group_items[0].shape[group_items[0].dims.index("time")])
         time_chunk = int(
-            output_group[group_items[0].name].chunks[group_items[0].dims.index("time")]
+            output_group[group_items[0].name].chunks[
+                group_items[0].dims.index("time")
+            ]
         )
         for chunk_start in range(0, time_size, time_chunk):
             if cancel_event is not None and cancel_event.is_set():
@@ -2611,17 +2986,25 @@ def _native_process_tile(
                     ]
                     metrics["read"] += time.perf_counter() - read_started
                     resample_started = time.perf_counter()
-                    result = _native_call_batch(
-                        native,
-                        blocks,
-                        source_lat_local,
-                        source_lon_local,
-                        target_lat_local,
-                        target_lon_local,
-                        method,
-                        plan.skipna,
-                        plan.na_thres,
-                    )
+                    try:
+                        result = _native_call_batch(
+                            native,
+                            blocks,
+                            source_lat_local,
+                            source_lon_local,
+                            target_lat_local,
+                            target_lon_local,
+                            method,
+                            plan.skipna,
+                            plan.na_thres,
+                        )
+                    except _NativeResampleFallback:
+                        raise
+                    except Exception as exc:
+                        raise _NativeResampleFallback(
+                            f"native kernel execution failed: {exc}"
+                        ) from exc
+                    result = result[:, :desired_lat_size, :desired_lon_size]
                     metrics["resample"] += time.perf_counter() - resample_started
                     block_length = block_stop - block_start
                     expected_shape = (
@@ -2834,11 +3217,14 @@ def _run_native_regular_resample(
         return {
             "backend": "rust",
             "backend_fallback": False,
+            "backend_fallback_reason": None,
+            "protocol_version": 1,
             "output": str(target_path),
             "logical_bytes": logical_bytes,
             "physical_bytes": physical_bytes,
             "method": plan.method,
             "wall_seconds": elapsed,
+            "elapsed": elapsed,
             "throughput_mib_s": logical_bytes / 1024**2 / max(elapsed, 1e-9),
             "physical_throughput_mib_s": physical_bytes / 1024**2 / max(elapsed, 1e-9),
             "used_intermediate": False,
@@ -2878,12 +3264,7 @@ def _resolve_fused_plan(
     plan: ResamplePlan | None,
     source_dataset: xr.Dataset | None,
 ) -> tuple[xr.Dataset | None, ResamplePlan]:
-    """Resolve the resample plan for an on-disk or in-memory fused source.
-
-    For the single-pass fusion path the conversion crop is an in-memory
-    xarray Dataset, so the plan is built by inspecting that Dataset instead of
-    a nonexistent intermediate Zarr path on disk.
-    """
+    """Resolve the resample plan for an on-disk or in-memory fused source."""
 
     if source_dataset is None:
         return None, plan or plan_resample(config)
@@ -2910,29 +3291,33 @@ def run_resample(
         raise ResampleExecutionError("输入和输出不能是同一个目录。")
     if source_dataset is None and source_path != plan.inspection.info.path:
         raise ResampleExecutionError("输入检查结果与执行输入路径不一致。")
-    native_operation = "resample.nearest" if plan.method.startswith("nearest") else "resample.bilinear"
-    if (
-        plan.method in {"nearest_s2d", "bilinear"}
-        and not plan.variable_options
-        and resolve_backend("auto", native_operation) == "rust"
-        and not config.before_replacements.rules
-        and not config.after_replacements.rules
-        and all(item.dims == ("time", "lat", "lon") and str(item.dtype) == "float32" for item in plan.inspection.info.data_variables)
-        and (
-            source_dataset is not None
-            or _native_source_has_direct_values(Path(config.input), plan)
+    if config.backend not in {"auto", "python", "rust"}:
+        raise ResampleExecutionError(f"不支持的重采样后端：{config.backend}")
+
+    fallback_reason: str | None = None
+    if config.backend != "python":
+        native_reason = _native_preflight_reason(
+            config, plan, source_dataset=source_dataset
         )
-    ):
-        try:
-            return _run_native_regular_resample(
-                config,
-                plan,
-                cancel_event=cancel_event,
-                progress_callback=progress_callback,
-                source_dataset=source_dataset,
-            )
-        except _NativeResampleFallback:
-            pass
+        if config.backend == "rust" and native_reason is not None:
+            raise ResampleExecutionError(f"Rust 重采样不可用: {native_reason}")
+        if native_reason is None:
+            try:
+                return _run_native_regular_resample(
+                    config,
+                    plan,
+                    cancel_event=cancel_event,
+                    progress_callback=progress_callback,
+                    source_dataset=source_dataset,
+                )
+            except _NativeResampleFallback as exc:
+                fallback_reason = str(exc)
+                if config.backend == "rust":
+                    raise ResampleExecutionError(
+                        f"Rust 重采样不可用: {fallback_reason}"
+                    ) from exc
+        elif config.backend == "auto":
+            fallback_reason = native_reason
     _prepare_target(target_path, config.overwrite)
     preflight_writable(target_path.parent, "重采样输出")
     temporary_root = _resolve_temporary_root(
@@ -2961,15 +3346,9 @@ def run_resample(
         )
         runtime_plan = replace(requested_plan, statistics=before_statistics)
         if source_dataset is not None and int(runtime_plan.space_workers) > 1:
-            # An in-memory source cannot be shared with spawned spatial
-            # workers, so a fused run always executes in-process (serially).
-            # The native fast path already uses a thread pool, which shares
-            # the object safely; only the Python process-pool path is capped.
             runtime_plan = replace(runtime_plan, space_workers=1)
         processing_plan = runtime_plan
         if requested_plan.after_replacements.data_dependent:
-            # Data-dependent post rules require statistics from the unmodified
-            # resampled product, so they run as a bounded second pass below.
             processing_plan = replace(
                 runtime_plan,
                 after_replacements=ReplacementRules(),
@@ -3187,12 +3566,13 @@ def run_resample(
         physical_bytes = _directory_size(target_path)
         if progress:
             print(f"重采样完成并通过校验：{target_path}")
-        return {
-            "elapsed": elapsed,
-            "wall_seconds": elapsed,
-            "output": str(target_path),
-            "physical_bytes": physical_bytes,
-            "logical_bytes": logical_bytes,
+        return _with_python_backend_metrics(
+            {
+                "elapsed": elapsed,
+                "wall_seconds": elapsed,
+                "output": str(target_path),
+                "physical_bytes": physical_bytes,
+                "logical_bytes": logical_bytes,
             "used_intermediate": False,
             "intermediate_logical_bytes": 0,
             "owner_buffer_bytes": int(tile_timing["owner_buffer_bytes"]),
@@ -3282,7 +3662,9 @@ def run_resample(
                 "after": after_statistics,
                 "after_mode": after_statistics_mode,
             },
-        }
+            },
+            fallback_reason,
+        )
     except Exception as exc:
         if source is not None:
             source.close()

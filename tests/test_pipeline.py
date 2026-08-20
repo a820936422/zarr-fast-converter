@@ -735,16 +735,35 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("最终压缩：gzip level 3；shuffle=auto", stdout.getvalue())
         self.assertFalse(output.exists())
-    def test_pipeline_explicit_rust_rejects_resampling_only_plan(self) -> None:
-        inspection = inspect_zarr(ROOT / "canonical-input.zarr")
+    def test_pipeline_explicit_rust_records_resampling_backend(self) -> None:
+        source = ROOT / "pipeline-native-input.zarr"
+        with xr.open_zarr(
+            ROOT / "canonical-input.zarr", consolidated=False, chunks=None
+        ) as dataset:
+            dataset[["value"]].to_zarr(
+                source,
+                mode="w",
+                consolidated=False,
+                zarr_format=3,
+                encoding={"value": {"compressors": []}},
+            )
+        inspection = inspect_zarr(source)
         config = replace(
             self._config(ROOT / "rust-resample-only.zarr"),
             input=PipelineInput(kind="zarr"),
             operations=PipelineOperations(resample=True),
             backend="rust",
         )
-        with self.assertRaisesRegex(PipelineExecutionError, "只支持兼容性最终化"):
-            run_pipeline(inspection, config, progress=False)
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["backend"]["requested"], "rust")
+        self.assertEqual(manifest["backend"]["resolved"], "rust")
+        self.assertFalse(manifest["backend"]["fallback"])
+        metrics = manifest["stages"]["resampling"]["metrics"]
+        self.assertEqual(metrics["backend"], "rust")
+        self.assertFalse(metrics["backend_fallback"])
+        self.assertIsNone(metrics["backend_fallback_reason"])
+        self.assertEqual(metrics["protocol_version"], 1)
 
     def test_resampling_without_storage_operations_uses_baseline_layout(self) -> None:
         inspection = inspect_source(

@@ -4,13 +4,26 @@
 
 ## 运行
 
-```bash
 # L0：受控样本正确性（每个数据集 1–2 个文件、32×32 窗口、≤2 时间步）
 pixi run python tests/external_data/run_samples.py
 
 # L1：v1.7.8 真实数据专项（T1–T5；T6 使用 pixi run validate-raw）
 pixi run python tests/external_data/run_v178_l1.py
-```
+
+# v1.8：真实 HDF4、派生 int16 native parity、FLUXSAT conservative 双后端 parity
+pixi run python tests/external_data/run_v180_acceptance.py \
+  --manifest tests/external_data/manifest.local.json \
+  --work-root tests/external_data/work/v180 \
+  --results-root tests/external_data/results
+
+v1.8 acceptance 的报告固定写入 `results/v180_acceptance_report.json`；任何 case
+失败时退出 1。报告记录源 SHA-256、HDF4 事实、窗口 provenance、backend/method、
+NaN mask、逐值差异与误差 tolerance。GLASS HDF4 读取仍明确由 Python/netCDF4
+compatibility backend 完成；报告中的 `native_hdf4_supported` 为 false。
+
+conservative/conservative_normed 的 FLUXSAT 双后端 parity 使用项目级确定性
+边界触碰规则：Python/xESMF 结果按与 native kernel 相同的几何 overlap 规则重算
+掩码与值，避免 ESMF 内部数值级 sliver 造成双后端差异。当前基线 9/9 通过。
 
 运行前复制 `manifest.example.json` 为 `manifest.local.json`，将 `source_root` 改为本机外部数据目录。当前机器的本地清单已配置好，未纳入 Git。
 

@@ -52,6 +52,20 @@ class ProtocolContractTests(unittest.TestCase):
         )
         self.assertTrue(inspect["supported"])
         self.assertIsNone(inspect["reason"])
+        expected_limitations = [
+            "float32",
+            "regular latitude/longitude grids",
+            "spherical cell-area overlap",
+            "NaN outside source bounds",
+        ]
+        for operation in ("resample.conservative", "resample.conservative_normed"):
+            detail = next(
+                item
+                for item in payload["capabilities"]
+                if item["operation"] == operation
+            )
+            self.assertTrue(detail["supported"])
+            self.assertEqual(detail["limitations"], expected_limitations)
 
     def test_request_and_event_schemas_keep_protocol_version_one(self) -> None:
         for name in ("request-v1.schema.json", "event-v1.schema.json"):

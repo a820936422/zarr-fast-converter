@@ -540,6 +540,9 @@ def _grid_coordinate_values(ds, dimension: str, axis: Literal["lat", "lon"]):
             return x0 + (np.arange(size, dtype="float64") + 0.5) * step
         except (TypeError, ValueError, ZeroDivisionError):
             pass
+    values = _hdf_eos_swath_axis_values(ds, axis)
+    if values is not None:
+        return values
     # A dimension-only source has no trustworthy physical geolocation.  Keep
     # it usable for index-based conversion while making the fallback explicit
     # through the canonical coordinate values.
@@ -577,6 +580,204 @@ def _hdf_eos_grid_values(
         return None
 
 
+_SWATH_METADATA_GROUP_RE = re.compile(
+    r"GROUP=SwathStructMetadata(.*?)END_GROUP=SwathStructMetadata", re.DOTALL
+)
+_SWATH_BLOCK_RE = re.compile(r"GROUP=(Swath_\d+)(.*?)END_GROUP=Swath_\d+", re.DOTALL)
+_SWATH_DIMENSION_RE = re.compile(r'DimensionName="([^"]+)"\s+Size=\s*(\d+)')
+_SWATH_FIELD_RE = re.compile(
+    r'(\w+)Name="([^"]+)"\s+DataType=\S+\s+DimList=\(([^)]*)\)'
+)
+
+
+@dataclass(frozen=True)
+class HdfEosSwath:
+    """Parsed HDF-EOS ``SwathStructMetadata`` block for the first Swath.
+
+    A Swath stores its geographic location as two-dimensional GeoFields
+    (``Latitude``/``Longitude``) over along-track/cross-track dimensions,
+    unlike a Grid whose bounds live in ``StructMetadata.0``.  The parsed
+    structure lets both the low-level netCDF4 scan and the xarray path
+    recover 1D latitude/longitude axes from regular (degenerate) swaths.
+    """
+
+    name: str
+    dimensions: tuple[str, ...]
+    data_fields: tuple[str, ...]
+    geo_fields: tuple[str, ...]
+    lat_field: str
+    lon_field: str
+
+
+def _hdf_eos_swath_structure(metadata: Any) -> HdfEosSwath | None:
+    """Parse HDF-EOS Swath structure from ``CoreMetadata.0``.
+
+    Returns ``None`` when the metadata does not contain a usable
+    ``SwathStructMetadata`` block with both latitude and longitude
+    GeoFields.
+    """
+    text = str(metadata or "")
+    group = _SWATH_METADATA_GROUP_RE.search(text)
+    if group is None:
+        return None
+    block = _SWATH_BLOCK_RE.search(group.group(1))
+    if block is None:
+        return None
+    body = block.group(2)
+    dimensions = tuple(
+        match.group(1) for match in _SWATH_DIMENSION_RE.finditer(body)
+    )
+    fields = tuple(
+        (
+            match.group(1),
+            match.group(2),
+            tuple(part.strip().strip('"') for part in match.group(3).split(",")),
+        )
+        for match in _SWATH_FIELD_RE.finditer(body)
+    )
+    data_fields = tuple(name for kind, name, _dims in fields if kind == "DataField")
+    geo_fields = tuple(name for kind, name, _dims in fields if kind == "GeoField")
+    if not dimensions or not geo_fields:
+        return None
+    lat_field = next(
+        (name for name in geo_fields if name.lower() in ("latitude", "lat")),
+        None,
+    )
+    lon_field = next(
+        (name for name in geo_fields if name.lower() in ("longitude", "lon")),
+        None,
+    )
+    if lat_field is None or lon_field is None:
+        return None
+    return HdfEosSwath(
+        name=block.group(1),
+        dimensions=dimensions,
+        data_fields=data_fields,
+        geo_fields=geo_fields,
+        lat_field=lat_field,
+        lon_field=lon_field,
+    )
+
+
+def _hdf_eos_swath_axis(
+    lat_2d: Any, lon_2d: Any, axis: Literal["lat", "lon"]
+) -> tuple[np.ndarray | None, int | None]:
+    """Reduce a Swath GeoField pair to a one-dimensional axis.
+
+    A Swath stores its location as two-dimensional Latitude/Longitude
+    fields.  Products whose location varies along exactly one dimension
+    (a degenerate, regular Swath) can be represented by the canonical 1D
+    latitude/longitude axes used by filename mode; genuinely irregular
+    Swaths return ``(None, None)`` so callers can fall back or refuse.
+
+    The returned integer is the array axis (0 = first dimension, 1 = second
+    dimension) along which the field varies, i.e. the dimension the 1D
+    values belong to.
+    """
+    try:
+        lat = np.asarray(lat_2d, dtype="float64")
+        lon = np.asarray(lon_2d, dtype="float64")
+    except (TypeError, ValueError):
+        return None, None
+    if lat.ndim != 2 or lon.ndim != 2 or lat.shape != lon.shape:
+        return None, None
+    field = lat if axis == "lat" else lon
+    rows, cols = field.shape
+    along_row = float(np.mean(np.abs(np.diff(field, axis=0)))) if rows > 1 else 0.0
+    along_col = float(np.mean(np.abs(np.diff(field, axis=1)))) if cols > 1 else 0.0
+    dominant = max(along_row, along_col)
+    tolerance = max(1e-9, dominant * 1e-6)
+    if along_row <= tolerance and along_col > tolerance:
+        values = np.asarray(field[0, :], dtype="float64")
+        dim_index = 1
+    elif along_col <= tolerance and along_row > tolerance:
+        values = np.asarray(field[:, 0], dtype="float64")
+        dim_index = 0
+    else:
+        return None, None
+    if values.size == 0 or not np.all(np.isfinite(values)):
+        return None, None
+    magnitude = float(np.max(np.abs(values)))
+    if magnitude > 500:
+        # Coordinates stored as micro-degrees (or projected metres), like
+        # Grid bounds.  A mix of plausible degrees and large fill-like
+        # values means the field is not a clean coordinate axis.
+        mixed = bool(np.any(np.abs(values) <= 500))
+        if mixed or magnitude >= 1e9:
+            return None, None
+        values = values / 1_000_000.0
+    return values, dim_index
+
+
+def _hdf_eos_swath_axis_values(ds, axis: Literal["lat", "lon"]) -> np.ndarray | None:
+    """Recover a 1D Swath axis from ``CoreMetadata.0`` GeoFields.
+
+    Works on both netCDF4 ``Dataset`` objects (low-level scan) and xarray
+    ``Dataset`` objects; returns ``None`` when the source is not a regular
+    Swath.
+    """
+    if hasattr(ds, "ncattrs"):
+        metadata = (
+            ds.getncattr("CoreMetadata.0")
+            if "CoreMetadata.0" in ds.ncattrs()
+            else ""
+        )
+    else:
+        metadata = str(ds.attrs.get("CoreMetadata.0", ""))
+    swath = _hdf_eos_swath_structure(metadata)
+    if swath is None or len(swath.dimensions) < 2:
+        return None
+    try:
+        if hasattr(ds, "variables"):
+            lat_2d = np.asarray(ds.variables[swath.lat_field][:])
+            lon_2d = np.asarray(ds.variables[swath.lon_field][:])
+        else:
+            lat_2d = np.asarray(ds[swath.lat_field].values)
+            lon_2d = np.asarray(ds[swath.lon_field].values)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    values, dim_index = _hdf_eos_swath_axis(lat_2d, lon_2d, axis)
+    if values is None or dim_index is None:
+        return None
+    return values
+
+
+def _swath_spatial_dimensions(ds) -> tuple[str, str] | None:
+    """Map an HDF-EOS Swath's along/cross-track dimensions to lat/lon."""
+    if hasattr(ds, "ncattrs"):
+        metadata = (
+            ds.getncattr("CoreMetadata.0")
+            if "CoreMetadata.0" in ds.ncattrs()
+            else ""
+        )
+        variables = ds.variables
+    else:
+        metadata = str(ds.attrs.get("CoreMetadata.0", ""))
+        variables = ds
+    swath = _hdf_eos_swath_structure(metadata)
+    if swath is None or len(swath.dimensions) < 2:
+        return None
+    try:
+        if hasattr(ds, "variables"):
+            lat_2d = np.asarray(variables[swath.lat_field][:])
+            lon_2d = np.asarray(variables[swath.lon_field][:])
+        else:
+            lat_2d = np.asarray(ds[swath.lat_field].values)
+            lon_2d = np.asarray(ds[swath.lon_field].values)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    _lat_values, lat_index = _hdf_eos_swath_axis(lat_2d, lon_2d, "lat")
+    _lon_values, lon_index = _hdf_eos_swath_axis(lat_2d, lon_2d, "lon")
+    if (
+        lat_index is None
+        or lon_index is None
+        or lat_index == lon_index
+        or max(lat_index, lon_index) >= len(swath.dimensions)
+    ):
+        return None
+    return swath.dimensions[lat_index], swath.dimensions[lon_index]
+
+
 def _low_level_spatial_dimensions(ds) -> tuple[str, str]:
     """Infer the source latitude/longitude dimensions from netCDF4 objects."""
     dimensions = tuple(str(name) for name in ds.dimensions)
@@ -608,6 +809,9 @@ def _low_level_spatial_dimensions(ds) -> tuple[str, str]:
             candidates["lon"] = str(name)
     if set(candidates) == {"lat", "lon"}:
         return candidates["lat"], candidates["lon"]
+    swath_dims = _swath_spatial_dimensions(ds)
+    if swath_dims is not None:
+        return swath_dims
     raise _LowLevelUnsupported(
         "netCDF4 低层扫描无法识别经纬度维度；回退到 xarray。"
     )
@@ -629,6 +833,18 @@ def _low_level_axis_values(ds, dimension: str, axis: Literal["lat", "lon"]) -> n
     if "StructMetadata.0" in ds.ncattrs():
         metadata = ds.getncattr("StructMetadata.0")
     values = _hdf_eos_grid_values(metadata, size, axis)
+    if values is None:
+        # HDF-EOS Swath products keep their location in 2D GeoFields
+        # declared through CoreMetadata.0 instead of coordinate variables.
+        values = _hdf_eos_swath_axis_values(ds, axis)
+        if values is not None:
+            swath_dims = _swath_spatial_dimensions(ds)
+            if swath_dims is None:
+                values = None
+            else:
+                expected = swath_dims[0] if axis == "lat" else swath_dims[1]
+                if expected != dimension:
+                    values = None
     return values if values is not None else np.arange(size, dtype="float64")
 
 
@@ -640,13 +856,22 @@ def _low_level_variable_attrs(variable) -> dict[str, Any]:
     return attrs
 
 
-def _low_level_variable_signature(variable, source_lat: str, source_lon: str) -> tuple[Any, ...] | None:
+def _low_level_variable_signature(
+    variable,
+    source_lat: str,
+    source_lon: str,
+    excluded_names: frozenset[str] = frozenset(),
+) -> tuple[Any, ...] | None:
     """Build the same signature as ``_filename_variable_signature``.
 
     The filename mode only keeps numeric two-dimensional spatial variables.
     Variables containing a singleton band/time dimension are intentionally
     left to xarray, whose normalisation already handles those cases.
+    HDF-EOS Swath GeoFields (``excluded_names``) are location metadata, not
+    data variables, and must not enter the signature or the output.
     """
+    if str(variable.name) in excluded_names:
+        return None
     dimensions = tuple(str(item) for item in variable.dimensions)
     if len(dimensions) != 2 or set(dimensions) != {source_lat, source_lon}:
         return None
@@ -705,6 +930,16 @@ def _inspect_filename_file_low_level(task) -> FileRecord:
         # scale_factor or add_offset: metadata validation must compare the
         # stored source coordinates, not silently transformed values.
         dataset.set_auto_maskandscale(False)
+        swath = _hdf_eos_swath_structure(
+            dataset.getncattr("CoreMetadata.0")
+            if "CoreMetadata.0" in dataset.ncattrs()
+            else None
+        )
+        excluded_names = (
+            frozenset({swath.lat_field, swath.lon_field})
+            if swath is not None
+            else frozenset()
+        )
         source_lat, source_lon = _low_level_spatial_dimensions(dataset)
         lat_values = _low_level_axis_values(dataset, source_lat, "lat")
         lon_values = _low_level_axis_values(dataset, source_lon, "lon")
@@ -714,7 +949,12 @@ def _inspect_filename_file_low_level(task) -> FileRecord:
                     signature
                     for variable in dataset.variables.values()
                     for signature in (
-                        _low_level_variable_signature(variable, source_lat, source_lon),
+                        _low_level_variable_signature(
+                            variable,
+                            source_lat,
+                            source_lon,
+                            excluded_names,
+                        ),
                     )
                     if signature is not None
                 ),
@@ -876,10 +1116,15 @@ def _rename_spatial_dims(ds):
             if standard == "longitude" or axis == "X":
                 candidates["lon"] = name
         if set(candidates) != {"lat", "lon"}:
-            raise FilenameTimeError(
-                f"无法从源文件识别纬度/经度维度；发现维度：{', '.join(map(str, ds.dims))}"
-            )
-        source_lat, source_lon = candidates["lat"], candidates["lon"]
+            swath_dims = _swath_spatial_dimensions(ds)
+            if swath_dims is not None:
+                source_lat, source_lon = swath_dims
+            else:
+                raise FilenameTimeError(
+                    f"无法从源文件识别纬度/经度维度；发现维度：{', '.join(map(str, ds.dims))}"
+                )
+        else:
+            source_lat, source_lon = candidates["lat"], candidates["lon"]
 
     mapping = {}
     if source_lat != "lat":
@@ -892,8 +1137,15 @@ def _rename_spatial_dims(ds):
         ds = ds.assign_coords(lat=_grid_coordinate_values(ds, "lat", "lat"))
     if "lon" not in ds.coords:
         ds = ds.assign_coords(lon=_grid_coordinate_values(ds, "lon", "lon"))
+    swath = _hdf_eos_swath_structure(ds.attrs.get("CoreMetadata.0"))
+    swath_fields = {swath.lat_field, swath.lon_field} if swath is not None else set()
     for name in list(ds.data_vars):
         variable = ds[name]
+        if name in swath_fields:
+            # HDF-EOS Swath GeoFields are location metadata consumed by the
+            # coordinate reconstruction above; they are not data variables.
+            ds = ds.drop_vars(name)
+            continue
         if "band" in variable.dims:
             if variable.sizes["band"] != 1:
                 raise FilenameTimeError(

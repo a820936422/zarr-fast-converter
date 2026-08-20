@@ -1009,6 +1009,7 @@ def _run_zarr_pipeline(
                         output=resample_output,
                         resolution=options.resolution,
                         method=options.method,
+                        backend=config.backend,
                         skipna=options.skipna,
                         na_thres=options.na_thres,
                         compute_dtype=options.compute_dtype,
@@ -1098,7 +1099,7 @@ def _run_zarr_pipeline(
         if cancel_event is not None and cancel_event.is_set():
             raise PipelineExecutionError("任务已取消。")
         if not plan.finalization_required:
-            _apply_backend_metrics(manifest, None, requested_backend)
+            _apply_backend_metrics(manifest, resample_metrics, requested_backend)
         if plan.finalization_required:
             chunking = config.chunking
             current_stage = "finalization"
@@ -1293,10 +1294,6 @@ def run_pipeline(
     progress_callback=None,
 ) -> dict[str, object]:
     plan = build_pipeline_plan(inspection, config)
-    if config.backend == "rust" and not getattr(plan, "finalization_required", False):
-        raise PipelineExecutionError(
-            "当前Rust后端只支持兼容性最终化重分块；源转换和重采样仍使用Python后端。"
-        )
     if plan.needs_resample:
         validate_resampling_environment()
 
@@ -1579,6 +1576,7 @@ def run_pipeline(
                 output=resample_output,
                 resolution=config.resampling.resolution,
                 method=resampling.method,
+                backend=config.backend,
                 skipna=resampling.skipna,
                 na_thres=resampling.na_thres,
                 compute_dtype=resampling.compute_dtype,
@@ -1706,7 +1704,11 @@ def run_pipeline(
                 "avoided_full_store_reads": 1,
                 "avoided_full_store_writes": 1,
             }
-            _apply_backend_metrics(manifest, rechunk_metrics, requested_backend)
+            _apply_backend_metrics(
+                manifest,
+                resample_metrics if plan.needs_resample else conversion_metrics,
+                requested_backend,
+            )
             manifest["stages"]["finalization"] = {
                 "status": "not_required_direct_layout",
                 "metrics": rechunk_metrics,

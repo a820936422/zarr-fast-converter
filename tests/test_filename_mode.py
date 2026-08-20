@@ -15,6 +15,8 @@ import xarray as xr
 from fast_nc_zarr.filename_mode import (
     FilenameTimeError,
     _hdf_eos_grid_values,
+    _hdf_eos_swath_axis,
+    _hdf_eos_swath_structure,
     convert_filename,
     filename_direct_write,
     inspect_filename_inventory,
@@ -31,6 +33,44 @@ from fast_nc_zarr.selection import make_selection
 
 
 ROOT = Path("/tmp/codex_test/fast_nc_zarr_filename_tests")
+
+_SWATH_CORE_METADATA = (
+    "GROUP=SwathStructMetadata\n"
+    "  GROUP=Swath_1\n"
+    "    OBJECT=SwathStructure\n"
+    "      GROUP=Dimension\n"
+    "        OBJECT=Dimension_1\n"
+    "          DimensionName=\"AlongTrack\"\n"
+    "          Size=2\n"
+    "        END_OBJECT=Dimension_1\n"
+    "        OBJECT=Dimension_2\n"
+    "          DimensionName=\"CrossTrack\"\n"
+    "          Size=3\n"
+    "        END_OBJECT=Dimension_2\n"
+    "      END_GROUP=Dimension\n"
+    "      GROUP=DataField\n"
+    "        OBJECT=DataField_1\n"
+    "          DataFieldName=\"EVI\"\n"
+    "          DataType=DFNT_INT16\n"
+    "          DimList=(\"AlongTrack\",\"CrossTrack\")\n"
+    "        END_OBJECT=DataField_1\n"
+    "      END_GROUP=DataField\n"
+    "      GROUP=GeoField\n"
+    "        OBJECT=GeoField_1\n"
+    "          GeoFieldName=\"Latitude\"\n"
+    "          DataType=DFNT_FLOAT32\n"
+    "          DimList=(\"AlongTrack\",\"CrossTrack\")\n"
+    "        END_OBJECT=GeoField_1\n"
+    "        OBJECT=GeoField_2\n"
+    "          GeoFieldName=\"Longitude\"\n"
+    "          DataType=DFNT_FLOAT32\n"
+    "          DimList=(\"AlongTrack\",\"CrossTrack\")\n"
+    "        END_OBJECT=GeoField_2\n"
+    "      END_GROUP=GeoField\n"
+    "    END_OBJECT=SwathStructure\n"
+    "  END_GROUP=Swath_1\n"
+    "END_GROUP=SwathStructMetadata\n"
+)
 
 
 class FilenameModeTests(unittest.TestCase):
@@ -649,6 +689,265 @@ gc.collect()
             np.testing.assert_array_equal(left["value"].values, right["value"].values)
             np.testing.assert_array_equal(left["lat"].values, right["lat"].values)
             np.testing.assert_array_equal(left["lon"].values, right["lon"].values)
+
+
+    def test_hdf_eos_swath_structure_parses_core_metadata(self) -> None:
+        metadata = (
+            "GROUP=INVENTORYMETADATA\n"
+            "  GROUP=ECSMETADATA\n"
+            "  END_GROUP=ECSMETADATA\n"
+            "END_GROUP=INVENTORYMETADATA\n"
+            "GROUP=SwathStructMetadata\n"
+            "  GROUP=Swath_1\n"
+            "    OBJECT=SwathStructure\n"
+            "      GROUP=Dimension\n"
+            "        OBJECT=Dimension_1\n"
+            "          DimensionName=\"AlongTrack\"\n"
+            "          Size=2\n"
+            "        END_OBJECT=Dimension_1\n"
+            "        OBJECT=Dimension_2\n"
+            "          DimensionName=\"CrossTrack\"\n"
+            "          Size=3\n"
+            "        END_OBJECT=Dimension_2\n"
+            "      END_GROUP=Dimension\n"
+            "      GROUP=DataField\n"
+            "        OBJECT=DataField_1\n"
+            "          DataFieldName=\"EVI\"\n"
+            "          DataType=DFNT_INT16\n"
+            "          DimList=(\"AlongTrack\",\"CrossTrack\")\n"
+            "        END_OBJECT=DataField_1\n"
+            "      END_GROUP=DataField\n"
+            "      GROUP=GeoField\n"
+            "        OBJECT=GeoField_1\n"
+            "          GeoFieldName=\"Latitude\"\n"
+            "          DataType=DFNT_FLOAT32\n"
+            "          DimList=(\"AlongTrack\",\"CrossTrack\")\n"
+            "        END_OBJECT=GeoField_1\n"
+            "        OBJECT=GeoField_2\n"
+            "          GeoFieldName=\"Longitude\"\n"
+            "          DataType=DFNT_FLOAT32\n"
+            "          DimList=(\"AlongTrack\",\"CrossTrack\")\n"
+            "        END_OBJECT=GeoField_2\n"
+            "      END_GROUP=GeoField\n"
+            "    END_OBJECT=SwathStructure\n"
+            "  END_GROUP=Swath_1\n"
+            "END_GROUP=SwathStructMetadata\n"
+        )
+        swath = _hdf_eos_swath_structure(metadata)
+        assert swath is not None
+        self.assertEqual(swath.name, "Swath_1")
+        self.assertEqual(swath.dimensions, ("AlongTrack", "CrossTrack"))
+        self.assertEqual(swath.data_fields, ("EVI",))
+        self.assertEqual(swath.geo_fields, ("Latitude", "Longitude"))
+        self.assertEqual(swath.lat_field, "Latitude")
+        self.assertEqual(swath.lon_field, "Longitude")
+
+    def test_hdf_eos_swath_structure_ignores_non_swath_metadata(self) -> None:
+        self.assertIsNone(_hdf_eos_swath_structure(""))
+        self.assertIsNone(
+            _hdf_eos_swath_structure(
+                "GROUP=GridStructure\nUpperLeftPointMtrs=(-90,45)\n"
+            )
+        )
+        # GeoFields without a latitude/longitude pair are not usable.
+        self.assertIsNone(
+            _hdf_eos_swath_structure(
+                "GROUP=SwathStructMetadata\n"
+                "  GROUP=Swath_1\n"
+                "    GROUP=GeoField\n"
+                "      OBJECT=GeoField_1\n"
+                "        GeoFieldName=\"Radiance\"\n"
+                "        DataType=DFNT_FLOAT32\n"
+                "        DimList=(\"AlongTrack\",\"CrossTrack\")\n"
+                "      END_OBJECT=GeoField_1\n"
+                "    END_GROUP=GeoField\n"
+                "  END_GROUP=Swath_1\n"
+                "END_GROUP=SwathStructMetadata\n"
+            )
+        )
+
+    def test_hdf_eos_swath_axis_reconstructs_regular_axes(self) -> None:
+        # Latitude varies along rows (along-track), longitude along columns
+        # (cross-track): the canonical degenerate-swath layout.
+        lat_2d = np.tile(np.array([30.0, 40.0]), (3, 1)).T
+        lon_2d = np.tile(np.array([100.0, 120.0, 140.0]), (2, 1))
+        lat_values, lat_index = _hdf_eos_swath_axis(lat_2d, lon_2d, "lat")
+        lon_values, lon_index = _hdf_eos_swath_axis(lat_2d, lon_2d, "lon")
+        assert lat_values is not None and lon_values is not None
+        np.testing.assert_allclose(lat_values, [30.0, 40.0])
+        np.testing.assert_allclose(lon_values, [100.0, 120.0, 140.0])
+        self.assertEqual(lat_index, 0)
+        self.assertEqual(lon_index, 1)
+
+        # Micro-degree storage is normalised like Grid bounds.
+        lat_micro = np.tile(np.array([3.0e7, 4.0e7]), (3, 1)).T
+        lon_micro = np.tile(np.array([1.0e8, 1.2e8, 1.4e8]), (2, 1))
+        lat_values, _ = _hdf_eos_swath_axis(lat_micro, lon_micro, "lat")
+        lon_values, _ = _hdf_eos_swath_axis(lat_micro, lon_micro, "lon")
+        assert lat_values is not None and lon_values is not None
+        np.testing.assert_allclose(lat_values, [30.0, 40.0])
+        np.testing.assert_allclose(lon_values, [100.0, 120.0, 140.0])
+
+    def test_hdf_eos_swath_axis_rejects_irregular_fields(self) -> None:
+        rng = np.random.default_rng(7)
+        # Both directions vary: a genuinely irregular swath.
+        lat_2d = rng.normal(30.0, 1.0, size=(4, 5))
+        lon_2d = rng.normal(100.0, 1.0, size=(4, 5))
+        self.assertEqual(_hdf_eos_swath_axis(lat_2d, lon_2d, "lat"), (None, None))
+        self.assertEqual(_hdf_eos_swath_axis(lat_2d, lon_2d, "lon"), (None, None))
+
+        # A constant field carries no geolocation.
+        constant = np.full((4, 5), 45.0)
+        self.assertEqual(_hdf_eos_swath_axis(constant, constant, "lat"), (None, None))
+
+        # Fill-like values mixed into a plausible-degree axis are rejected.
+        mixed = np.tile(np.array([30.0, 40.0]), (3, 1)).T
+        mixed[1, 1] = -9999.0
+        lon_ok = np.tile(np.array([100.0, 120.0, 140.0]), (2, 1))
+        self.assertEqual(_hdf_eos_swath_axis(mixed, lon_ok, "lat"), (None, None))
+
+    def test_hdf_eos_swath_axis_same_dimension_falls_back_to_index(self) -> None:
+        from netCDF4 import Dataset
+        from fast_nc_zarr.filename_mode import _low_level_axis_values
+
+        folder = ROOT / "degenerate-swath"
+        folder.mkdir()
+        path = folder / "swath_2001001.hdf"
+        metadata = (
+            "GROUP=SwathStructMetadata\n"
+            "  GROUP=Swath_1\n"
+            "    OBJECT=SwathStructure\n"
+            "      GROUP=Dimension\n"
+            "        OBJECT=Dimension_1\n"
+            "          DimensionName=\"YDim:T\"\n"
+            "          Size=2\n"
+            "        END_OBJECT=Dimension_1\n"
+            "        OBJECT=Dimension_2\n"
+            "          DimensionName=\"XDim:T\"\n"
+            "          Size=3\n"
+            "        END_OBJECT=Dimension_2\n"
+            "      END_GROUP=Dimension\n"
+            "      GROUP=GeoField\n"
+            "        OBJECT=GeoField_1\n"
+            "          GeoFieldName=\"Latitude\"\n"
+            "          DataType=DFNT_FLOAT32\n"
+            "          DimList=(\"YDim:T\",\"XDim:T\")\n"
+            "        END_OBJECT=GeoField_1\n"
+            "        OBJECT=GeoField_2\n"
+            "          GeoFieldName=\"Longitude\"\n"
+            "          DataType=DFNT_FLOAT32\n"
+            "          DimList=(\"YDim:T\",\"XDim:T\")\n"
+            "        END_OBJECT=GeoField_2\n"
+            "      END_GROUP=GeoField\n"
+            "    END_OBJECT=SwathStructure\n"
+            "  END_GROUP=Swath_1\n"
+            "END_GROUP=SwathStructMetadata\n"
+        )
+        with Dataset(path, "w", format="NETCDF4") as dataset:
+            dataset.createDimension("YDim:T", 2)
+            dataset.createDimension("XDim:T", 3)
+            dataset.setncattr("CoreMetadata.0", metadata)
+            latitude = dataset.createVariable(
+                "Latitude", "f8", ("YDim:T", "XDim:T")
+            )
+            # Both fields vary along the first dimension only, so the
+            # lat/lon mapping is ambiguous and must fall back cleanly.
+            latitude[:] = np.tile(np.array([30.0, 40.0]), (3, 1)).T
+            longitude = dataset.createVariable(
+                "Longitude", "f8", ("YDim:T", "XDim:T")
+            )
+            longitude[:] = np.tile(np.array([100.0, 120.0]), (3, 1)).T
+        with Dataset(path, mode="r") as dataset:
+            np.testing.assert_array_equal(
+                _low_level_axis_values(dataset, "YDim:T", "lat"),
+                np.arange(2, dtype="float64"),
+            )
+
+    def _write_swath_files(self, folder: Path, metadata: str) -> None:
+        from netCDF4 import Dataset
+
+        for index, doy in enumerate(("001", "005")):
+            path = folder / f"swath_2001{doy}.hdf"
+            with Dataset(path, "w", format="NETCDF4") as dataset:
+                dataset.createDimension("AlongTrack", 2)
+                dataset.createDimension("CrossTrack", 3)
+                dataset.setncattr("CoreMetadata.0", metadata)
+                latitude = dataset.createVariable(
+                    "Latitude", "f8", ("AlongTrack", "CrossTrack")
+                )
+                latitude[:] = np.tile(np.array([30.0, 40.0]), (3, 1)).T
+                longitude = dataset.createVariable(
+                    "Longitude", "f8", ("AlongTrack", "CrossTrack")
+                )
+                longitude[:] = np.tile(np.array([100.0, 120.0, 140.0]), (2, 1))
+                evi = dataset.createVariable(
+                    "EVI", "i2", ("AlongTrack", "CrossTrack"), fill_value=-9999
+                )
+                evi[:] = index
+
+    def test_hdf_eos_swath_low_level_scan_reconstructs_coordinates(self) -> None:
+        folder = ROOT / "low-level-swath"
+        folder.mkdir()
+        self._write_swath_files(folder, _SWATH_CORE_METADATA)
+
+        scan = scan_filename_times(folder)
+        inventory = inspect_filename_inventory(
+            scan, requested_engine="netcdf4", workers=1, progress=False
+        )
+        self.assertEqual(inventory.source_engine, "netcdf4")
+        np.testing.assert_allclose(inventory.lat_values, [30.0, 40.0])
+        np.testing.assert_allclose(inventory.lon_values, [100.0, 120.0, 140.0])
+        self.assertEqual(tuple(inventory.variables), ("EVI",))
+        self.assertEqual(inventory.variables["EVI"].attrs["_FillValue"], -9999)
+
+    def test_hdf_eos_swath_filename_conversion_reconstructs_coordinates(self) -> None:
+        folder = ROOT / "low-level-swath-convert"
+        folder.mkdir()
+        self._write_swath_files(folder, _SWATH_CORE_METADATA)
+
+        scan = scan_filename_times(folder)
+        inventory = inspect_filename_inventory(
+            scan, requested_engine="netcdf4", workers=1, progress=False
+        )
+        output = ROOT / "low-level-swath-convert-output.zarr"
+        convert_filename(
+            inventory,
+            make_selection(inventory),
+            output,
+            plan=ConversionPlan("file", 1, 1, 2, 3),
+            auto_tune=False,
+            progress=False,
+            validate=True,
+        )
+        with xr.open_zarr(
+            output, consolidated=False, chunks=None, decode_times=False
+        ) as result:
+            np.testing.assert_allclose(result["lat"].values, [30.0, 40.0])
+            np.testing.assert_allclose(result["lon"].values, [100.0, 120.0, 140.0])
+            self.assertEqual(result["EVI"].shape, (2, 2, 3))
+            np.testing.assert_array_equal(
+                result["EVI"].isel(time=0).values,
+                np.zeros((2, 3), dtype="int16"),
+            )
+            # GeoFields are location metadata, not output variables.
+            self.assertNotIn("Latitude", result.data_vars)
+            self.assertNotIn("Longitude", result.data_vars)
+
+    def test_hdf_eos_swath_xarray_normalization_drops_geofields(self) -> None:
+        from fast_nc_zarr.filename_mode import _normalized_filename_dataset
+
+        folder = ROOT / "xarray-swath"
+        folder.mkdir()
+        self._write_swath_files(folder, _SWATH_CORE_METADATA)
+
+        with _normalized_filename_dataset(
+            folder / "swath_2001001.hdf", "netcdf4"
+        ) as (ds, engine):
+            self.assertEqual(engine, "netcdf4")
+            np.testing.assert_allclose(ds.lat.values, [30.0, 40.0])
+            np.testing.assert_allclose(ds.lon.values, [100.0, 120.0, 140.0])
+            self.assertEqual(tuple(ds.data_vars), ("EVI",))
+            self.assertEqual(tuple(ds.EVI.dims), ("lat", "lon"))
 
 
 if __name__ == "__main__":

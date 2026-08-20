@@ -7,6 +7,8 @@ pub const DESKTOP_NATIVE_OPERATIONS: &[&str] = &[
     "raw.netcdf.convert",
     "resample.nearest",
     "resample.bilinear",
+    "resample.conservative",
+    "resample.conservative_normed",
     "zarr.rechunk_f32",
     "zarr.rechunk_multi",
     "zarr.write_f64",
@@ -167,6 +169,12 @@ impl BackendCapability {
                         "no CF packing or missing-value markers",
                         "NaN outside source bounds",
                     ],
+                    "resample.conservative" | "resample.conservative_normed" => &[
+                        "float32",
+                        "regular latitude/longitude grids",
+                        "spherical cell-area overlap",
+                        "NaN outside source bounds",
+                    ],
                     "zarr.rechunk_f32" => &[
                         "single float32 data variable",
                         "staged output",
@@ -266,6 +274,24 @@ impl BackendCapability {
                     "NaN outside source bounds",
                 ][..],
             ),
+            (
+                "resample.conservative",
+                &[
+                    "float32",
+                    "regular latitude/longitude grids",
+                    "spherical cell-area overlap",
+                    "NaN outside source bounds",
+                ][..],
+            ),
+            (
+                "resample.conservative_normed",
+                &[
+                    "float32",
+                    "regular latitude/longitude grids",
+                    "spherical cell-area overlap",
+                    "NaN outside source bounds",
+                ][..],
+            ),
         ];
         let operations = supported
             .iter()
@@ -304,8 +330,8 @@ mod tests {
     fn smoke_capability_has_stable_protocol_and_matrix() {
         let capability = BackendCapability::smoke();
         assert_eq!(capability.backend, "rust");
-        assert_eq!(capability.operations.len(), 18);
-        assert_eq!(capability.capabilities.len(), 19);
+        assert_eq!(capability.operations.len(), 20);
+        assert_eq!(capability.capabilities.len(), 21);
         let supported = capability
             .capabilities
             .iter()
@@ -337,5 +363,20 @@ mod tests {
                 .expect("multi-variable rechunk")
                 .supported
         );
+        for operation in ["resample.conservative", "resample.conservative_normed"] {
+            let detail = capability
+                .operation(operation)
+                .expect("conservative capability");
+            assert!(detail.supported);
+            assert_eq!(
+                detail.limitations,
+                vec![
+                    "float32",
+                    "regular latitude/longitude grids",
+                    "spherical cell-area overlap",
+                    "NaN outside source bounds",
+                ]
+            );
+        }
     }
 }

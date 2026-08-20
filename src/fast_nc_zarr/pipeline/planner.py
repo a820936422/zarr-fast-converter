@@ -769,6 +769,7 @@ def build_zarr_pipeline_plan(inspection, config: PipelineConfig) -> ZarrPipeline
                 output=config.general.output,
                 resolution=options.resolution,
                 method=options.method,
+                backend=config.backend,
                 skipna=options.skipna,
                 na_thres=options.na_thres,
                 compute_dtype=options.compute_dtype,

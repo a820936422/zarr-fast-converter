@@ -22,8 +22,17 @@ from fast_nc_zarr.rechunking.native import (
 
 
 _CAPABILITY = rust_capability()
-_RUST_NETCDF_READY = _CAPABILITY.supported and "raw.netcdf.inspect" in _CAPABILITY.operations
-_RUST_RESAMPLE_READY = _CAPABILITY.supported and {"resample.nearest", "resample.bilinear"}.issubset(_CAPABILITY.operations)
+_RUST_NETCDF_READY = (
+    _CAPABILITY.supported
+    and {"raw.netcdf.inspect", "raw.netcdf.convert"}.issubset(_CAPABILITY.operations)
+)
+_RUST_RESAMPLE_METHODS = {
+    "resample.nearest",
+    "resample.bilinear",
+    "resample.conservative",
+    "resample.conservative_normed",
+}
+_RUST_RESAMPLE_READY = _CAPABILITY.supported and _RUST_RESAMPLE_METHODS.issubset(_CAPABILITY.operations)
 
 _RUST_ZARR_READY = _CAPABILITY.supported and {
     "zarr.inspect",
@@ -83,13 +92,13 @@ class NativePreparationTests(unittest.TestCase):
         expected = "rust" if _RUST_ZARR_READY else "python"
         self.assertEqual(resolve_backend("auto", "zarr.rechunk_f32"), expected)
 
-    def test_standard_raw_and_resample_operations_resolve_native_capabilities(self) -> None:
+    def test_standard_raw_and_all_resample_operations_resolve_native_capabilities(self) -> None:
         netcdf_expected = "rust" if _RUST_NETCDF_READY else "python"
         resample_expected = "rust" if _RUST_RESAMPLE_READY else "python"
         self.assertEqual(resolve_backend("auto", "raw.netcdf.inspect"), netcdf_expected)
         self.assertEqual(resolve_backend("auto", "raw.netcdf.convert"), netcdf_expected)
-        self.assertEqual(resolve_backend("auto", "resample.nearest"), resample_expected)
-        self.assertEqual(resolve_backend("auto", "resample.bilinear"), resample_expected)
+        for operation in sorted(_RUST_RESAMPLE_METHODS):
+            self.assertEqual(resolve_backend("auto", operation), resample_expected)
 
 
 

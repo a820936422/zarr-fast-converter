@@ -761,6 +761,210 @@ class ResamplingTests(unittest.TestCase):
         with xr.open_zarr(output, consolidated=False, chunks=None) as dataset:
             self.assertEqual(dataset.value.shape, (2, 2, 2))
 
+    def test_conservative_native_matches_python_backend(self) -> None:
+        source = ROOT / "conservative-native-input.zarr"
+        values = np.arange(2 * 4 * 4, dtype="float32").reshape(2, 4, 4)
+        values[0, :2, :2] = np.nan
+        dataset = xr.Dataset(
+            {"value": (("time", "lat", "lon"), values, {"units": "test"})},
+            coords={
+                "time": np.arange(2, dtype="float32"),
+                "lat": np.asarray([3.5, 2.5, 1.5, 0.5], dtype="float32"),
+                "lon": np.asarray([0.5, 1.5, 2.5, 3.5], dtype="float32"),
+            },
+            attrs={"title": "conservative parity"},
+        )
+        dataset.to_zarr(
+            source,
+            mode="w",
+            consolidated=False,
+            zarr_format=3,
+            encoding={"value": {"chunks": (1, 2, 2), "compressors": []}},
+        )
+        dataset.close()
+
+        for method in ("conservative", "conservative_normed"):
+            python_output = ROOT / f"{method}-python.zarr"
+            rust_output = ROOT / f"{method}-rust.zarr"
+            python_metrics = run_resample(
+                ResampleConfig(
+                    source,
+                    python_output,
+                    resolution=2.0,
+                    method=method,
+                    backend="python",
+                ),
+                progress=False,
+            )
+            rust_metrics = run_resample(
+                ResampleConfig(
+                    source,
+                    rust_output,
+                    resolution=2.0,
+                    method=method,
+                    backend="rust",
+                ),
+                progress=False,
+            )
+            self.assertEqual(python_metrics["backend"], "python")
+            self.assertFalse(python_metrics["backend_fallback"])
+            self.assertIsNone(python_metrics["backend_fallback_reason"])
+            self.assertIsNone(python_metrics["protocol_version"])
+            self.assertEqual(rust_metrics["backend"], "rust")
+            self.assertFalse(rust_metrics["backend_fallback"])
+            self.assertIsNone(rust_metrics["backend_fallback_reason"])
+            self.assertEqual(rust_metrics["protocol_version"], 1)
+            with xr.open_zarr(
+                python_output, consolidated=False, chunks=None, decode_times=False
+            ) as python_result, xr.open_zarr(
+                rust_output, consolidated=False, chunks=None, decode_times=False
+            ) as rust_result:
+                self.assertEqual(rust_result.attrs, python_result.attrs)
+                self.assertEqual(
+                    rust_result["value"].encoding["chunks"],
+                    python_result["value"].encoding["chunks"],
+                )
+                np.testing.assert_array_equal(rust_result.time.values, python_result.time.values)
+                np.testing.assert_allclose(rust_result.lat.values, python_result.lat.values)
+                np.testing.assert_allclose(rust_result.lon.values, python_result.lon.values)
+                np.testing.assert_array_equal(
+                    np.isnan(rust_result.value.values),
+                    np.isnan(python_result.value.values),
+                )
+                np.testing.assert_allclose(
+                    rust_result.value.values,
+                    python_result.value.values,
+                    rtol=5e-5,
+                    atol=1e-6,
+                    equal_nan=True,
+                )
+
+    def test_conservative_native_skipna_false_matches_python_boundary_nan(self) -> None:
+        source = ROOT / "conservative-boundary-native-input.zarr"
+        lat = np.arange(-0.1875, 0.1876, 0.05, dtype="float32")
+        lon = np.arange(0.3125, 0.6876, 0.05, dtype="float32")
+        values = np.full((1, lat.size, lon.size), 7.0, dtype="float32")
+        # Source cell (-0.1375, 0.3125) touches the target cell boundary in
+        # latitude only; xESMF gives it a tiny nonzero weight, so skipna=False
+        # must propagate this NaN while the native kernel must not drop it.
+        values[0, 1, 0] = np.nan
+        dataset = xr.Dataset(
+            {"value": (("time", "lat", "lon"), values, {"units": "test"})},
+            coords={
+                "time": np.asarray([0], dtype="float32"),
+                "lat": lat,
+                "lon": lon,
+            },
+            attrs={"title": "conservative boundary parity"},
+        )
+        dataset.to_zarr(
+            source,
+            mode="w",
+            consolidated=False,
+            zarr_format=3,
+            encoding={"value": {"chunks": (1, 2, 2), "compressors": []}},
+        )
+        dataset.close()
+
+        common = dict(
+            resolution=0.1,
+            skipna=False,
+        )
+        for method in ("conservative", "conservative_normed"):
+            python_output = ROOT / f"{method}-boundary-python.zarr"
+            rust_output = ROOT / f"{method}-boundary-rust.zarr"
+            python_metrics = run_resample(
+                ResampleConfig(source, python_output, method=method, backend="python", **common),
+                progress=False,
+            )
+            rust_metrics = run_resample(
+                ResampleConfig(source, rust_output, method=method, backend="rust", **common),
+                progress=False,
+            )
+            self.assertEqual(python_metrics["backend"], "python")
+            self.assertFalse(python_metrics["backend_fallback"])
+            self.assertEqual(rust_metrics["backend"], "rust")
+            self.assertFalse(rust_metrics["backend_fallback"])
+            with xr.open_zarr(
+                python_output, consolidated=False, chunks=None, decode_times=False
+            ) as python_result, xr.open_zarr(
+                rust_output, consolidated=False, chunks=None, decode_times=False
+            ) as rust_result:
+                # The touched target cell must be masked by both backends.
+                self.assertTrue(
+                    np.isnan(python_result["value"].values[0, 1, 0]),
+                    "python must mask the boundary-touched cell",
+                )
+                self.assertTrue(
+                    np.isnan(rust_result["value"].values[0, 1, 0]),
+                    "native must mask the boundary-touched cell",
+                )
+                np.testing.assert_array_equal(
+                    np.isnan(rust_result["value"].values),
+                    np.isnan(python_result["value"].values),
+                )
+                np.testing.assert_allclose(
+                    rust_result["value"].values,
+                    python_result["value"].values,
+                    rtol=5e-5,
+                    atol=1e-6,
+                    equal_nan=True,
+                )
+
+    def test_explicit_backend_and_auto_fallback_contract(self) -> None:
+        source = ROOT / "input.zarr"
+        auto_output = ROOT / "auto-fallback.zarr"
+        metrics = run_resample(
+            ResampleConfig(
+                source,
+                auto_output,
+                resolution=2.0,
+                method="conservative",
+                backend="auto",
+            ),
+            progress=False,
+        )
+        self.assertEqual(metrics["backend"], "python")
+        self.assertTrue(metrics["backend_fallback"])
+        self.assertIn(
+            "native regular resampling requires float32 (time, lat, lon) variables",
+            metrics["backend_fallback_reason"],
+        )
+        self.assertIsNone(metrics["protocol_version"])
+
+        rust_output = ROOT / "rust-rejected.zarr"
+        with self.assertRaisesRegex(
+            ResampleExecutionError,
+            r"Rust 重采样不可用: native regular resampling requires float32 \(time, lat, lon\) variables",
+        ):
+            run_resample(
+                ResampleConfig(
+                    source,
+                    rust_output,
+                    resolution=2.0,
+                    method="conservative",
+                    backend="rust",
+                ),
+                progress=False,
+            )
+        self.assertFalse(rust_output.exists())
+
+        with patch("fast_nc_zarr.resampling.engine.resolve_backend") as resolver:
+            python_output = ROOT / "python-never-probes-native.zarr"
+            metrics = run_resample(
+                ResampleConfig(
+                    source,
+                    python_output,
+                    resolution=2.0,
+                    method="conservative",
+                    backend="python",
+                ),
+                progress=False,
+            )
+            resolver.assert_not_called()
+            self.assertEqual(metrics["backend"], "python")
+            self.assertFalse(metrics["backend_fallback"])
+            self.assertIsNone(metrics["backend_fallback_reason"])
     def test_space_workers_write_complete_output_chunks(self) -> None:
         output = ROOT / "parallel.zarr"
         config = ResampleConfig(

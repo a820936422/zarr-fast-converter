@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=Path, help="输入 Zarr v3 目录。")
     parser.add_argument("--output", type=Path, help="输出 Zarr v3 目录。")
     parser.add_argument("--resolution", type=float, help="目标纬度/经度分辨率，单位为度。")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "python", "rust"),
+        default="auto",
+        help="执行后端；auto 在 native 不可用时回退 Python。",
+    )
     parser.add_argument("--method", choices=RESAMPLING_METHODS, default="bilinear")
     parser.add_argument(
         "--compute-dtype",
@@ -150,6 +156,7 @@ def _interactive_args() -> argparse.Namespace:
             input("浮点数据计算 dtype（source/float32，默认 source）：").strip().lower()
             or "source"
         ),
+        backend=input("执行后端（auto/python/rust，默认 auto）：").strip().lower() or "auto",
         skipna=input("是否启用 skipna？[Y/n]：").strip().lower() not in {"n", "no"},
         extent="source",
         tile_size="auto",
@@ -194,6 +201,7 @@ def run(args: argparse.Namespace) -> int:
         input=args.input,
         output=args.output,
         resolution=args.resolution,
+        backend=args.backend,
         method=args.method,
         skipna=args.skipna,
         compute_dtype=args.compute_dtype,

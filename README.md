@@ -23,7 +23,7 @@ Rust desktop runtime
 - zstd、Blosc 系列和 gzip 显式无损 codec；
 - 标准 NetCDF-4/classic 的 `time/lat/lon` 数值变量 metadata inspect 和 float32/float64 → Zarr v3 conversion；
 - native NetCDF 转换支持 float32/float64（CF packed 解码为物理值）与未打包标准整数（int8/int16/int32/int64、uint8/uint16/uint32/uint64 原样写入），源 `_FillValue`、`scale_factor`、`add_offset` 等记录为 `source_*` 元数据；带 scale_factor/add_offset 的打包整数仍走兼容路径；
-- float32 规则经纬度网格的 native nearest/bilinear 仅处理有限输入；含 CF packing 或非有限值时自动回退兼容路径，支持 latitude 方向和越界 NaN；
+- float32 规则经纬度网格的 native nearest/bilinear/conservative/conservative_normed 仅处理有限输入；含 CF packing 或非有限值时自动回退兼容路径，支持 latitude 方向和越界 NaN；conservative 使用确定性边界触碰规则，与 Python/xESMF 后处理掩码和值保持 parity；
 - 有界并行、取消、进度、staging 校验和原子发布；
 - capability matrix、manifest 和事件证据。
 

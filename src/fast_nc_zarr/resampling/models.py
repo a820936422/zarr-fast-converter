@@ -18,6 +18,8 @@ SpaceWorkers = int | Literal["auto"]
 TimeBlock = int | Literal["auto"]
 ComputeDType = Literal["source", "float32"]
 
+BackendName = Literal["auto", "python", "rust"]
+
 @dataclass(frozen=True)
 class ResampleVariableOptions:
     """Resolved resampling controls for one spatial data variable."""
@@ -95,6 +97,7 @@ class ResampleConfig:
     output: Path
     resolution: float = 0.25
     method: str = "bilinear"
+    backend: BackendName = "auto"
     skipna: bool = True
     na_thres: float = 1.0
     compute_dtype: ComputeDType = "source"

@@ -163,8 +163,11 @@ fn run_native_task(
         "zarr.inspect" => native_inspect(&request.payload),
         "raw.netcdf.inspect" => native_netcdf_inspect(&request.payload),
         "raw.netcdf.convert" => native_netcdf_convert(&request.payload, &cancellation_file),
-        "resample.nearest" | "resample.bilinear" => {
-            native_resample(&request.payload, &cancellation_file)
+        "resample.nearest"
+        | "resample.bilinear"
+        | "resample.conservative"
+        | "resample.conservative_normed" => {
+            native_resample(&request.payload, &cancellation_file, &operation)
         }
         "zarr.write_f64" => native_write_f64(&request.payload, &cancellation_file),
         "zarr.rechunk_f32" => native_rechunk(
@@ -305,6 +308,7 @@ fn native_netcdf_convert(
 fn native_resample(
     payload: &Map<String, Value>,
     cancellation_file: &Path,
+    operation: &str,
 ) -> Result<Map<String, Value>, AppError> {
     if cancellation_file.is_file() {
         return Err(AppError::new(ErrorKind::Cancelled, "任务已取消").at_stage("resampling"));
@@ -313,6 +317,20 @@ fn native_resample(
         .map_err(|error| {
             AppError::new(ErrorKind::InvalidRequest, error.to_string()).at_stage("resampling")
         })?;
+    let expected_method = match operation {
+        "resample.nearest" => "nearest",
+        "resample.bilinear" => "bilinear",
+        "resample.conservative" => "conservative",
+        "resample.conservative_normed" => "conservative_normed",
+        _ => unreachable!("operation gate validates resample operation"),
+    };
+    if request.method != expected_method {
+        return Err(AppError::new(
+            ErrorKind::InvalidRequest,
+            format!("native operation {operation} requires method {expected_method}"),
+        )
+        .at_stage("resampling"));
+    }
     if request.values.len() > MAX_NATIVE_ARRAY_VALUES {
         return Err(AppError::new(
             ErrorKind::ResourceBudgetExceeded,
@@ -738,7 +756,8 @@ fn read_progress(path: Option<&Path>) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_inspect, native_rechunk, native_rechunk_multi, native_write_f64, validate_operation,
+        native_inspect, native_rechunk, native_rechunk_multi, native_resample, native_write_f64,
+        validate_operation,
     };
     use crate::protocol::EventEnvelope;
     use fast_nc_zarr_zarr::write_f32_array;
@@ -762,6 +781,31 @@ mod tests {
         assert!(validate_operation("raw.netcdf.convert").is_ok());
         assert!(validate_operation("resample.nearest").is_ok());
         assert!(validate_operation("resample.bilinear").is_ok());
+    }
+
+    #[test]
+    fn conservative_native_operations_are_gated_and_method_bound() {
+        assert!(validate_operation("resample.conservative").is_ok());
+        assert!(validate_operation("resample.conservative_normed").is_ok());
+        assert!(validate_operation("resample.unknown").is_err());
+
+        let payload: Map<String, Value> = serde_json::from_value(json!({
+            "values": [1.0, 2.0, 3.0, 4.0],
+            "shape": [1, 2, 2],
+            "source_lat": [0.0, 1.0],
+            "source_lon": [0.0, 1.0],
+            "target_lat": [0.5],
+            "target_lon": [0.5],
+            "method": "bilinear"
+        }))
+        .expect("resample payload");
+        let error = native_resample(
+            &payload,
+            PathBuf::from("/nonexistent").as_path(),
+            "resample.conservative",
+        )
+        .expect_err("operation/method mismatch must be rejected");
+        assert_eq!(error.kind, crate::error::ErrorKind::InvalidRequest);
     }
 
     #[test]

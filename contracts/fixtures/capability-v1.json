@@ -20,7 +20,9 @@
     "raw.netcdf.inspect",
     "raw.netcdf.convert",
     "resample.nearest",
-    "resample.bilinear"
+    "resample.bilinear",
+    "resample.conservative",
+    "resample.conservative_normed"
   ],
   "capabilities": [
     {"operation": "probe", "supported": true, "reason": null, "limitations": []},
@@ -41,6 +43,8 @@
     {"operation": "raw.netcdf.convert", "supported": true, "reason": null, "limitations": ["NetCDF-4/classic", "float32/float64 and unpacked standard integer variables", "Zarr v3 output"]},
     {"operation": "resample.nearest", "supported": true, "reason": null, "limitations": ["float32", "regular latitude/longitude grids", "NaN outside source bounds"]},
     {"operation": "resample.bilinear", "supported": true, "reason": null, "limitations": ["float32", "regular latitude/longitude grids", "NaN outside source bounds"]},
+    {"operation": "resample.conservative", "supported": true, "reason": null, "limitations": ["float32", "regular latitude/longitude grids", "spherical cell-area overlap", "NaN outside source bounds"]},
+    {"operation": "resample.conservative_normed", "supported": true, "reason": null, "limitations": ["float32", "regular latitude/longitude grids", "spherical cell-area overlap", "NaN outside source bounds"]},
     {"operation": "pipeline.native", "supported": false, "reason": "native pipeline runtime is not implemented in this phase", "limitations": ["use Python fallback"]}
   ]
 }

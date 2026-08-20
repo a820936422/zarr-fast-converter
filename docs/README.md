@@ -106,7 +106,7 @@ pixi run resample -- \
 
 执行器按空间 tile 和时间 block 流式运行，统一受 `EffectiveResourceBudget`、owner buffer、worker 和物理 chunk ownership 约束。缺失值会被掩码；目标范围超出源覆盖时不外推，未覆盖格点保持缺测。替换规则通过 `--before-conditions/--before-results` 与 `--after-conditions/--after-results` 成对提供。
 
-规则 float32 且无压缩的输入可走 Rust native 快速路径；该路径通过 typed buffer bridge 传递连续 float32 数据，避免 Python list/JSON 序列化。CF `scale_factor`、`add_offset`、非 NaN 缺失标记或非有限输入会回退 Python 路径，先解码并规范化为物理值，避免 metadata 语义丢失。
+规则 float32 且无压缩的输入可走 Rust native 快速路径；该路径通过 typed buffer bridge 传递连续 float32 数据，避免 Python list/JSON 序列化。CF `scale_factor`、`add_offset`、非 NaN 缺失标记或非有限输入会回退 Python 路径，先解码并规范化为物理值，避免 metadata 语义丢失。conservative/conservative_normed 使用项目级确定性边界触碰规则：Python/xESMF 结果会按同一规则重算掩码与值，避免 ESMF 内部数值级 sliver 造成双后端差异。
 
 ## 4. 重分块与重压缩
 
