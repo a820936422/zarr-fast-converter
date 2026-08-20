@@ -16,10 +16,21 @@ pixi run python tests/external_data/run_v180_acceptance.py \
   --work-root tests/external_data/work/v180 \
   --results-root tests/external_data/results
 
+# v1.8.1：真实格式验收（GOSIF GeoTIFF、MCD12C1 HDF-EOS、GLASS HDF4、FLUXSAT NetCDF4）
+pixi run python tests/external_data/run_v181_acceptance.py \
+  --manifest tests/external_data/manifest.local.json \
+  --work-root tests/external_data/work/v181 \
+  --results-root tests/external_data/results
+
 v1.8 acceptance 的报告固定写入 `results/v180_acceptance_report.json`；任何 case
 失败时退出 1。报告记录源 SHA-256、HDF4 事实、窗口 provenance、backend/method、
 NaN mask、逐值差异与误差 tolerance。GLASS HDF4 读取仍明确由 Python/netCDF4
 compatibility backend 完成；报告中的 `native_hdf4_supported` 为 false。
+
+v1.8.1 acceptance 的报告固定写入 `results/v181_acceptance_report.json`；任何
+case 失败时退出 1。数据源来自 `/run/media/owen/HDD/数据备份/` 的只读备份目录，
+只使用中心窗口和 ≤2 个时间步，覆盖 GOSIF-GPP GeoTIFF filename 模式、MCD12C1
+HDF-EOS 分类数据、GLASS-EVI HDF4 打包数据和 FLUXSATv2 NetCDF4 完整模式。
 
 conservative/conservative_normed 的 FLUXSAT 双后端 parity 使用项目级确定性
 边界触碰规则：Python/xESMF 结果按与 native kernel 相同的几何 overlap 规则重算
