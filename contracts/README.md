@@ -1,4 +1,4 @@
-# v1.7.9 IPC contract
+# v1.8.1 IPC contract
 
 Protocol version: `1`.
 
