@@ -4,7 +4,7 @@
 > **约定：每次版本更新时，必须同步更新本文档的“版本状态”与“版本历史”章节。**
 
 - **最近更新**：2026-08-20
-- **当前版本**：v1.8.1
+- **当前版本**：v1.8.2
 - **当前分支**：`develop`
 - **仓库**：`https://github.com/a820936422/zarr-fast-converter.git`
 
@@ -208,7 +208,7 @@ pixi run scaling-check
    - 更新本维护文档的“当前版本”“版本状态”“版本历史”。
    - 如架构、命令、模块或发布范围变化，同步更新本维护文档。
    - 如有重大审查/路线图，更新或新增 `docs/` 下对应文档。
-   - 如有待办/路线图变更，同步更新 `docs/v1.8.1-development.md`。
+   - 如有待办/路线图变更，同步更新 `docs/v1.8.2-development.md`。
 3. **运行完整检查**：
 
 ```bash
@@ -300,24 +300,25 @@ pixi run release-candidate
 1. ~~CI workflow 引用未定义的 pixi 任务~~ 已修复：`pixi.toml` 已新增 `cross-backend-test`，本地运行通过。
 2. ~~本地 sidecar 过期~~ 已修复：已执行 `pixi run desktop-sidecar` 并重新校验通过。
 3. ~~前端浏览器预览 fallback 版本号为 1.7.5~~ 已修复：`App.tsx` 改为从 `package.json` 读取版本。
-4. **文档/维护状态**：历史版本专项文档已整合清理；当前活跃文档为 `docs/MAINTENANCE.md`、`docs/README.md` 和 `docs/v1.8.1-development.md`。
+4. **文档/维护状态**：历史版本专项文档已整合清理；当前活跃文档为 `docs/MAINTENANCE.md`、`docs/README.md` 和 `docs/v1.8.2-development.md`（v1.8.1 开发文档已完成并退役，历史由 git 保留）。
 5. **Python 可维护性**：`ruff`/`python-lint` 已落地并修复 F/E9 问题；大模块拆分仍作为后续 backlog。
 6. ~~`validate-raw` 对 FLUXSATv2 float32 经纬度网格误报“不规则网格”~~ 已修复：`raw_validation._axis_report` 容差改为按坐标 dtype 自适应（float32 0.05° 网格通过）；新增单测 `test_axis_report_accepts_float32_regular_grid`。
-7. **硬件条件暂不具备（重要约束）**：目前没有更大的真实数据窗口，也没有独立 SSD/NVMe 设备，因此 v1.8.1 开发文档 3.3 的「真实设备读写阶段分离验证」与「真实数据 scaling 基准外业验证」被阻塞，无法按完成定义推进；
+7. **硬件条件暂不具备（重要约束）**：目前没有更大的真实数据窗口，也没有独立 SSD/NVMe 设备，因此 v1.8.2 开发文档 3.4 的「真实设备读写阶段分离验证」与「真实数据 scaling 基准外业验证」被阻塞，无法按完成定义推进；
    - 现阶段仅能以备份语料（`/run/media/owen/HDD/数据备份/`）的小窗口与同设备完成初步 A/B（报告见 `tests/external_data/results/v181-scaling/`），正式收益仍需更大窗口与独立写入设备验证；
    - 上述两项在开发文档中保持待办并明确「硬件前置」状态，待硬件条件具备后再执行并纳入发布门禁；
    - 该约束不影响已完成的格式验证、native 能力与全量回归（295 passed）。
 
-> 后续待处理内容统一记录在 [v1.8.1 开发文档](v1.8.1-development.md)。
+> 后续待处理内容统一记录在 [v1.8.2 开发文档](v1.8.2-development.md)。
 
 ### 6.3 发布状态（开发阶段）
 
 - **v1.7.7 修改已提交并同步远程**：当前 `develop` 分支已包含 v1.7.7 全部修改，远程已手动推送；本地 tag `v1.7.7` 已创建。
 - **v1.7.8 真实数据测试已完成**：版本已提升至 1.7.8，L0/L1 与 `validate-raw` 全树验证通过，回归门禁保持绿色。
 - **v1.7.8 后端优化分析已完成，P0 代码优化已落地**：存储感知 worker/batch **初始值**（仅作起始猜测，调优仍探索完整 worker 范围）、重采样全局线程预算已实现并通过测试。
-- **v1.7.9 后端优化已实施**：已完成 HardwareProfile（含 NUMA/P/E）、PerformanceModel、重分块存储感知初始值、WorkerPool 工具类、文件亲和排序、OnlineController 可观测与保守调整、CPU affinity、PipelineFusion eligibility 标记；剩余项列入 [v1.8.1 开发文档](v1.8.1-development.md)。
+- **v1.7.9 后端优化已实施**：已完成 HardwareProfile（含 NUMA/P/E）、PerformanceModel、重分块存储感知初始值、WorkerPool 工具类、文件亲和排序、OnlineController 可观测与保守调整、CPU affinity、PipelineFusion eligibility 标记；剩余项后续转入开发文档。
 - **v1.8.0 开发基线已提交并推送**：v1.8.0 完成项已收敛进版本历史（commit `18bf7bb`），包括 WorkerPool 全路径、HDD 读写阶段分离、PipelineFusion、OnlineController、native 整数、HDF-EOS Grid/Swath、native conservative parity、scaling 基础设施。
-- **v1.8.1 待办推进（开发中）**：版本已提升至 1.8.1；剩余项转入 [v1.8.1 开发文档](v1.8.1-development.md)，重点为真实设备/真实数据验证、HDF-EOS/GeoTIFF fixture、剩余 native 能力扩展与发布门禁。其中「真实设备读写阶段分离验证」与「真实数据 scaling 外业基准」两项因当前缺少更大数据窗口与独立 SSD/NVMe 硬件被阻塞（见 6.2 第 7 条），保持待办，待硬件条件具备后再推进并纳入发布门禁。filename 重复文件边界与 filename 模式 PipelineFusion 两项已实现并纳入已验证状态。
+- **v1.8.1 已完成并收敛**：版本提升至 1.8.1 并完成发布门禁；完成真实 HDF4-EOS/GeoTIFF/HDF-EOS 小窗验收 6/6、filename 缺日检测与重复文件边界（拒绝语义）、filename 模式 PipelineFusion 单遍流式；全量回归 295 保持绿色。剩余硬件前置项（真实设备读写阶段分离验证、真实数据 scaling 外业基准）因缺少更大数据窗口与独立 SSD/NVMe 被阻塞（见 6.2 第 7 条），已承接至 [v1.8.2 开发文档](v1.8.2-development.md) 3.4。
+- **v1.8.2 基线已建立**：版本提升至 1.8.2；v1.8.1 开发文档退役，开发方案见 [v1.8.2 开发文档](v1.8.2-development.md)。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。
@@ -338,9 +339,10 @@ pixi run release-candidate
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
-| 1.8.1 | 2026-08-20 | 版本提升至 1.8.1；v1.8.0 完成项收敛进本文档；剩余项见 `docs/v1.8.1-development.md`，重点为真实设备/真实数据验证、HDF-EOS/GeoTIFF fixture、剩余 native 能力扩展与发布门禁 |
+| 1.8.2 | 2026-08-20 | 版本提升至 1.8.2；v1.8.1 完成项收敛进本文档（filename 缺日/重复边界、filename 模式 PipelineFusion、真实格式验收 6/6、发布门禁）；v1.8.1 开发文档退役；开发方案见 `docs/v1.8.2-development.md` |
+| 1.8.1 | 2026-08-20 | 版本提升至 1.8.1 并完成：真实 HDF4-EOS/GeoTIFF/HDF-EOS 小窗验收 6/6、filename 缺日检测与重复文件边界（拒绝语义）、filename 模式 PipelineFusion、发布门禁（sidecar/typecheck/build/tauri-build/release-candidate）；全量回归 295 保持绿色；硬件前置项（真实设备 staging/scaling 外业）承接至 v1.8.2 |
 | 1.8.0 | 2026-08-20 | v1.8.0 开发基线提交并推送（commit `18bf7bb`）：WorkerPool 全路径、HDD 读写阶段分离、PipelineFusion、OnlineController、native 整数、HDF-EOS Grid/Swath、native conservative parity（v180 acceptance 9/9）、scaling 基础设施；开发阶段暂不打包上传 |
-| 1.7.9 | 2026-08-18 | 版本提升至 1.7.9；开始实施后端优化方案：新增 HardwareProfile 存储微基准与缓存、PerformanceModel 候选排序、重分块 worker 初始值（全范围实测保留）；P1 其余项与 P2 继续推进；开发阶段暂不打包上传，剩余项见 `docs/v1.8.1-development.md` |
+| 1.7.9 | 2026-08-18 | 版本提升至 1.7.9；开始实施后端优化方案：新增 HardwareProfile 存储微基准与缓存、PerformanceModel 候选排序、重分块 worker 初始值（全范围实测保留）；P1 其余项与 P2 继续推进；开发阶段暂不打包上传，剩余项后续转入开发文档 |
 | 1.7.8 | 2026-08-18 | 版本提升至 1.7.8；完成 FLUXSATv2 + GLASS-EVI 真实数据测试（L0/L1、`validate-raw` 全树 1240 文件通过）；修复 `validate-raw` float32 坐标容差；落地后端自适应优化 P0（存储感知 worker/batch 初始值、重采样全局线程预算）；sidecar 已按 v1.7.8 重建并校验；开发阶段暂不打包上传 |
 | 1.7.6 | 2026-08-18 | 当前基线：native-first 能力矩阵、Tauri 桌面、pipeline/resample/rechunk 能力；本文档首次建立 |
 | 1.7.7 | 2026-08-18 | 版本提升至 1.7.7；P0、P1、P2 已完成；M6 发布门禁与发布准备完成（deb 候选包已收集）；修改已提交并同步远程（tag `v1.7.7`）；当前处于开发阶段，暂不打包安装包、暂不上传发布资产 |

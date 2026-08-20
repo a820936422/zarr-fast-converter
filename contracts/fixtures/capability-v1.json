@@ -1,7 +1,7 @@
 {
   "backend": "rust",
   "protocol_version": 1,
-  "crate_version": "1.8.1",
+  "crate_version": "1.8.2",
   "operations": [
     "probe",
     "zarr.inspect",
