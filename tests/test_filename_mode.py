@@ -155,6 +155,35 @@ class FilenameModeTests(unittest.TestCase):
             ["2001-01-01", "2001-01-09", "2001-01-17"],
         )
 
+    def test_filename_duplicate_time_is_rejected(self) -> None:
+        folder = ROOT / "duplicate-time-manual"
+        folder.mkdir()
+        for name in (
+            "GOSIF_GPP_2001001_Mean.tif",
+            "GOSIF_GPP_2001001_Xean.tif",
+        ):
+            (folder / name).touch()
+        with self.assertRaisesRegex(FilenameTimeError, "时间重复") as raised:
+            scan_filename_times(folder, template="doy", field_values=("2001", "001"))
+        message = str(raised.exception)
+        self.assertIn("2001-01-01", message)
+        for name in ("GOSIF_GPP_2001001_Mean.tif", "GOSIF_GPP_2001001_Xean.tif"):
+            self.assertIn(name, message)
+
+    def test_filename_duplicate_time_never_silently_deduped(self) -> None:
+        # Two files mapping to the same observation date with no other unique
+        # date field must never be silently accepted or de-duplicated; the
+        # scanner has to fail and leave resolution to the user.
+        folder = ROOT / "duplicate-time-auto"
+        folder.mkdir()
+        for name in (
+            "GOSIF_GPP_2001001_Mean.tif",
+            "GOSIF_GPP_2001001_Xean.tif",
+        ):
+            (folder / name).touch()
+        with self.assertRaises(FilenameTimeError):
+            scan_filename_times(folder)
+
     def test_manual_rule_allows_non_time_tokens_to_change(self) -> None:
         folder = ROOT / "manual"
         folder.mkdir()

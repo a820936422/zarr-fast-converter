@@ -25,7 +25,7 @@ import xarray as xr
 
 from fast_nc_zarr.application.services import SourceInspectionConfig, inspect_source
 from fast_nc_zarr.engine import convert
-from fast_nc_zarr.filename_mode import convert_filename
+from fast_nc_zarr.filename_mode import FilenameTimeError, convert_filename
 from fast_nc_zarr.models import Selection
 
 ROOT = Path(__file__).resolve().parent
@@ -442,6 +442,40 @@ def _case_filename_gap(spec: dict[str, Any], work_root: Path) -> dict[str, Any]:
     }
 
 
+def _case_filename_duplicate(spec: dict[str, Any], work_root: Path) -> dict[str, Any]:
+    links = work_root / "inputs" / "gosif-dup"
+    if links.exists():
+        for path in links.iterdir():
+            if path.is_symlink():
+                path.unlink()
+    links.mkdir(parents=True, exist_ok=True)
+    source_root = Path(spec["source_root"]).expanduser().resolve()
+    first = source_root / "GOSIF_GPP_2001001_Mean.tif"
+    if not first.is_file():
+        raise FileNotFoundError(f"real-data source is missing: {first}")
+    # Two distinct names of identical length map to the same DOY 2001001.
+    _replace_link(links / "GOSIF_GPP_2001001_Mean.tif", first)
+    _replace_link(links / "GOSIF_GPP_2001001_Xean.tif", first)
+    _replace_link(
+        links / "GOSIF_GPP_2001009_Mean.tif",
+        source_root / "GOSIF_GPP_2001009_Mean.tif",
+    )
+    try:
+        _inspect(links, spec)
+    except FilenameTimeError as exc:
+        message = str(exc)
+        if "时间重复" not in message or "2001-01-01" not in message:
+            raise AssertionError(f"unexpected duplicate rejection message: {message}")
+        return {
+            "cells": 0,
+            "diffs": 0,
+            "max_abs_error": 0.0,
+            "duplicate_rejected": True,
+            "error": message,
+        }
+    raise AssertionError("duplicate-time batch was accepted without rejection")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -477,6 +511,13 @@ def main(argv: list[str] | None = None) -> int:
                 "gosif_filename_gap_detection",
                 EXACT,
                 lambda: _case_filename_gap(specs["gosif_gpp"], args.work_root),
+            )
+        )
+        cases.append(
+            _run_case(
+                "gosif_filename_duplicate_rejection",
+                EXACT,
+                lambda: _case_filename_duplicate(specs["gosif_gpp"], args.work_root),
             )
         )
     if "mcd12c1" in specs:

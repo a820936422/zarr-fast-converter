@@ -440,7 +440,9 @@ def scan_filename_times(
         parsed = _date_from_parts(template, _parts_from_text(template, extracted, lengths))
         if parsed in seen:
             raise FilenameTimeError(
-                f"时间重复：{parsed.isoformat()} 出现在 {seen[parsed].name} 和 {name}。"
+                f"时间重复：{parsed.isoformat()} 同时对应 {seen[parsed]} 和 {path}；"
+                "filename 模式要求每个时间点恰好只有一个源文件，"
+                "请删除或重命名其中重复的文件后重试。"
             )
         seen[parsed] = path
         actual_pairs.append((path, parsed))
