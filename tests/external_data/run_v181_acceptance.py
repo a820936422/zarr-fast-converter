@@ -415,6 +415,33 @@ def _case_fluxsat(spec: dict[str, Any], work_root: Path) -> dict[str, Any]:
     }
 
 
+def _case_filename_gap(spec: dict[str, Any], work_root: Path) -> dict[str, Any]:
+    links = work_root / "inputs" / "gosif-gap"
+    if links.exists():
+        for path in links.iterdir():
+            if path.is_symlink():
+                path.unlink()
+    links.mkdir(parents=True, exist_ok=True)
+    source_root = Path(spec["source_root"]).expanduser().resolve()
+    for name in (
+        "GOSIF_GPP_2001001_Mean.tif",
+        "GOSIF_GPP_2001009_Mean.tif",
+        "GOSIF_GPP_2001025_Mean.tif",
+    ):
+        _replace_link(links / name, source_root / name)
+    inspection = _inspect(links, spec)
+    inventory = inspection.source_inventory
+    if not inventory.missing_time_keys:
+        raise AssertionError("expected a filename-mode missing time for 2001017")
+    return {
+        "cells": 0,
+        "diffs": 0,
+        "max_abs_error": 0.0,
+        "missing_time_keys": list(inventory.missing_time_keys),
+        "theoretical_time_count": len(inventory.times),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -443,6 +470,13 @@ def main(argv: list[str] | None = None) -> int:
                 "gosif_geotiff_filename_mode",
                 EXACT,
                 lambda: _case_gosif(specs["gosif_gpp"], args.work_root),
+            )
+        )
+        cases.append(
+            _run_case(
+                "gosif_filename_gap_detection",
+                EXACT,
+                lambda: _case_filename_gap(specs["gosif_gpp"], args.work_root),
             )
         )
     if "mcd12c1" in specs:
