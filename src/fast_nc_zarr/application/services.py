@@ -805,27 +805,40 @@ def run_fused_conversion(
 
     The conversion "output" is a lazy in-memory xarray Dataset handed directly
     to resampling, so the intermediate Zarr store is never written to disk.
-    Only the non-filename (complete/auto) source mode is eligible; filename
-    mode follows its own read/write scheduling and is not fused here.
+    Both the dimension-mode ``open_mfdataset`` combine and the filename-mode
+    per-file slice assembly are supported; filename mode keeps its own
+    read/fill/scale semantics identical to the on-disk intermediate.
     """
 
     from ..engine import convert_fused as core_convert_fused
+    from ..engine import convert_fused_filename as core_convert_fused_filename
 
     preview = preview_conversion(inspection, config)
     _assert_source_inventory_stable(preview.inventory)
     if preview.inventory.source_mode == "filename":
-        raise ValueError("融合转换不支持 filename 模式。")
-    result = core_convert_fused(
-        preview.inventory,
-        preview.selection,
-        variable_transforms=config.variable_transforms,
-        variable_names=config.variable_names,
-        chunks=config.chunks,
-        output_layout=config.output_layout,
-        cancel_event=cancel_event,
-        progress=False,
-        progress_callback=progress_callback,
-    )
+        result = core_convert_fused_filename(
+            preview.inventory,
+            preview.selection,
+            variable_transforms=config.variable_transforms,
+            variable_names=config.variable_names,
+            chunks=config.chunks,
+            output_layout=config.output_layout,
+            cancel_event=cancel_event,
+            progress=False,
+            progress_callback=progress_callback,
+        )
+    else:
+        result = core_convert_fused(
+            preview.inventory,
+            preview.selection,
+            variable_transforms=config.variable_transforms,
+            variable_names=config.variable_names,
+            chunks=config.chunks,
+            output_layout=config.output_layout,
+            cancel_event=cancel_event,
+            progress=False,
+            progress_callback=progress_callback,
+        )
     _assert_source_inventory_stable(preview.inventory)
     return result
 

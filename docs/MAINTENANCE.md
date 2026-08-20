@@ -272,7 +272,7 @@ pixi run release-candidate
 | Rust 核心测试 | ✅ 23 个通过 |
 | Rust 桌面测试 | ✅ 22 个通过 |
 | 前端 typecheck / build | ✅ 通过 |
-| Python 测试 | ✅ 292 passed，35 subtests passed，1 warning |
+| Python 测试 | ✅ 295 passed，35 subtests passed，1 warning |
 | `cross-backend-test` | ✅ 44 passed, 4 subtests passed |
 | sidecar-check | ✅ 已重建并校验通过（v1.7.8） |
 | Filename A/B smoke | ✅ 合成数据可重复执行 |
@@ -281,7 +281,7 @@ pixi run release-candidate
 | L1 真实数据专项 | ✅ T1–T5 全部 passed，T6 `validate-raw` 全树通过 |
 | `validate-raw` 全树 | ✅ 1240 文件 / 2 数据集 passed |
 | 后端自适应优化 | ✅ 存储感知 worker/batch 初始值（非硬上限）+ 重采样全局线程预算已落地 |
-| WorkerPool 全路径接入 | ✅ `direct_write`、文件名写入/检查、inspection、重分块两阶段与调参、重采样空间并行已接入；完整回归 292 passed |
+| WorkerPool 全路径接入 | ✅ `direct_write`、文件名写入/检查、inspection、重分块两阶段与调参、重采样空间并行已接入；完整回归 295 passed |
 | OnlineController 扩展 | ✅ 重分块阶段 1/2 与重采样空间并行动态 pending + `online_adjustments` 事件，pipeline manifest 顶层聚合 |
 | HardwareProfile 调度集成 | ✅ 实测带宽初始 worker（fast HDD 提升到 8）+ P/E affinity spec 已落地并有单测 |
 | scaling smoke 门禁 | ✅ `pixi run scaling-check` 通过（合成数据，workers 1/2） |
@@ -291,8 +291,9 @@ pixi run release-candidate
 | native 未打包标准整数 | ✅ `test_native_smoke.py` 33 passed（int16 inspect/conversion roundtrip + 打包 int16 拒绝），capability 矩阵已同步 |
 | native conservative 双后端 parity | ✅ native conservative/conservative_normed 已实现球面 cell-area overlap 与确定性边界触碰规则；Python/xESMF 路径按同一规则重算掩码与值，`test_resampling.py` 新增 skipna=False 边界触碰 parity 测试；v180 acceptance 9/9 通过（FLUXSAT conservative/conservative_normed 双后端值、NaN 掩码与 attrs 一致） |
 | PipelineFusion 单遍流式 | ✅ 融合路径已实现：eligible 且 ≤2 GiB crop / 非 filename / 串行或 auto 重采样时，转换以惰性内存 `xr.Dataset` 直入重采样，不写磁盘中间 crop；`write_amplification=1.0`、`intermediate_validation_skipped=True`、`stages.conversion.status=fused_in_memory`；`--no-fusion` 关闭保留磁盘 checkpoint/恢复语义；`tests/test_pipeline.py` 43 passed（含中间 store 跳过 + 与磁盘路径逐值 parity） |
-| 完整回归（当前基线） | ✅ `pixi run test` 292 passed、35 subtests、1 warning；`cross-backend-test` 44 passed、4 subtests；Rust 核心 23 passed |
+| 完整回归（当前基线） | ✅ `pixi run test` 295 passed、35 subtests、1 warning；`cross-backend-test` 44 passed、4 subtests；Rust 核心 23 passed |
 | filename 重复文件边界 | ✅ 同日期重复文件批次被 `scan_filename_times` 显式拒绝（`FilenameTimeError`，错误含两文件完整路径与处理指引），绝不静默去重；新增单测 2 个 + 真实数据 acceptance `gosif_filename_duplicate_rejection`（6/6 passed） |
+| filename 模式 PipelineFusion | ✅ filename 模式 raw 输入在 `_fusion_eligible` 统一判定（crop ≤ 2 GiB、`space_workers∈{1,auto}`）下以惰性内存数据集直入重采样，不写中间 `source-crop.zarr`（`write_amplification=1.0`、`fused_in_memory`）；`build_filename_fused_dataset` 逐文件 `_prepare_filename_data` 语义保证与磁盘路径逐值一致（含缺日 fill）；新增 `tests/test_pipeline.py` filename fusion 单遍/回退 3 个测试通过 |
 
 ### 6.2 已知问题
 
@@ -305,7 +306,7 @@ pixi run release-candidate
 7. **硬件条件暂不具备（重要约束）**：目前没有更大的真实数据窗口，也没有独立 SSD/NVMe 设备，因此 v1.8.1 开发文档 3.3 的「真实设备读写阶段分离验证」与「真实数据 scaling 基准外业验证」被阻塞，无法按完成定义推进；
    - 现阶段仅能以备份语料（`/run/media/owen/HDD/数据备份/`）的小窗口与同设备完成初步 A/B（报告见 `tests/external_data/results/v181-scaling/`），正式收益仍需更大窗口与独立写入设备验证；
    - 上述两项在开发文档中保持待办并明确「硬件前置」状态，待硬件条件具备后再执行并纳入发布门禁；
-   - 该约束不影响已完成的格式验证、native 能力与全量回归（292 passed）。
+   - 该约束不影响已完成的格式验证、native 能力与全量回归（295 passed）。
 
 > 后续待处理内容统一记录在 [v1.8.1 开发文档](v1.8.1-development.md)。
 
@@ -316,7 +317,7 @@ pixi run release-candidate
 - **v1.7.8 后端优化分析已完成，P0 代码优化已落地**：存储感知 worker/batch **初始值**（仅作起始猜测，调优仍探索完整 worker 范围）、重采样全局线程预算已实现并通过测试。
 - **v1.7.9 后端优化已实施**：已完成 HardwareProfile（含 NUMA/P/E）、PerformanceModel、重分块存储感知初始值、WorkerPool 工具类、文件亲和排序、OnlineController 可观测与保守调整、CPU affinity、PipelineFusion eligibility 标记；剩余项列入 [v1.8.1 开发文档](v1.8.1-development.md)。
 - **v1.8.0 开发基线已提交并推送**：v1.8.0 完成项已收敛进版本历史（commit `18bf7bb`），包括 WorkerPool 全路径、HDD 读写阶段分离、PipelineFusion、OnlineController、native 整数、HDF-EOS Grid/Swath、native conservative parity、scaling 基础设施。
-- **v1.8.1 待办推进（开发中）**：版本已提升至 1.8.1；剩余项转入 [v1.8.1 开发文档](v1.8.1-development.md)，重点为真实设备/真实数据验证、HDF-EOS/GeoTIFF fixture、剩余 native 能力扩展与发布门禁。其中「真实设备读写阶段分离验证」与「真实数据 scaling 外业基准」两项因当前缺少更大数据窗口与独立 SSD/NVMe 硬件被阻塞（见 6.2 第 7 条），保持待办，待硬件条件具备后再推进并纳入发布门禁。
+- **v1.8.1 待办推进（开发中）**：版本已提升至 1.8.1；剩余项转入 [v1.8.1 开发文档](v1.8.1-development.md)，重点为真实设备/真实数据验证、HDF-EOS/GeoTIFF fixture、剩余 native 能力扩展与发布门禁。其中「真实设备读写阶段分离验证」与「真实数据 scaling 外业基准」两项因当前缺少更大数据窗口与独立 SSD/NVMe 硬件被阻塞（见 6.2 第 7 条），保持待办，待硬件条件具备后再推进并纳入发布门禁。filename 重复文件边界与 filename 模式 PipelineFusion 两项已实现并纳入已验证状态。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。

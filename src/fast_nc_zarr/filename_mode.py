@@ -1754,6 +1754,126 @@ def _transformed_attrs(
     return attrs
 
 
+def build_filename_fused_dataset(
+    inventory: Inventory,
+    selection: Selection,
+    *,
+    variable_transforms: dict[str, VariableTransform] | None = None,
+    variable_names: dict[str, str] | None = None,
+    chunks: tuple[int, int, int] | None = None,
+    output_layout: OutputLayout | None = None,
+    cancel_event=None,
+) -> object:
+    """Build the single-pass fusion crop for filename mode, without Zarr.
+
+    This mirrors ``filename_direct_write`` + ``_initialize_filename_zarr`` value
+    and attribute semantics so the in-memory crop is value-for-value equivalent
+    to the on-disk ``source-crop.zarr`` intermediate the disk path would write:
+    per-time-slice reads go through the same ``_prepare_filename_data``
+    transform (missing mask, output dtype cast, scale factor, output fill) and
+    variables carry the same ``_transformed_attrs`` including the fill markers
+    the resampling engine uses to mask missing values.
+
+    The returned xarray Dataset is Dask-backed (lazy) so the caller owns its
+    lifecycle and must close it.  It is memory-bounded by the fusion crop cap
+    already enforced by the pipeline eligibility check.
+    """
+
+    import dask.array as da
+    import xarray as xr
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("任务已取消。")
+    variable_transforms = variable_transforms or {}
+    variable_names = variable_names or {}
+    source_map = source_path_by_time(inventory)
+    selected_keys = inventory.time_keys[selection.time_start : selection.time_stop]
+    nt, ny, nx = selection.shape
+    lat_values = inventory.lat_values[selection.lat_start : selection.lat_stop]
+    lon_values = inventory.lon_values[selection.lon_start : selection.lon_stop]
+    reverse_lat = output_layout is not None and "lat" in output_layout.axis_reversals
+    reverse_lon = output_layout is not None and "lon" in output_layout.axis_reversals
+    if reverse_lat:
+        lat_values = lat_values[::-1]
+    if reverse_lon:
+        lon_values = lon_values[::-1]
+
+    with _normalized_filename_dataset(
+        inventory.reference_file, inventory.source_engine
+    ) as (ref, _):
+        lat_attrs = ref.lat.attrs.copy()
+        lon_attrs = ref.lon.attrs.copy()
+        ref_attrs = dict(ref.attrs)
+        scalar_coords = [
+            (name, xr.Variable((), coordinate.values, attrs=coordinate.attrs.copy()))
+            for name, coordinate in ref.coords.items()
+            if name not in {"time", "lat", "lon"} and not coordinate.dims
+        ]
+
+    coords = {
+        "time": xr.Variable(
+            ("time",),
+            inventory.times[selection.time_start : selection.time_stop],
+            attrs={"source": "filename"},
+        ),
+        "lat": xr.Variable(("lat",), lat_values, attrs=lat_attrs),
+        "lon": xr.Variable(("lon",), lon_values, attrs=lon_attrs),
+    }
+    for name, coordinate in scalar_coords:
+        coords[name] = coordinate
+
+    variables = {}
+    for name in selection.variables:
+        spec = inventory.variables[name]
+        transform = variable_transforms.get(name)
+        output_name = variable_names.get(name, name)
+        dtype = _output_dtype(spec, transform)
+        fill = _missing_output_value(
+            spec,
+            transform,
+            dtype,
+            require_missing=bool(inventory.missing_time_keys),
+        )
+        block = chunks or (max(1, min(nt, 1)), max(1, min(ny, 1)), max(1, min(nx, 1)))
+        arrays = np.empty((nt, ny, nx), dtype=dtype)
+        for row in range(nt):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("任务已取消。")
+            source = source_map.get(selected_keys[row])
+            if source is None:
+                arrays[row].fill(fill)
+                continue
+            with _normalized_filename_dataset(source, inventory.source_engine) as (ds, _):
+                raw = np.asarray(
+                    ds[name]
+                    .isel(
+                        lat=slice(selection.lat_start, selection.lat_start + ny),
+                        lon=slice(selection.lon_start, selection.lon_start + nx),
+                    )
+                    .values
+                )
+            if reverse_lat:
+                raw = np.flip(raw, axis=0)
+            if reverse_lon:
+                raw = np.flip(raw, axis=1)
+            arrays[row] = _prepare_filename_data(raw, spec, transform, dtype, fill)
+        variables[output_name] = xr.Variable(
+            ("time", "lat", "lon"),
+            da.from_array(arrays, chunks=block),
+            attrs=_transformed_attrs(spec, transform, fill),
+        )
+
+    dataset_attrs = dict(ref_attrs)
+    dataset_attrs.update({
+        "source_mode": "filename",
+        "filename_time_template": inventory.filename_template or "",
+        "filename_step_days": inventory.filename_step_days,
+        "filename_annual_steps": [list(item) for item in inventory.filename_annual_steps],
+        "source_engine": inventory.source_engine,
+    })
+    return xr.Dataset(variables, coords=coords, attrs=dataset_attrs)
+
+
 def _initialize_filename_zarr(
     inventory: Inventory,
     selection: Selection,

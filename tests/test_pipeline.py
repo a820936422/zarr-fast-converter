@@ -898,6 +898,117 @@ class PipelineTests(unittest.TestCase):
             "回退路径应保留中间 source-crop.zarr",
         )
 
+    def _filename_source(self) -> Path:
+        root = ROOT / "filename-src"
+        if root.exists():
+            return root
+        root.mkdir(parents=True, exist_ok=True)
+        lat = np.asarray([0.025 + 0.025 * index for index in range(16)], dtype="float64")
+        lon = np.asarray([-0.225 + 0.025 * index for index in range(18)], dtype="float64")
+        for index, doy in enumerate(("2001001", "2001009", "2001021")):
+            values = (
+                np.arange(lat.size * lon.size, dtype="float32").reshape(lat.size, lon.size)
+                + 100 * index
+            )
+            dataset = xr.Dataset(
+                {"value": (("lat", "lon"), values)},
+                coords={"lat": lat, "lon": lon},
+            )
+            dataset.to_netcdf(root / f"data_{doy}.nc", engine="h5netcdf")
+            dataset.close()
+        return root
+
+    def _filename_config(self, output: Path, *, fusion: bool = True, space_workers=1) -> PipelineConfig:
+        base = self._config(output)
+        return replace(
+            base,
+            general=replace(
+                base.general,
+                time_start="2001-01-01",
+                time_end="2001-01-21",
+                lat_min=0.05,
+                lat_max=0.35,
+                lon_min=-0.20,
+                lon_max=0.20,
+                fusion=fusion,
+            ),
+            operations=PipelineOperations(resample=True, rechunk=False, recompress=False),
+            resampling=replace(base.resampling, space_workers=space_workers),
+        )
+
+    def test_filename_fusion_single_pass_skips_intermediate_store(self) -> None:
+        inspection = inspect_source(SourceInspectionConfig(self._filename_source(), workers=1))
+        self.assertEqual(inspection.inventory.source_mode, "filename")
+        config = self._filename_config(ROOT / "filename-fused.zarr")
+        self.assertTrue(preview_pipeline(inspection, config).streaming_fusion_eligible)
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        pipeline_root = Path(result["manifest"]).parent
+        self.assertEqual(manifest["fusion"]["eligible"], True)
+        self.assertEqual(manifest["fusion"]["stage"], "conversion->resampling")
+        self.assertEqual(manifest["fusion"]["intermediate_validation_skipped"], True)
+        self.assertEqual(manifest["stages"]["conversion"]["status"], "fused_in_memory")
+        self.assertEqual(manifest["stages"]["conversion"]["metrics"]["fused"], True)
+        self.assertEqual(manifest["logical_io"]["temporary_write_bytes"], 0)
+        self.assertEqual(manifest["logical_io"]["write_amplification"], 1.0)
+        self.assertFalse(
+            (pipeline_root / "source-crop.zarr").exists(),
+            "filename 融合单遍不应创建中间 source-crop.zarr",
+        )
+        fused_output = xr.open_zarr(config.general.output, consolidated=False)
+        try:
+            fused_values = fused_output["value"].values.copy()
+            fused_time = fused_output["time"].values.copy()
+        finally:
+            fused_output.close()
+        # The filename fused single-pass product must equal the on-disk
+        # intermediate path value-for-value (same config, fusion disabled).
+        twin = self._filename_config(ROOT / "filename-disk.zarr", fusion=False)
+        result_twin = run_pipeline(inspection, twin, progress=False)
+        twin_manifest = json.loads(Path(result_twin["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(twin_manifest["stages"]["conversion"]["status"], "validated")
+        twin_output = xr.open_zarr(twin.general.output, consolidated=False)
+        try:
+            np.testing.assert_allclose(
+                twin_output["value"].values,
+                fused_values,
+                rtol=0.0,
+                atol=1e-6,
+                equal_nan=True,
+            )
+            np.testing.assert_array_equal(twin_output["time"].values, fused_time)
+        finally:
+            twin_output.close()
+
+    def test_filename_fusion_falls_back_for_parallel_resampling(self) -> None:
+        inspection = inspect_source(SourceInspectionConfig(self._filename_source(), workers=1))
+        config = self._filename_config(ROOT / "filename-fallback.zarr", space_workers=4)
+        self.assertTrue(preview_pipeline(inspection, config).streaming_fusion_eligible)
+        result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["fusion"]["intermediate_validation_skipped"], False)
+        self.assertEqual(manifest["stages"]["conversion"]["status"], "validated")
+        self.assertGreaterEqual(manifest["logical_io"]["write_amplification"], 1.0)
+        self.assertTrue(
+            (Path(result["manifest"]).parent / "source-crop.zarr").exists()
+        )
+
+    def test_filename_fusion_falls_back_when_crop_cap_exceeded(self) -> None:
+        inspection = inspect_source(SourceInspectionConfig(self._filename_source(), workers=1))
+        config = self._filename_config(ROOT / "filename-crop-cap.zarr")
+        self.assertTrue(preview_pipeline(inspection, config).streaming_fusion_eligible)
+        with patch(
+            "fast_nc_zarr.pipeline.engine._FUSION_MAX_CROP_BYTES",
+            1,  # any positive crop exceeds the cap -> fall back to disk
+        ):
+            result = run_pipeline(inspection, config, progress=False)
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["fusion"]["intermediate_validation_skipped"], False)
+        self.assertEqual(manifest["stages"]["conversion"]["status"], "validated")
+        self.assertTrue(
+            (Path(result["manifest"]).parent / "source-crop.zarr").exists()
+        )
+
     def test_auto_pipeline_conversion_time_chunk_uses_resampling_batch(self) -> None:
         inspection = inspect_source(
             SourceInspectionConfig(

@@ -377,6 +377,96 @@ def convert_fused(
     return plan, metrics, ds
 
 
+def convert_fused_filename(
+    inventory: Inventory,
+    selection: Selection,
+    *,
+    variable_transforms: dict[str, VariableTransform] | None = None,
+    variable_names: dict[str, str] | None = None,
+    chunks: tuple[int, int, int] | None = None,
+    output_layout: OutputLayout | None = None,
+    cancel_event=None,
+    progress: bool = True,
+    progress_callback=None,
+) -> tuple[ConversionPlan, dict, object]:
+    """Build the single-pass fused conversion dataset for filename mode.
+
+    Filename mode contributes one reconstructed time slice per source file, so
+    the lazy crop is assembled from per-file windows instead of an
+    ``open_mfdataset`` combine.  Value/attribute semantics stay identical to
+    the on-disk ``source-crop.zarr`` intermediate (see
+    ``filename_mode.build_filename_fused_dataset``).  The returned Dataset is
+    owned by the caller and must be closed.
+    """
+
+    from .filename_mode import build_filename_fused_dataset
+
+    import xarray as xr
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("任务已取消。")
+    fixed_layout = chunks is not None or output_layout is not None
+    plan_chunks = chunks
+    placeholder_output = Path(inventory.input_dir).expanduser().resolve() / ".fused-plan"
+    if plan_chunks is None and output_layout is not None:
+        plan_chunks = output_layout_plan_chunks(selection, output_layout)
+    plan = resolve_conversion_plan(
+        inventory,
+        selection,
+        placeholder_output,
+        chunks=plan_chunks,
+        max_workers=1,
+        reserve_gib=1.0,
+        resource_budget=effective_resource_budget(
+            source=inventory.input_dir,
+            output=placeholder_output,
+            reserve_memory_bytes=0,
+            requested=1 if not fixed_layout else None,
+        ),
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("任务已取消。")
+    started = time.perf_counter()
+    if plan_chunks is None:
+        nt, ny, nx = selection.shape
+        plan_chunks = (
+            max(1, min(nt, plan.chunk_time)),
+            max(1, min(ny, plan.chunk_lat)),
+            max(1, min(nx, plan.chunk_lon)),
+        )
+    ds = build_filename_fused_dataset(
+        inventory,
+        selection,
+        variable_transforms=variable_transforms,
+        variable_names=variable_names,
+        chunks=plan_chunks,
+        output_layout=output_layout,
+        cancel_event=cancel_event,
+    )
+    assert isinstance(ds, xr.Dataset)
+    elapsed = time.perf_counter() - started
+    logical = selected_output_logical_bytes(
+        inventory,
+        selection,
+        variable_transforms,
+        output_layout,
+    )
+    if progress_callback is not None:
+        progress_callback(logical, logical, logical, "融合转换：内存数据集已就绪")
+    metrics: dict[str, object] = {
+        "elapsed": elapsed,
+        "logical_bytes": logical,
+        "throughput_mib_s": logical / max(elapsed, 1e-9) / 1024**2,
+        "fused": True,
+        "intermediate_store": None,
+        "backend": "python",
+        "backend_fallback": False,
+        "backend_fallback_reason": None,
+        "source_mode": "filename",
+    }
+    return plan, metrics, ds
+
+
 def convert(
     inventory: Inventory,
     selection: Selection,

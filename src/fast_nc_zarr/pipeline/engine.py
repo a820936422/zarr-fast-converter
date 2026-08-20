@@ -504,6 +504,25 @@ def _fusion_crop_bytes(inspection, plan: PipelinePlan) -> int:
     return int(nt) * int(nlat) * int(nlon) * int(itemsize)
 
 
+def _fusion_eligible(config, plan: PipelinePlan, inspection) -> bool:
+    """Decide whether the conversion can fuse in-memory into resampling.
+
+    Both the dimension-mode and filename-mode conversion paths support the
+    single-pass crop; filename mode additionally inherits the same crop-bytes
+    and serial-resampling memory constraints.
+    """
+
+    return bool(
+        config.general.fusion
+        and plan.streaming_fusion_eligible
+        and (
+            config.resampling.space_workers == 1
+            or config.resampling.space_workers == "auto"
+        )
+        and _fusion_crop_bytes(inspection, plan) <= _FUSION_MAX_CROP_BYTES
+    )
+
+
 def _check_raw_storage_capacity(inspection, plan: PipelinePlan, paths: PipelinePaths) -> None:
     temporary_estimate, final_estimate = _raw_storage_estimate(inspection, plan)
     temporary_base = paths.root.parent
@@ -1417,16 +1436,7 @@ def run_pipeline(
         conversion = config.conversion
         conversion_is_final = not plan.needs_resample and not plan.finalization_required
         resampling_is_final = plan.needs_resample and not plan.finalization_required
-        fused = (
-            config.general.fusion
-            and plan.streaming_fusion_eligible
-            and (
-                config.resampling.space_workers == 1
-                or config.resampling.space_workers == "auto"
-            )
-            and inspection.source_inventory.source_mode != "filename"
-            and _fusion_crop_bytes(inspection, plan) <= _FUSION_MAX_CROP_BYTES
-        )
+        fused = _fusion_eligible(config, plan, inspection)
         final_target = Path(config.general.output).expanduser().resolve()
         if conversion_is_final or resampling_is_final:
             validate_publish_target(
