@@ -92,6 +92,7 @@ import type {
   View,
 } from "./lib/types";
 import { Icon } from "./components/Icon";
+import { ErrorBanner } from "./components/ErrorBanner";
 import { InspectionProgressCard, progressStatusLabel } from "./components/InspectionProgressCard";
 import { StructuredPipelinePlan } from "./components/StructuredPipelinePlan";
 import { StructuredTimeInspection } from "./components/StructuredTimeInspection";
@@ -1173,7 +1174,7 @@ function App() {
             </section>
           </div>
         )}
-        {(error || backendError) && <div className="error-toast" role="alert"><Icon name="terminal" size={17} /><span>{error || backendError}</span><button type="button" onClick={() => { setError(null); setBackendError(null); }}>×</button></div>}
+        {(error || backendError) && <ErrorBanner message={error || backendError} onClose={() => { setError(null); setBackendError(null); }} />}
       </main>
     </div>
   );
