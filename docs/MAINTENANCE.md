@@ -296,6 +296,7 @@ pixi run release-candidate
 | filename 模式 PipelineFusion | ✅ filename 模式 raw 输入在 `_fusion_eligible` 统一判定（crop ≤ 2 GiB、`space_workers∈{1,auto}`）下以惰性内存数据集直入重采样，不写中间 `source-crop.zarr`（`write_amplification=1.0`、`fused_in_memory`）；`build_filename_fused_dataset` 逐文件 `_prepare_filename_data` 语义保证与磁盘路径逐值一致（含缺日 fill）；新增 `tests/test_pipeline.py` filename fusion 单遍/回退 3 个测试通过 |
 | v1.8.2 真实数据融合收敛 | ✅ `run_v182_acceptance.py` 2/2：GOSIF GeoTIFF 3 步与 GLASS HDF4 打包 int16（含缺日 2001017）4 步融合 vs 磁盘路径 EXACT parity；修复 CF 打包源上 `build_filename_fused_dataset` 的 `xr.decode_cf` 解码缺口（fill→NaN、物理值，等价磁盘重开 `mask_and_scale=True`） |
 | v1.8.2 格式盲区 fixture | ✅ `run_v182_acceptance.py` 3/3：旋转仿射 GeoTIFF 接受并按规则网格重建（值逐像素 parity）、多 band GeoTIFF 确定性拒绝（单 band 约束，reason 记录）、int16+scale/add_offset 打包转换保留打包值与 CF attrs（重采样侧解码由 GLASS case 覆盖） |
+| v1.8.3 时间维度识别 | ✅ HDF-EOS `CoreMetadata.0` RANGEDATETIME 解析（`coverage_start/coverage_end/internal_time_source` + 报告/一致性 warning）；生产时间戳 13/14 位字段抗歧义（MCD12C1 自动模板成功）；年度产品时间尺度（每年 1 点，MCD12C1 24 年点/0 缺日）；日历识别面（noleap 族支持、360_day 明确拒绝）；`run_v183_acceptance.py` `mcd12c1_auto_time_recognition` 1/1 |
 
 ### 6.2 已知问题
 
@@ -322,6 +323,7 @@ pixi run release-candidate
 - **v1.8.1 已完成并收敛**：版本提升至 1.8.1 并完成发布门禁；完成真实 HDF4-EOS/GeoTIFF/HDF-EOS 小窗验收 6/6、filename 缺日检测与重复文件边界（拒绝语义）、filename 模式 PipelineFusion 单遍流式；全量回归 295 保持绿色。剩余硬件前置项（真实设备读写阶段分离验证、真实数据 scaling 外业基准）因缺少更大数据窗口与独立 SSD/NVMe 被阻塞（见 6.2 第 7 条），已承接至 [v1.8.3 开发文档](v1.8.3-development.md) 3.4。
 - **v1.8.2 已完成并收敛**：版本提升至 1.8.2；完成真实数据融合收敛（`run_v182_acceptance.py` 5/5：GOSIF/GLASS 融合 EXACT parity，含 CF 解码修复）与格式盲区 fixture（旋转/多 band/打包）；模块拆分（3.3）按预案推迟；全量回归 295 保持绿色；发布门禁通过（local `Fast NC Zarr_1.8.2_amd64.deb`）；v1.8.1 开发文档退役。
 - **v1.8.3 基线已建立**：版本提升至 1.8.3；v1.8.2 开发文档退役，开发方案见 [v1.8.3 开发文档](v1.8.3-development.md)，重点为时间维度信息识别能力加强。
+- **v1.8.3 待办推进（开发中）**：时间识别模块 A/B/C 已实现（HDF-EOS CoreMetadata 时间、生产时间戳抗歧义、年度时间尺度、日历决策；`run_v183_acceptance.py` 1/1）；剩余发布门禁与收尾（3.5）。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。
@@ -342,7 +344,7 @@ pixi run release-candidate
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
-| 1.8.3 | 2026-08-20 | 版本提升至 1.8.3；v1.8.2 完成项收敛进本文档；开发方案见 `docs/v1.8.3-development.md`，重点为时间维度信息识别能力加强（HDF-EOS CoreMetadata 时间解析、filename 自动推断抗歧义、日历识别面） |
+| 1.8.3 | 2026-08-20 | 版本提升至 1.8.3；完成时间维度信息识别能力加强：HDF-EOS `CoreMetadata.0` RANGEDATETIME 解析（coverage 字段 + 一致性 warning）、生产时间戳 13/14 位字段抗歧义（MCD12C1 自动模板成功）、年度产品时间尺度（每年 1 点）、日历识别面（noleap 族支持、360_day 明确拒绝）；`run_v183_acceptance.py` 1/1；全量回归 301 passed；发布门禁通过（local `Fast NC Zarr_1.8.3_amd64.deb`） |
 | 1.8.2 | 2026-08-20 | 版本提升至 1.8.2 并完成：真实数据融合收敛（`run_v182_acceptance.py` 5/5，含 CF 解码修复）、格式盲区 fixture 验收（旋转/多 band/打包）、发布门禁（sidecar/tauri-build/release-candidate，local `Fast NC Zarr_1.8.2_amd64.deb`）；模块拆分按预案推迟；全量回归 295 保持绿色；v1.8.1 开发文档退役 |
 | 1.8.1 | 2026-08-20 | 版本提升至 1.8.1 并完成：真实 HDF4-EOS/GeoTIFF/HDF-EOS 小窗验收 6/6、filename 缺日检测与重复文件边界（拒绝语义）、filename 模式 PipelineFusion、发布门禁（sidecar/typecheck/build/tauri-build/release-candidate）；全量回归 295 保持绿色；硬件前置项（真实设备 staging/scaling 外业）承接至 v1.8.2 |
 | 1.8.0 | 2026-08-20 | v1.8.0 开发基线提交并推送（commit `18bf7bb`）：WorkerPool 全路径、HDD 读写阶段分离、PipelineFusion、OnlineController、native 整数、HDF-EOS Grid/Swath、native conservative parity（v180 acceptance 9/9）、scaling 基础设施；开发阶段暂不打包上传 |
