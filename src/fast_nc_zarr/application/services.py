@@ -169,6 +169,14 @@ class InspectionResult:
                 "schema_version": 3,
                 "kind": self.kind,
                 "report": self.report,
+                "excluded_extra_dimension_variables": list(
+                    info.excluded_extra_dimension_variables
+                ),
+                "coverage": {
+                    "start": info.coverage_start,
+                    "end": info.coverage_end,
+                    "source": info.internal_time_source,
+                },
                 "source": {
                     "path": str(self.path),
                     "file_count": len(info.files),

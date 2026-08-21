@@ -92,6 +92,7 @@ export type InspectionResult = {
   warnings: string[];
   snapshot: Record<string, unknown>;
   inspection_snapshot_path?: string;
+  excluded_extra_dimension_variables?: string[];
 };
 
 export type PipelinePayload = Record<string, unknown> & { output: string };

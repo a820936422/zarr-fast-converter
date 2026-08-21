@@ -100,6 +100,7 @@ type VariableDetail = {
   dtype: string;
   dims: string[];
   attrs: Record<string, unknown>;
+  excluded?: boolean;
 };
 
 type VariableTransformDraft = {
@@ -1355,20 +1356,35 @@ function App() {
   const runningTasks = useMemo(() => tasks.filter((task) => task.status === "running" || task.status === "cancelling"), [tasks]);
   const supported = (operation: string) => nativeCapability?.capabilities.find((item) => item.operation === operation);
   const variableDetails = useMemo<VariableDetail[]>(() => {
-    const raw = inspection?.snapshot.variables;
-    if (!Array.isArray(raw)) return [];
-    return raw.flatMap((item) => {
-      const record = asRecord(item);
-      if (!record || record.is_coord === true || typeof record.name !== "string" || !record.name) return [];
-      return [{
-        name: record.name,
-        dtype: typeof record.dtype === "string" ? record.dtype : "unknown",
-        dims: Array.isArray(record.dims) ? record.dims.filter((value): value is string => typeof value === "string") : [],
-        attrs: asRecord(record.attrs) || {},
-      }];
-    });
+    const snapshot = inspection?.snapshot;
+    const raw = snapshot?.["variables"];
+    const items: VariableDetail[] = [];
+    if (Array.isArray(raw)) {
+      items.push(...raw.flatMap((item) => {
+        const record = asRecord(item);
+        if (!record || record.is_coord === true || typeof record.name !== "string" || !record.name) return [];
+        return [{
+          name: record.name,
+          dtype: typeof record.dtype === "string" ? record.dtype : "unknown",
+          dims: Array.isArray(record.dims) ? record.dims.filter((value): value is string => typeof value === "string") : [],
+          attrs: asRecord(record.attrs) || {},
+        }];
+      }));
+    }
+    // Extra-dimension variables (beyond time/lat/lon) are excluded from the
+    // canonical conversion but must stay visible instead of disappearing.
+    const excludedRaw = snapshot?.["excluded_extra_dimension_variables"];
+    if (Array.isArray(excludedRaw)) {
+      for (const name of excludedRaw) {
+        if (typeof name === "string" && !items.some((item) => item.name === name)) {
+          items.push({ name, dtype: "—", dims: [], attrs: {}, excluded: true });
+        }
+      }
+    }
+    return items;
   }, [inspection]);
-  const variableOptions = useMemo(() => variableDetails.map((item) => item.name), [variableDetails]);
+  const excludedVariables = useMemo(() => variableDetails.filter((item) => item.excluded === true), [variableDetails]);
+  const variableOptions = useMemo(() => variableDetails.filter((item) => !item.excluded).map((item) => item.name), [variableDetails]);
 
   useEffect(() => {
     setSelectedVariables((current) => {
@@ -1640,9 +1656,11 @@ function App() {
                     <div className="advanced-panel variable-settings-panel">
                       <div className="panel-label"><Icon name="layers" size={15} />变量选择与处理参数</div>
                       <p className="variable-settings-help">可选择变量、重命名输出变量，并覆盖源文件中的缺失值、缩放因子和偏移量。留空表示沿用源元数据或默认行为。</p>
+                      {excludedVariables.length > 0 && <p className="variable-settings-help" style={{ color: "var(--text-muted, inherit)" }}>另有 {excludedVariables.length} 个变量因含额外维度（非 time/lat/lon）被排除，无法参与转换：{excludedVariables.map((item) => item.name).join("、")}。</p>}
                       <div className="variable-settings-table">
                         <div className="variable-settings-head"><span>处理</span><span>源变量</span><span>输出变量名</span><span>缺失值</span><span>缩放因子</span><span>偏移量</span><span>输出填充值</span><span>重采样</span></div>
                         {variableDetails.map((detail) => {
+                          const isExcluded = detail.excluded === true;
                           const draft = variableTransforms[detail.name] || EMPTY_VARIABLE_TRANSFORM;
                           const resampleDraft = variableResampling[detail.name] || DEFAULT_VARIABLE_RESAMPLING;
                           const sourceFill = attributeText(detail.attrs, "_FillValue") || attributeText(detail.attrs, "missing_value");
@@ -1650,14 +1668,18 @@ function App() {
                           const sourceOffset = attributeText(detail.attrs, "add_offset");
                           return (
                             <div className="variable-settings-row" key={detail.name}>
-                              <label className="variable-enabled"><input type="checkbox" checked={selectedVariables.includes(detail.name)} onChange={(event) => setSelectedVariables((current) => event.target.checked ? [...current, detail.name] : current.filter((item) => item !== detail.name))} /><span className="fake-check" /></label>
-                              <div className="variable-source"><strong>{detail.name}</strong><small>{detail.dtype} · {detail.dims.join(" × ") || "未知维度"}</small></div>
+                              <label className="variable-enabled"><input type="checkbox" disabled={isExcluded} checked={!isExcluded && selectedVariables.includes(detail.name)} onChange={(event) => setSelectedVariables((current) => event.target.checked ? [...current, detail.name] : current.filter((item) => item !== detail.name))} /><span className="fake-check" /></label>
+                              <div className="variable-source"><strong>{detail.name}</strong><small>{isExcluded ? "额外维度已排除" : `${detail.dtype} · ${detail.dims.join(" × ") || "未知维度"}`}</small></div>
+                              {isExcluded ? <div className="variable-excluded-note" style={{ gridColumn: "span 6", color: "inherit", opacity: 0.75 }}>该变量含有额外维度（非 time/lat/lon），当前版本无法转换；如需处理请先将其预处理为逐类二维变量。</div> : (
+                                <>
                               <input aria-label={`${detail.name} 输出变量名`} value={variableNames[detail.name] ?? detail.name} onChange={(event) => setVariableNames((current) => ({ ...current, [detail.name]: event.target.value }))} />
                               <input aria-label={`${detail.name} 缺失值`} value={draft.fillValues} onChange={(event) => updateVariableTransform(detail.name, { fillValues: event.target.value })} placeholder={sourceFill ? `源: ${sourceFill}` : "不处理"} />
                               <input aria-label={`${detail.name} 缩放因子`} value={draft.scaleFactor} onChange={(event) => updateVariableTransform(detail.name, { scaleFactor: event.target.value })} placeholder={sourceScale ? `源: ${sourceScale}` : "不额外缩放"} />
                               <input aria-label={`${detail.name} 偏移量`} value={draft.addOffset} onChange={(event) => updateVariableTransform(detail.name, { addOffset: event.target.value })} placeholder={sourceOffset ? `源: ${sourceOffset}` : "不额外偏移"} />
                               <input aria-label={`${detail.name} 输出填充值`} value={draft.outputFill} onChange={(event) => updateVariableTransform(detail.name, { outputFill: event.target.value })} placeholder="浮点默认 NaN" />
                               <button className="table-action" type="button" disabled={!effectiveResample} onClick={() => openVariableResampling(detail.name)}>{resampleDraft.inherit ? "继承全局" : resampleDraft.method}</button>
+                                </>
+                              )}
                             </div>
                           );
                         })}
