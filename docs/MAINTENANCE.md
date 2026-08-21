@@ -4,7 +4,7 @@
 > **约定：每次版本更新时，必须同步更新本文档的“版本状态”与“版本历史”章节。**
 
 - **最近更新**：2026-08-20
-- **当前版本**：v1.8.3
+- **当前版本**：v1.8.4
 - **当前分支**：`develop`
 - **仓库**：`https://github.com/a820936422/zarr-fast-converter.git`
 
@@ -208,7 +208,7 @@ pixi run scaling-check
    - 更新本维护文档的“当前版本”“版本状态”“版本历史”。
    - 如架构、命令、模块或发布范围变化，同步更新本维护文档。
    - 如有重大审查/路线图，更新或新增 `docs/` 下对应文档。
-   - 如有待办/路线图变更，同步更新 `docs/v1.8.3-development.md`。
+   - 如有待办/路线图变更，同步更新 `docs/v1.8.4-development.md`。
 3. **运行完整检查**：
 
 ```bash
@@ -304,15 +304,15 @@ pixi run release-candidate
 1. ~~CI workflow 引用未定义的 pixi 任务~~ 已修复：`pixi.toml` 已新增 `cross-backend-test`，本地运行通过。
 2. ~~本地 sidecar 过期~~ 已修复：已执行 `pixi run desktop-sidecar` 并重新校验通过。
 3. ~~前端浏览器预览 fallback 版本号为 1.7.5~~ 已修复：`App.tsx` 改为从 `package.json` 读取版本。
-4. **文档/维护状态**：历史版本专项文档已整合清理；当前活跃文档为 `docs/MAINTENANCE.md`、`docs/README.md` 和 `docs/v1.8.3-development.md`（v1.8.1/v1.8.2 开发文档已完成并退役，历史由 git 保留）。
+4. **文档/维护状态**：历史版本专项文档已整合清理；当前活跃文档为 `docs/MAINTENANCE.md`、`docs/README.md` 和 `docs/v1.8.4-development.md`（v1.8.1~v1.8.3 开发文档已完成并退役，历史由 git 保留）。
 5. **Python 可维护性**：`ruff`/`python-lint` 已落地并修复 F/E9 问题；大模块拆分仍作为后续 backlog。
 6. ~~`validate-raw` 对 FLUXSATv2 float32 经纬度网格误报“不规则网格”~~ 已修复：`raw_validation._axis_report` 容差改为按坐标 dtype 自适应（float32 0.05° 网格通过）；新增单测 `test_axis_report_accepts_float32_regular_grid`。
-7. **硬件条件暂不具备（重要约束）**：目前没有更大的真实数据窗口，也没有独立 SSD/NVMe 设备，因此 v1.8.3 开发文档 3.4 的「真实设备读写阶段分离验证」与「真实数据 scaling 基准外业验证」被阻塞，无法按完成定义推进；
+7. **硬件条件暂不具备（重要约束）**：目前没有更大的真实数据窗口，也没有独立 SSD/NVMe 设备，因此 v1.8.4 开发文档 3.5 的「真实设备读写阶段分离验证」与「真实数据 scaling 基准外业验证」被阻塞，无法按完成定义推进；
    - 现阶段仅能以备份语料（`/run/media/owen/HDD/数据备份/`）的小窗口与同设备完成初步 A/B（报告见 `tests/external_data/results/v181-scaling/`），正式收益仍需更大窗口与独立写入设备验证；
    - 上述两项在开发文档中保持待办并明确「硬件前置」状态，待硬件条件具备后再执行并纳入发布门禁；
    - 该约束不影响已完成的格式验证、native 能力与全量回归（295 passed）。
 
-> 后续待处理内容统一记录在 [v1.8.3 开发文档](v1.8.3-development.md)。
+> 后续待处理内容统一记录在 [v1.8.4 开发文档](v1.8.4-development.md)。
 
 ### 6.3 发布状态（开发阶段）
 
@@ -321,10 +321,11 @@ pixi run release-candidate
 - **v1.7.8 后端优化分析已完成，P0 代码优化已落地**：存储感知 worker/batch **初始值**（仅作起始猜测，调优仍探索完整 worker 范围）、重采样全局线程预算已实现并通过测试。
 - **v1.7.9 后端优化已实施**：已完成 HardwareProfile（含 NUMA/P/E）、PerformanceModel、重分块存储感知初始值、WorkerPool 工具类、文件亲和排序、OnlineController 可观测与保守调整、CPU affinity、PipelineFusion eligibility 标记；剩余项后续转入开发文档。
 - **v1.8.0 开发基线已提交并推送**：v1.8.0 完成项已收敛进版本历史（commit `18bf7bb`），包括 WorkerPool 全路径、HDD 读写阶段分离、PipelineFusion、OnlineController、native 整数、HDF-EOS Grid/Swath、native conservative parity、scaling 基础设施。
-- **v1.8.1 已完成并收敛**：版本提升至 1.8.1 并完成发布门禁；完成真实 HDF4-EOS/GeoTIFF/HDF-EOS 小窗验收 6/6、filename 缺日检测与重复文件边界（拒绝语义）、filename 模式 PipelineFusion 单遍流式；全量回归 295 保持绿色。剩余硬件前置项（真实设备读写阶段分离验证、真实数据 scaling 外业基准）因缺少更大数据窗口与独立 SSD/NVMe 被阻塞（见 6.2 第 7 条），已承接至 [v1.8.3 开发文档](v1.8.3-development.md) 3.4。
+- **v1.8.1 已完成并收敛**：版本提升至 1.8.1 并完成发布门禁；完成真实 HDF4-EOS/GeoTIFF/HDF-EOS 小窗验收 6/6、filename 缺日检测与重复文件边界（拒绝语义）、filename 模式 PipelineFusion 单遍流式；全量回归 295 保持绿色。剩余硬件前置项（真实设备读写阶段分离验证、真实数据 scaling 外业基准）因缺少更大数据窗口与独立 SSD/NVMe 被阻塞（见 6.2 第 7 条），已承接至 [v1.8.4 开发文档](v1.8.4-development.md) 3.5。
 - **v1.8.2 已完成并收敛**：版本提升至 1.8.2；完成真实数据融合收敛（`run_v182_acceptance.py` 5/5：GOSIF/GLASS 融合 EXACT parity，含 CF 解码修复）与格式盲区 fixture（旋转/多 band/打包）；模块拆分（3.3）按预案推迟；全量回归 295 保持绿色；发布门禁通过（local `Fast NC Zarr_1.8.2_amd64.deb`）；v1.8.1 开发文档退役。
-- **v1.8.3 基线已建立**：版本提升至 1.8.3；v1.8.2 开发文档退役，开发方案见 [v1.8.3 开发文档](v1.8.3-development.md)，重点为时间维度信息识别能力加强。
-- **v1.8.3 待办推进（开发中）**：时间识别模块 A/B/C 已实现（HDF-EOS CoreMetadata 时间、生产时间戳抗歧义、年度时间尺度、日历决策；`run_v183_acceptance.py` 1/1）；剩余发布门禁与收尾（3.5）。
+- **v1.8.3 已完成并收敛**：版本提升至 1.8.3；完成时间维度识别（HDF-EOS CoreMetadata 时间解析、生产时间戳抗歧义、年度时间尺度、日历决策）与变量完整性（额外维度变量显式化）；`run_v183_acceptance.py` 1/1、全量回归 302 passed；发布门禁通过（local `Fast NC Zarr_1.8.3_amd64.deb`）；v1.8.2 开发文档退役。
+- **v1.8.4 基线已建立**：版本提升至 1.8.4；v1.8.3 开发文档退役，开发方案见 [v1.8.4 开发文档](v1.8.4-development.md)，重点为 GUI 接口对齐审计与界面重构。
+- **v1.8.4 待办推进（开发中）**：GUI 四层对齐审计与缺口修复（3.1）、UI 结构重构（3.2）、交互重设计（3.3）进行中；硬件前置项（3.5）保持待办。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。
@@ -345,7 +346,8 @@ pixi run release-candidate
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
-| 1.8.3 | 2026-08-20 | 版本提升至 1.8.3；完成时间维度信息识别能力加强：HDF-EOS `CoreMetadata.0` RANGEDATETIME 解析（coverage 字段 + 一致性 warning）、生产时间戳 13/14 位字段抗歧义（MCD12C1 自动模板成功）、年度产品时间尺度（每年 1 点）、日历识别面（noleap 族支持、360_day 明确拒绝）；`run_v183_acceptance.py` 1/1；全量回归 301 passed；发布门禁通过（local `Fast NC Zarr_1.8.3_amd64.deb`） |
+| 1.8.4 | 2026-08-20 | 版本提升至 1.8.4；v1.8.3 完成项收敛进本文档；开发方案见 `docs/v1.8.4-development.md`，重点为 GUI 接口对齐审计（四层审计+缺口修复）与界面/交互重构 |
+| 1.8.3 | 2026-08-20 | 版本提升至 1.8.3 并完成时间维度识别增强（HDF-EOS `CoreMetadata.0` RANGEDATETIME 解析、生产时间戳抗歧义、年度产品时间尺度、日历识别面）与变量完整性（额外维度变量显式化，GUI 变量面板可见）；`run_v183_acceptance.py` 1/1；全量回归 302 passed；发布门禁通过（local `Fast NC Zarr_1.8.3_amd64.deb`） |
 | 1.8.2 | 2026-08-20 | 版本提升至 1.8.2 并完成：真实数据融合收敛（`run_v182_acceptance.py` 5/5，含 CF 解码修复）、格式盲区 fixture 验收（旋转/多 band/打包）、发布门禁（sidecar/tauri-build/release-candidate，local `Fast NC Zarr_1.8.2_amd64.deb`）；模块拆分按预案推迟；全量回归 295 保持绿色；v1.8.1 开发文档退役 |
 | 1.8.1 | 2026-08-20 | 版本提升至 1.8.1 并完成：真实 HDF4-EOS/GeoTIFF/HDF-EOS 小窗验收 6/6、filename 缺日检测与重复文件边界（拒绝语义）、filename 模式 PipelineFusion、发布门禁（sidecar/typecheck/build/tauri-build/release-candidate）；全量回归 295 保持绿色；硬件前置项（真实设备 staging/scaling 外业）承接至 v1.8.2 |
 | 1.8.0 | 2026-08-20 | v1.8.0 开发基线提交并推送（commit `18bf7bb`）：WorkerPool 全路径、HDD 读写阶段分离、PipelineFusion、OnlineController、native 整数、HDF-EOS Grid/Swath、native conservative parity（v180 acceptance 9/9）、scaling 基础设施；开发阶段暂不打包上传 |

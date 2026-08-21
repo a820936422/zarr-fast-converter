@@ -1,7 +1,7 @@
 {
   "name": "fast-nc-zarr-desktop",
   "private": true,
-  "version": "1.8.3",
+  "version": "1.8.4",
   "description": "Tauri desktop shell for Fast NC Zarr",
   "type": "module",
   "engines": {
