@@ -294,6 +294,8 @@ pixi run release-candidate
 | 完整回归（当前基线） | ✅ `pixi run test` 295 passed、35 subtests、1 warning；`cross-backend-test` 44 passed、4 subtests；Rust 核心 23 passed |
 | filename 重复文件边界 | ✅ 同日期重复文件批次被 `scan_filename_times` 显式拒绝（`FilenameTimeError`，错误含两文件完整路径与处理指引），绝不静默去重；新增单测 2 个 + 真实数据 acceptance `gosif_filename_duplicate_rejection`（6/6 passed） |
 | filename 模式 PipelineFusion | ✅ filename 模式 raw 输入在 `_fusion_eligible` 统一判定（crop ≤ 2 GiB、`space_workers∈{1,auto}`）下以惰性内存数据集直入重采样，不写中间 `source-crop.zarr`（`write_amplification=1.0`、`fused_in_memory`）；`build_filename_fused_dataset` 逐文件 `_prepare_filename_data` 语义保证与磁盘路径逐值一致（含缺日 fill）；新增 `tests/test_pipeline.py` filename fusion 单遍/回退 3 个测试通过 |
+| v1.8.2 真实数据融合收敛 | ✅ `run_v182_acceptance.py` 2/2：GOSIF GeoTIFF 3 步与 GLASS HDF4 打包 int16（含缺日 2001017）4 步融合 vs 磁盘路径 EXACT parity；修复 CF 打包源上 `build_filename_fused_dataset` 的 `xr.decode_cf` 解码缺口（fill→NaN、物理值，等价磁盘重开 `mask_and_scale=True`） |
+| v1.8.2 格式盲区 fixture | ✅ `run_v182_acceptance.py` 3/3：旋转仿射 GeoTIFF 接受并按规则网格重建（值逐像素 parity）、多 band GeoTIFF 确定性拒绝（单 band 约束，reason 记录）、int16+scale/add_offset 打包转换保留打包值与 CF attrs（重采样侧解码由 GLASS case 覆盖） |
 
 ### 6.2 已知问题
 
@@ -319,6 +321,7 @@ pixi run release-candidate
 - **v1.8.0 开发基线已提交并推送**：v1.8.0 完成项已收敛进版本历史（commit `18bf7bb`），包括 WorkerPool 全路径、HDD 读写阶段分离、PipelineFusion、OnlineController、native 整数、HDF-EOS Grid/Swath、native conservative parity、scaling 基础设施。
 - **v1.8.1 已完成并收敛**：版本提升至 1.8.1 并完成发布门禁；完成真实 HDF4-EOS/GeoTIFF/HDF-EOS 小窗验收 6/6、filename 缺日检测与重复文件边界（拒绝语义）、filename 模式 PipelineFusion 单遍流式；全量回归 295 保持绿色。剩余硬件前置项（真实设备读写阶段分离验证、真实数据 scaling 外业基准）因缺少更大数据窗口与独立 SSD/NVMe 被阻塞（见 6.2 第 7 条），已承接至 [v1.8.2 开发文档](v1.8.2-development.md) 3.4。
 - **v1.8.2 基线已建立**：版本提升至 1.8.2；v1.8.1 开发文档退役，开发方案见 [v1.8.2 开发文档](v1.8.2-development.md)。
+- **v1.8.2 待办推进（开发中）**：真实数据融合收敛（3.1）与格式盲区 fixture（3.2）已完成（`run_v182_acceptance.py` 5/5）；模块拆分（3.3）按预案推迟；硬件前置项（3.4）保持待办；剩余发布门禁与收尾（3.5）。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。
