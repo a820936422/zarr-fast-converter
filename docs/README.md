@@ -1,6 +1,6 @@
-# Fast NC Zarr v1.8.2 模块与运行指南
+# Fast NC Zarr v1.8.3 模块与运行指南
 
-本文档合并项目各模块的入口、核心约束和验证方式。项目总览、环境安装和快速示例见根目录 [README](../README.md)。IPC 定义见 [contracts/README.md](../contracts/README.md)。项目维护文档见：[维护文档](MAINTENANCE.md)。后续版本待办见：[v1.8.2 开发文档](v1.8.2-development.md)。历史版本专项文档已整合清理，不再单独维护。
+本文档合并项目各模块的入口、核心约束和验证方式。项目总览、环境安装和快速示例见根目录 [README](../README.md)。IPC 定义见 [contracts/README.md](../contracts/README.md)。项目维护文档见：[维护文档](MAINTENANCE.md)。后续版本待办见：[v1.8.3 开发文档](v1.8.3-development.md)。历史版本专项文档已整合清理，不再单独维护。
 
 ## 共通约定
 
@@ -170,9 +170,9 @@ cargo test -p fast-nc-zarr-desktop
 
 前端通过 Tauri commands 调用 Rust runtime；runtime 负责 worker、任务 registry、取消、资源快照、事件流、native capability 和恢复。Tauri command 包括 `get_backend_info`、`native_capabilities`、`inspect_source`、`inspect_zarr`、`inspect_time_metadata`、`save_inspection_snapshot`、`preview_pipeline`、`start_pipeline`、`start_inspection`、`resume_pipeline`、`inspect_pipeline_recovery`、`start_native_task`、`get_task`、`list_tasks`、`clear_task_history` 和 `cancel_task`。worker stdout 只承载 JSONL，诊断进入结构化事件或 stderr。
 
-## v1.8.2 Linux 发布范围
+## v1.8.3 Linux 发布范围
 
-v1.8.2 以 Linux `x86_64-unknown-linux-gnu` 为阻塞发布平台。发布前至少执行：
+v1.8.3 以 Linux `x86_64-unknown-linux-gnu` 为阻塞发布平台。发布前至少执行：
 
 ```bash
 pixi run version-check
