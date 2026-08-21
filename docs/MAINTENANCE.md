@@ -298,6 +298,7 @@ pixi run release-candidate
 | v1.8.2 格式盲区 fixture | ✅ `run_v182_acceptance.py` 3/3：旋转仿射 GeoTIFF 接受并按规则网格重建（值逐像素 parity）、多 band GeoTIFF 确定性拒绝（单 band 约束，reason 记录）、int16+scale/add_offset 打包转换保留打包值与 CF attrs（重采样侧解码由 GLASS case 覆盖） |
 | v1.8.3 时间维度识别 | ✅ HDF-EOS `CoreMetadata.0` RANGEDATETIME 解析（`coverage_start/coverage_end/internal_time_source` + 报告/一致性 warning）；生产时间戳 13/14 位字段抗歧义（MCD12C1 自动模板成功）；年度产品时间尺度（每年 1 点，MCD12C1 24 年点/0 缺日）；日历识别面（noleap 族支持、360_day 明确拒绝）；`run_v183_acceptance.py` `mcd12c1_auto_time_recognition` 1/1 |
 | v1.8.3 变量完整性 | ✅ 额外维度数值变量不再静默丢弃：`_rename_spatial_dims` drop 前记录，`Inventory.excluded_extra_dimension_variables` + 报告「已排除的额外维度变量」行 + inspect warning；选择时显式拒绝（「变量含额外维度，无法转换」）；MCD12C1 3 个 `Land_Cover_Type_*_Percent` 类维度变量被明确列出 |
+| v1.8.4 GUI 对齐与重构 | ✅ 四层审计（`docs/gui-audit-v1.8.4.md`：命令/事件全对齐，`fusion` 缺口修复 + capability 标签补全 11 项 + 协议测试）；`App.tsx` 从 1844 行拆分为 `lib/`（types/constants/format/validate）+ `components/`（Icon/计划/时间检查/进度/诊断/ErrorBanner 等 6 个）+ `views/OverviewView`（1181 行）；纯转换快速模式验证与引导、融合开关、任务中心/恢复/事件流组件化；typecheck/build 绿，Python 回归 303 passed |
 
 ### 6.2 已知问题
 
@@ -325,7 +326,7 @@ pixi run release-candidate
 - **v1.8.2 已完成并收敛**：版本提升至 1.8.2；完成真实数据融合收敛（`run_v182_acceptance.py` 5/5：GOSIF/GLASS 融合 EXACT parity，含 CF 解码修复）与格式盲区 fixture（旋转/多 band/打包）；模块拆分（3.3）按预案推迟；全量回归 295 保持绿色；发布门禁通过（local `Fast NC Zarr_1.8.2_amd64.deb`）；v1.8.1 开发文档退役。
 - **v1.8.3 已完成并收敛**：版本提升至 1.8.3；完成时间维度识别（HDF-EOS CoreMetadata 时间解析、生产时间戳抗歧义、年度时间尺度、日历决策）与变量完整性（额外维度变量显式化）；`run_v183_acceptance.py` 1/1、全量回归 302 passed；发布门禁通过（local `Fast NC Zarr_1.8.3_amd64.deb`）；v1.8.2 开发文档退役。
 - **v1.8.4 基线已建立**：版本提升至 1.8.4；v1.8.3 开发文档退役，开发方案见 [v1.8.4 开发文档](v1.8.4-development.md)，重点为 GUI 接口对齐审计与界面重构。
-- **v1.8.4 待办推进（开发中）**：GUI 四层对齐审计与缺口修复（3.1）、UI 结构重构（3.2）、交互重设计（3.3）进行中；硬件前置项（3.5）保持待办。
+- **v1.8.4 已完成并收敛**：完成 GUI 四层对齐审计与缺口修复（`fusion` 暴露、capability 标签、协议测试）、UI 结构重构（`App.tsx` → `lib/components/views` 拆分）、交互收尾（快速转换模式、融合开关、统一 ErrorBanner）；全量回归 303 passed；发布门禁通过（sidecar 重建、tauri-build、release-candidate，local `Fast NC Zarr_1.8.4_amd64.deb`）；硬件前置项保持待办。
 - **项目仍处于开发阶段**：**暂不打包安装包、暂不上传发布资产**（不创建 GitHub Release、不上传 `.deb`/`.rpm` 等安装包）。
 - 本地 `release/` 下的候选安装包（含 `Fast NC Zarr_1.7.7_amd64.deb`）仅作本地留档，不用于分发；`release/*.deb` 已由 `.gitignore` 排除，不入库。
 - 后续若进入正式发布阶段，再按本文件“5. 发布与版本更新流程”执行打包、收集与上传。
@@ -346,7 +347,7 @@ pixi run release-candidate
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
-| 1.8.4 | 2026-08-20 | 版本提升至 1.8.4；v1.8.3 完成项收敛进本文档；开发方案见 `docs/v1.8.4-development.md`，重点为 GUI 接口对齐审计（四层审计+缺口修复）与界面/交互重构 |
+| 1.8.4 | 2026-08-20 | 版本提升至 1.8.4 并完成 GUI 接口对齐审计（`docs/gui-audit-v1.8.4.md` 四层：命令/事件对齐、`fusion` 缺口修复、capability 标签补全、协议测试）与界面重构（`App.tsx` 1844→1181 行：`lib/`+`components/`+`views/`；快速转换模式、融合开关、统一 ErrorBanner）；全量回归 303 passed；发布门禁通过（local `Fast NC Zarr_1.8.4_amd64.deb`）；硬件前置项保持待办 |
 | 1.8.3 | 2026-08-20 | 版本提升至 1.8.3 并完成时间维度识别增强（HDF-EOS `CoreMetadata.0` RANGEDATETIME 解析、生产时间戳抗歧义、年度产品时间尺度、日历识别面）与变量完整性（额外维度变量显式化，GUI 变量面板可见）；`run_v183_acceptance.py` 1/1；全量回归 302 passed；发布门禁通过（local `Fast NC Zarr_1.8.3_amd64.deb`） |
 | 1.8.2 | 2026-08-20 | 版本提升至 1.8.2 并完成：真实数据融合收敛（`run_v182_acceptance.py` 5/5，含 CF 解码修复）、格式盲区 fixture 验收（旋转/多 band/打包）、发布门禁（sidecar/tauri-build/release-candidate，local `Fast NC Zarr_1.8.2_amd64.deb`）；模块拆分按预案推迟；全量回归 295 保持绿色；v1.8.1 开发文档退役 |
 | 1.8.1 | 2026-08-20 | 版本提升至 1.8.1 并完成：真实 HDF4-EOS/GeoTIFF/HDF-EOS 小窗验收 6/6、filename 缺日检测与重复文件边界（拒绝语义）、filename 模式 PipelineFusion、发布门禁（sidecar/typecheck/build/tauri-build/release-candidate）；全量回归 295 保持绿色；硬件前置项（真实设备 staging/scaling 外业）承接至 v1.8.2 |
