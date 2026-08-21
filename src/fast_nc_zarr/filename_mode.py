@@ -1871,7 +1871,14 @@ def build_filename_fused_dataset(
         "filename_annual_steps": [list(item) for item in inventory.filename_annual_steps],
         "source_engine": inventory.source_engine,
     })
-    return xr.Dataset(variables, coords=coords, attrs=dataset_attrs)
+    ds = xr.Dataset(variables, coords=coords, attrs=dataset_attrs)
+    # The on-disk intermediate is reopened by the resampling engine with
+    # ``mask_and_scale=True``, which CF-decodes ``_FillValue``/``missing_value``
+    # into NaN and ``scale_factor``/``add_offset`` into physical values.  Apply
+    # the identical xarray decode here so the in-memory crop is
+    # value-for-value equivalent to the reopened disk crop (packed integer
+    # sources such as GLASS int16 + scale_factor depend on this).
+    return xr.decode_cf(ds)
 
 
 def _initialize_filename_zarr(
