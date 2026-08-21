@@ -274,6 +274,7 @@ def _pipeline_config(payload: dict[str, Any]):
             lon_max=float(payload.get("lon_max", 180.0)),
             cleanup_intermediate=bool(payload.get("cleanup_intermediate", False)),
             overwrite=bool(payload.get("overwrite", False)),
+            fusion=bool(payload.get("fusion", True)),
             source_storage=str(payload.get("source_storage", "auto")),
             temporary_storage=str(payload.get("temporary_storage", "auto")),
             output_storage=str(payload.get("output_storage", "auto")),

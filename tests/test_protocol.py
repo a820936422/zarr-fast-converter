@@ -229,6 +229,18 @@ class DesktopWorkerTests(unittest.TestCase):
         self.assertFalse(config.resampling.variable_options["a2"].skipna)
         self.assertEqual(config.resampling.variable_options["a2"].compute_dtype, "float32")
 
+    def test_pipeline_payload_fusion_default_and_override(self) -> None:
+        default = _pipeline_config({"output": "/tmp/fusion-default.zarr"})
+        self.assertTrue(default.general.fusion)
+        disabled = _pipeline_config(
+            {"output": "/tmp/fusion-disabled.zarr", "fusion": False}
+        )
+        self.assertFalse(disabled.general.fusion)
+        enabled = _pipeline_config(
+            {"output": "/tmp/fusion-enabled.zarr", "fusion": True}
+        )
+        self.assertTrue(enabled.general.fusion)
+
     def test_run_pipeline_publishes_output_after_worker_launch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="desktop-pipeline-") as raw:
             root = Path(raw)

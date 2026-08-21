@@ -268,6 +268,13 @@ const VIEW_TITLES: Record<View, string> = {
 };
 
 const OPERATION_LABELS: Record<string, string> = {
+  probe: "环境探测",
+  "raw.netcdf.inspect": "NetCDF 原生检查",
+  "raw.netcdf.convert": "NetCDF 原生转换",
+  "resample.nearest": "最近邻重采样",
+  "resample.bilinear": "双线性重采样",
+  "resample.conservative": "保守重采样",
+  "resample.conservative_normed": "归一化保守重采样",
   "zarr.inspect": "Zarr 结构检查",
   "zarr.read_chunk_f32": "Float32 chunk 读取",
   "zarr.read_chunk_f64": "Float64 chunk 读取",
@@ -276,7 +283,11 @@ const OPERATION_LABELS: Record<string, string> = {
   "zarr.write_f32": "Float32 数组写入",
   "zarr.write_f64": "Float64 数组写入",
   "zarr.rechunk_f32": "Float32 重分块",
+  "zarr.rechunk_f32_codec": "Float32 codec 重分块",
+  "zarr.rechunk_f32_cancel": "Float32 重分块（可取消）",
   "zarr.rechunk_f64": "Float64 重分块",
+  "zarr.rechunk_f64_cancel": "Float64 重分块（可取消）",
+  "zarr.rechunk_multi": "多变量重分块",
 };
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -754,6 +765,7 @@ function App() {
   const [recoveryPath, setRecoveryPath] = useState("");
   const [recoveryInspection, setRecoveryInspection] = useState<InspectionResult | null>(null);
   const [resample, setResample] = useState(false);
+  const [fusionEnabled, setFusionEnabled] = useState(true);
   const [resampleMethod, setResampleMethod] = useState("bilinear");
   const [resolution, setResolution] = useState(0.1);
   const [targetTimeStart, setTargetTimeStart] = useState("");
@@ -1235,6 +1247,9 @@ function App() {
       compression_objective: compressionObjective,
       compression_tune_budget: effectiveCompressionTuneBudget,
       tune_budget: effectiveTuneBudget,
+      cleanup_intermediate: false,
+      overwrite: false,
+      fusion: fusionEnabled,
       resample: effectiveResample,
       method: resampleMethod,
       resolution,
@@ -1579,6 +1594,7 @@ function App() {
                   <div className="surface-title"><div><span className="section-kicker">PROCESS FLOW</span><h2>处理阶段</h2></div><span className="surface-number">02</span></div>
                   {inspectionProgress && inspectionTaskOperation === "preview_pipeline" && <InspectionProgressCard progress={inspectionProgress} nowMs={progressNowMs} onCancel={inspectionTaskId ? cancelInspection : undefined} />}
                   <div className="stage-flow"><div className="flow-stage complete"><span>01</span><Icon name="database" size={16} /><div><strong>输入检查</strong><small>{inputPath.split(/[\\/]/).pop() || "已确认数据"}</small></div><Icon name="spark" size={14} /></div><div className="flow-connector" /><label className={`flow-stage toggle-stage ${effectiveResample ? "enabled" : ""}`}><span>02</span><Icon name="grid" size={16} /><div><strong>空间重采样</strong><small>{effectiveResample ? (automaticResample ? "按目标范围自动规划" : resampleMethod) : "未启用"}</small></div><input type="checkbox" checked={effectiveResample} disabled={automaticResample} onChange={(event) => setResample(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${rechunk ? "enabled" : ""}`}><span>03</span><Icon name="layers" size={16} /><div><strong>重分块</strong><small>{rechunk ? `目标 ${targetMib} MiB` : "未启用"}</small></div><input type="checkbox" checked={rechunk} onChange={(event) => setRechunk(event.target.checked)} /><span className="toggle-switch" /></label><div className="flow-connector" /><label className={`flow-stage toggle-stage ${recompress ? "enabled" : ""}`}><span>04</span><Icon name="spark" size={16} /><div><strong>重压缩</strong><small>{recompress ? compression : "未启用"}</small></div><input type="checkbox" checked={recompress} onChange={(event) => setRecompress(event.target.checked)} /><span className="toggle-switch" /></label></div>
+                  <div className="fusion-option-row"><label className={`flow-stage toggle-stage fusion-toggle ${fusionEnabled ? "enabled" : ""}`}><span>07</span><div><strong>内存单遍融合</strong><small>转换不落中间盘、直接流入下一阶段（仅串行重采样且 crop ≤ 2 GiB）</small></div><input type="checkbox" checked={fusionEnabled} onChange={(event) => setFusionEnabled(event.target.checked)} /><span className="toggle-switch" /></label>{!fusionEnabled && <p className="variable-settings-help">已关闭：使用磁盘中间路径，保留从转换中断点恢复的 checkpoint/恢复语义。</p>}</div>
                   <div className="advanced-panel target-range-panel">
                     <div className="panel-label"><Icon name="clock" size={15} />输出目标范围</div>
                     <p className="target-range-help">填写最终输出的时间段和空间范围。日期支持直接输入年份、年月或完整日期（YYYY、YYYY-MM、YYYY-MM-DD）；启用自定义经纬度后，系统会自动启用重采样，并根据目标网格计算读取窗口、chunks 和发布策略。</p>
