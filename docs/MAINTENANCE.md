@@ -297,6 +297,7 @@ pixi run release-candidate
 | v1.8.2 真实数据融合收敛 | ✅ `run_v182_acceptance.py` 2/2：GOSIF GeoTIFF 3 步与 GLASS HDF4 打包 int16（含缺日 2001017）4 步融合 vs 磁盘路径 EXACT parity；修复 CF 打包源上 `build_filename_fused_dataset` 的 `xr.decode_cf` 解码缺口（fill→NaN、物理值，等价磁盘重开 `mask_and_scale=True`） |
 | v1.8.2 格式盲区 fixture | ✅ `run_v182_acceptance.py` 3/3：旋转仿射 GeoTIFF 接受并按规则网格重建（值逐像素 parity）、多 band GeoTIFF 确定性拒绝（单 band 约束，reason 记录）、int16+scale/add_offset 打包转换保留打包值与 CF attrs（重采样侧解码由 GLASS case 覆盖） |
 | v1.8.3 时间维度识别 | ✅ HDF-EOS `CoreMetadata.0` RANGEDATETIME 解析（`coverage_start/coverage_end/internal_time_source` + 报告/一致性 warning）；生产时间戳 13/14 位字段抗歧义（MCD12C1 自动模板成功）；年度产品时间尺度（每年 1 点，MCD12C1 24 年点/0 缺日）；日历识别面（noleap 族支持、360_day 明确拒绝）；`run_v183_acceptance.py` `mcd12c1_auto_time_recognition` 1/1 |
+| v1.8.3 变量完整性 | ✅ 额外维度数值变量不再静默丢弃：`_rename_spatial_dims` drop 前记录，`Inventory.excluded_extra_dimension_variables` + 报告「已排除的额外维度变量」行 + inspect warning；选择时显式拒绝（「变量含额外维度，无法转换」）；MCD12C1 3 个 `Land_Cover_Type_*_Percent` 类维度变量被明确列出 |
 
 ### 6.2 已知问题
 
