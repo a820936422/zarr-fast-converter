@@ -27,268 +27,76 @@ import {
   type TimeRule,
 } from "./api";
 import { useTaskEvents } from "./taskEvents";
+import {
+  DEFAULT_VARIABLE_RESAMPLING,
+  EMPTY_VARIABLE_TRANSFORM,
+  ICON_PATHS,
+  OPERATION_LABELS,
+  RESAMPLING_METHODS,
+  TIME_COMPONENT_LABELS,
+  VIEW_TITLES,
+} from "./lib/constants";
+import {
+  asRecord,
+  attributeText,
+  capabilityReason,
+  defaultOutputPath,
+  eventText,
+  fieldValuesPreview,
+  formatBytes,
+  formatCommand,
+  formatTaskStatus,
+  joinPath,
+  operationLabel,
+  outputStoreName,
+  pathBaseName,
+  pathParent,
+  planAxisSummary,
+  planDispositionLabel,
+  planOperationLabel,
+  planSeconds,
+  planTuple,
+  planValueText,
+  reasonText,
+  timeValuesPreview,
+} from "./lib/format";
+import {
+  firstTimeRef,
+  initialTimeRule,
+  parseCoordinateBound,
+  parseFillValues,
+  parseNonNegativeNumber,
+  parseOptionalNumber,
+  parsePositiveInteger,
+  timeRefKey,
+  timeRuleMode,
+  timeRuleOptionLabel,
+  timeRuleSummary,
+  validateDateBoundary,
+  validateTimeRule,
+} from "./lib/validate";
+import type {
+  BackendMode,
+  ChunkStrategy,
+  IconName,
+  InputKind,
+  InspectionProgressState,
+  InspectionProgressStatus,
+  InspectionStage,
+  PipelineTargetSummary,
+  TimeComponent,
+  TimeRuleMode,
+  VariableDetail,
+  VariableResamplingDraft,
+  VariableTransformDraft,
+  View,
+} from "./lib/types";
 import "./styles.css";
 
-type TimeRuleMode = "full" | "doy" | "calendar";
-type TimeComponent = "full" | "year" | "month" | "day" | "doy";
 
-const TIME_COMPONENT_LABELS: Record<TimeComponent, string> = {
-  full: "完整日期/时间",
-  year: "年份",
-  month: "月份",
-  day: "日期",
-  doy: "年内日序（DOY）",
-};
 
-function timeRefKey(ref: TimeRef | undefined): string {
-  return ref ? `${ref.source}:${ref.component}:${ref.index}` : "";
-}
 
-function firstTimeRef(options: TimeFieldOption[], component: TimeComponent): TimeRef | undefined {
-  return options.find((option) => option.ref.component === component)?.ref;
-}
 
-function timeRuleMode(rule: TimeRule | null): TimeRuleMode {
-  if (rule?.full) return "full";
-  if (rule?.doy) return "doy";
-  return "calendar";
-}
-
-function initialTimeRule(
-  inspection: TimeInspection,
-  current: TimeRule | null,
-): { rule: TimeRule | null; mode: TimeRuleMode } {
-  if (current) return { rule: current, mode: timeRuleMode(current) };
-  if (inspection.suggested_rule) {
-    return { rule: inspection.suggested_rule, mode: timeRuleMode(inspection.suggested_rule) };
-  }
-  const full = firstTimeRef(inspection.options, "full");
-  if (full) return { rule: { full }, mode: "full" };
-  const year = firstTimeRef(inspection.options, "year");
-  const doy = firstTimeRef(inspection.options, "doy");
-  if (year && doy) return { rule: { year, doy }, mode: "doy" };
-  const month = firstTimeRef(inspection.options, "month");
-  const day = firstTimeRef(inspection.options, "day");
-  if (year && month && day) return { rule: { year, month, day }, mode: "calendar" };
-  return { rule: null, mode: "full" };
-}
-
-function validateTimeRule(mode: TimeRuleMode, rule: TimeRule | null): string | null {
-  if (mode === "full" && !rule?.full) return "请选择一个完整日期或完整时间字段。";
-  if (mode === "doy" && (!rule?.year || !rule.doy)) return "请选择年份字段和 DOY 字段。";
-  if (mode === "calendar" && (!rule?.year || !rule.month || !rule.day)) {
-    return "请选择年份、月份和日期字段。";
-  }
-  return null;
-}
-
-function timeRuleOptionLabel(options: TimeFieldOption[], ref: TimeRef | undefined): string {
-  return options.find((option) => timeRefKey(option.ref) === timeRefKey(ref))?.label || "未选择";
-}
-
-function timeRuleSummary(rule: TimeRule | null, options: TimeFieldOption[]): string {
-  if (!rule) return "尚未选择时间规则";
-  if (rule.full) return `${TIME_COMPONENT_LABELS.full}：${timeRuleOptionLabel(options, rule.full)}`;
-  const parts = (["year", "month", "day", "doy"] as const)
-    .filter((component) => rule[component])
-    .map((component) => `${TIME_COMPONENT_LABELS[component]}：${timeRuleOptionLabel(options, rule[component])}`);
-  return parts.join("；");
-}
-
-type VariableDetail = {
-  name: string;
-  dtype: string;
-  dims: string[];
-  attrs: Record<string, unknown>;
-  excluded?: boolean;
-};
-
-type VariableTransformDraft = {
-  fillValues: string;
-  scaleFactor: string;
-  addOffset: string;
-  outputFill: string;
-};
-
-type VariableResamplingDraft = {
-  inherit: boolean;
-  method: string;
-  skipna: boolean;
-  naThres: number;
-  computeDtype: string;
-};
-
-const DEFAULT_VARIABLE_RESAMPLING: VariableResamplingDraft = {
-  inherit: true,
-  method: "bilinear",
-  skipna: true,
-  naThres: 1,
-  computeDtype: "source",
-};
-
-const RESAMPLING_METHODS = [
-  ["bilinear", "双线性插值"],
-  ["conservative", "保守重采样"],
-  ["conservative_normed", "归一化保守重采样"],
-  ["nearest_s2d", "最近邻（源到目标）"],
-  ["nearest_d2s", "最近邻（目标到源）"],
-  ["patch", "Patch 插值"],
-] as const;
-const EMPTY_VARIABLE_TRANSFORM: VariableTransformDraft = {
-  fillValues: "",
-  scaleFactor: "",
-  addOffset: "",
-  outputFill: "",
-};
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
-
-function attributeText(attrs: Record<string, unknown>, key: string): string {
-  const value = attrs[key];
-  return value === undefined || value === null ? "" : String(value);
-}
-
-function parseOptionalNumber(value: string, label: string): number | "nan" | undefined {
-  const text = value.trim();
-  if (!text) return undefined;
-  if (text.toLowerCase() === "nan") return "nan";
-  const result = Number(text);
-  if (!Number.isFinite(result)) throw new Error(`${label} 必须是有限数值或 nan。`);
-  return result;
-}
-function parseCoordinateBound(value: string, label: string, minimum: number, maximum: number): number {
-  const text = value.trim();
-  if (!text) throw new Error(`请输入${label}。`);
-  const result = Number(text);
-  if (!Number.isFinite(result) || result < minimum || result > maximum) {
-    throw new Error(`${label}必须位于 ${minimum} 到 ${maximum} 之间。`);
-  }
-  return result;
-}
-function parsePositiveInteger(value: string, label: string): number {
-  const text = value.trim();
-  const result = Number(text);
-  if (!text || !Number.isInteger(result) || result <= 0) {
-    throw new Error(`${label}必须是正整数。`);
-  }
-  return result;
-}
-function parseNonNegativeNumber(value: number, label: string): number {
-  if (!Number.isFinite(value) || value < 0) {
-    throw new Error(`${label}必须是有限非负数。`);
-  }
-  return value;
-}
-function validateDateBoundary(value: string, label: string): string {
-  const text = value.trim();
-  const match = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(text);
-  if (!match) throw new Error(`${label}请输入 YYYY、YYYY-MM 或 YYYY-MM-DD。`);
-  const year = Number(match[1]);
-  const month = match[2] ? Number(match[2]) : null;
-  const day = match[3] ? Number(match[3]) : null;
-  if (year < 1 || (month !== null && (month < 1 || month > 12))) {
-    throw new Error(`${label}不是有效日期。`);
-  }
-  if (day !== null) {
-    const lastDay = new Date(Date.UTC(year, month || 1, 0)).getUTCDate();
-    if (day < 1 || day > lastDay) throw new Error(`${label}不是有效日期。`);
-  }
-  return text;
-}
-
-function parseFillValues(value: string, label: string): Array<number | "nan"> | undefined {
-  const text = value.trim();
-  if (!text) return undefined;
-  return text.split(",").map((item) => parseOptionalNumber(item, label)).filter(
-    (item): item is number | "nan" => item !== undefined,
-  );
-}
-
-type InspectionProgressStatus = "starting" | "running" | "cancelling" | "finished" | "failed" | "cancelled";
-type InspectionProgressState = {
-  taskId: string | null;
-  operation: InspectionTaskOperation;
-  label: string;
-  message: string;
-  completed: number;
-  total: number;
-  status: InspectionProgressStatus;
-  startedAt: number;
-};
-type InputKind = "source" | "zarr";
-type InspectionStage = "input" | "time" | "structure";
-type View = "overview" | "inspection" | "pipeline" | "tasks" | "settings";
-type BackendMode = "auto" | "rust";
-type ChunkStrategy = "time" | "space" | "custom";
-type IconName =
-  | "activity"
-  | "archive"
-  | "arrow"
-  | "chevron"
-  | "clock"
-  | "database"
-  | "folder"
-  | "grid"
-  | "layers"
-  | "play"
-  | "refresh"
-  | "settings"
-  | "spark"
-  | "tasks"
-  | "terminal"
-  | "upload";
-
-const ICON_PATHS: Record<IconName, string> = {
-  activity: "M3 12h4l2.2-7 4.2 14 2.2-7H21",
-  archive: "M4 7h16v13H4zM3 4h18v3H3zM9 11h6",
-  arrow: "M5 12h13M13 6l6 6-6 6",
-  chevron: "M9 5l7 7-7 7",
-  clock: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zm0-14v5l3 2",
-  database: "M5 6c0-1.7 3.1-3 7-3s7 1.3 7 3-3.1 3-7 3-7-1.3-7-3zm0 0v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6m-14 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6",
-  folder: "M3 6.5A1.5 1.5 0 0 1 4.5 5H10l2 2h7.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z",
-  grid: "M4 4h6v6H4zm10 0h6v6h-6zM4 14h6v6H4zm10 0h6v6h-6z",
-  layers: "M12 3l9 5-9 5-9-5 9-5zm-9 9 9 5 9-5M3 17l9 5 9-5",
-  play: "M8 5v14l11-7z",
-  refresh: "M20 11a8 8 0 0 0-14.7-3L3 11m0 0V5m0 6h6M4 13a8 8 0 0 0 14.7 3L21 13m0 0v6m0-6h-6",
-  settings: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0-5v3m0 8v3m0 5v-3m0-8V5m9 7h-3M8 12H5m14.4-6.4-2.1 2.1M7.7 16.3l-2.1 2.1m0-12.8 2.1 2.1m9.6 8.6 2.1 2.1",
-  spark: "M12 2l1.7 6.3L20 10l-6.3 1.7L12 18l-1.7-6.3L4 10l6.3-1.7zM19 16l.7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7z",
-  tasks: "M5 5h14v14H5zM8 9h8M8 13h5M8 17h3",
-  terminal: "M5 7l5 5-5 5m7 0h7",
-  upload: "M12 16V4m0 0L7 9m5-5 5 5M5 20h14",
-};
-
-const VIEW_TITLES: Record<View, string> = {
-  overview: "工作台",
-  inspection: "数据检查",
-  pipeline: "处理流程",
-  tasks: "任务中心",
-  settings: "路径设置",
-};
-
-const OPERATION_LABELS: Record<string, string> = {
-  probe: "环境探测",
-  "raw.netcdf.inspect": "NetCDF 原生检查",
-  "raw.netcdf.convert": "NetCDF 原生转换",
-  "resample.nearest": "最近邻重采样",
-  "resample.bilinear": "双线性重采样",
-  "resample.conservative": "保守重采样",
-  "resample.conservative_normed": "归一化保守重采样",
-  "zarr.inspect": "Zarr 结构检查",
-  "zarr.read_chunk_f32": "Float32 chunk 读取",
-  "zarr.read_chunk_f64": "Float64 chunk 读取",
-  "zarr.read_region_f32": "Float32 region 读取",
-  "zarr.read_region_f64": "Float64 region 读取",
-  "zarr.write_f32": "Float32 数组写入",
-  "zarr.write_f64": "Float64 数组写入",
-  "zarr.rechunk_f32": "Float32 重分块",
-  "zarr.rechunk_f32_codec": "Float32 codec 重分块",
-  "zarr.rechunk_f32_cancel": "Float32 重分块（可取消）",
-  "zarr.rechunk_f64": "Float64 重分块",
-  "zarr.rechunk_f64_cancel": "Float64 重分块（可取消）",
-  "zarr.rechunk_multi": "多变量重分块",
-};
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   return (
@@ -297,18 +105,6 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     </svg>
   );
 }
-function fieldValuesPreview(field: FilenameFieldSummary): string {
-  const values = field.values.slice(0, 4);
-  if (!values.length) return "暂无样例值";
-  return values.join("、") + (field.values.length > values.length ? " ……" : "");
-}
-
-function timeValuesPreview(values: string[]): string {
-  if (!values.length) return "未发现可解码值";
-  const preview = values.slice(0, 3).join("、");
-  return preview + (values.length > 3 ? " ……" : "");
-}
-
 function StructuredTimeInspection({ inspection }: { inspection: TimeInspection }) {
   const dimension: TimeDimensionSummary = inspection.time_dimension;
   const attributes = Object.entries(dimension.attrs).filter(([, value]) => value !== null && value !== "").slice(0, 4);
@@ -353,58 +149,6 @@ function StructuredTimeInspection({ inspection }: { inspection: TimeInspection }
     </div>
   );
 }
-function planValueText(value: unknown, fallback = "—"): string {
-  if (value === null || value === undefined || value === "") return fallback;
-  if (Array.isArray(value)) return value.map((item) => planValueText(item, "")).join(" × ") || fallback;
-  if (typeof value === "number") return Number.isFinite(value) ? value.toLocaleString() : fallback;
-  if (typeof value === "boolean") return value ? "是" : "否";
-  return String(value);
-}
-
-function planSeconds(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value) ? `${value.toLocaleString()} s` : "—";
-}
-
-function planTuple(value: unknown): string {
-  return Array.isArray(value) ? value.map((item) => planValueText(item)).join(" × ") : planValueText(value);
-}
-function planAxisSummary(value: unknown): string {
-  if (!Array.isArray(value) || value.length === 0) return "—";
-  const first = planValueText(value[0]);
-  const last = planValueText(value[value.length - 1]);
-  return `${first} → ${last}（${value.length.toLocaleString()} 个边界）`;
-}
-
-type PipelineTargetSummary = {
-  timeStart: string;
-  timeEnd: string;
-  spatialEnabled: boolean;
-  latMin: string;
-  latMax: string;
-  lonMin: string;
-  lonMax: string;
-  resolution: number;
-  automaticResample: boolean;
-};
-
-function planOperationLabel(operation: string): string {
-  return {
-    conversion: "格式转换",
-    resampling: "空间重采样",
-    rechunking: "重分块",
-    recompression: "重压缩",
-  }[operation] || operation;
-}
-
-function planDispositionLabel(disposition: string): string {
-  return {
-    executed_as_stage: "执行阶段",
-    not_requested: "未请求",
-    skipped: "跳过",
-    reused: "复用已有结果",
-  }[disposition] || disposition;
-}
-
 function StructuredPipelinePlan({ plan, target }: { plan: Record<string, unknown>; target: PipelineTargetSummary }) {
   const targetGrid = asRecord(plan.target_grid);
   const sourceWindow = asRecord(plan.source_read_window);
@@ -563,87 +307,6 @@ function InspectionProgressCard({
   );
 }
 
-
-function reasonText(reason: unknown): string {
-  if (reason instanceof Error) return reason.message;
-  if (typeof reason === "string") return reason;
-  if (reason && typeof reason === "object") {
-    const value = reason as Record<string, unknown>;
-    const message = typeof value.message === "string" ? value.message : null;
-    const kind = typeof value.kind === "string" ? value.kind : null;
-    const stage = typeof value.stage === "string" ? value.stage : null;
-    if (message) {
-      const context = [kind, stage].filter(Boolean).join(" / ");
-      return context ? `${context}: ${message}` : message;
-    }
-    try {
-      const serialized = JSON.stringify(reason);
-      if (serialized) return serialized;
-    } catch {
-      // Keep the final fallback below for non-serializable rejection values.
-    }
-  }
-  return String(reason);
-}
-
-function formatBytes(value: number): string {
-  if (!value) return "—";
-  const units = ["B", "KiB", "MiB", "GiB"];
-  const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
-  return `${(value / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
-}
-
-function formatTaskStatus(status: TaskSummary["status"]): string {
-  return {
-    running: "运行中",
-    cancelling: "正在取消",
-    finished: "已完成",
-    failed: "失败",
-    cancelled: "已取消",
-  }[status];
-}
-
-function formatCommand(command: string): string {
-  return {
-    native_task: "原生任务",
-    run_pipeline: "数据处理",
-    resume_pipeline: "恢复处理",
-    inspect_time_metadata: "时间轴检查",
-    inspect_source: "结构检查",
-    inspect_zarr: "Zarr 结构检查",
-  }[command] || command;
-}
-
-function operationLabel(operation: string): string {
-  return OPERATION_LABELS[operation] || operation;
-}
-
-function capabilityReason(item: BackendCapability["capabilities"][number]): string {
-  if (item.supported) return "已就绪 · 原生执行";
-  return item.reason || "当前走兼容执行";
-}
-
-function eventText(event: TaskEvent): string {
-  const message = event.payload.message;
-  if (typeof message === "string" && message) return message;
-  if (event.event === "progress") {
-    const completed = event.payload.completed;
-    const total = event.payload.total;
-    const temporary = event.payload.temporary_bytes;
-    const eta = event.payload.eta_seconds;
-    const parts: string[] = [];
-    if (typeof completed === "number" && typeof total === "number" && total > 0) {
-      parts.push(`业务 ${Math.round((completed / total) * 100)}%`);
-    }
-    if (typeof temporary === "number") parts.push(`临时观测 ${formatBytes(temporary)}`);
-    if (typeof eta === "number" && Number.isFinite(eta) && eta > 0) {
-      parts.push(`预计 ${Math.ceil(eta)}s`);
-    }
-    if (parts.length) return parts.join(" · ");
-  }
-  return event.stage || "任务事件";
-}
-
 function TaskDiagnosticsCard({ event }: { event: TaskEvent | null }) {
   const [copied, setCopied] = useState(false);
   if (!event) {
@@ -698,34 +361,6 @@ function TaskDiagnosticsCard({ event }: { event: TaskEvent | null }) {
     </section>
   );
 }
-
-function pathBaseName(value: string): string {
-  const trimmed = value.replace(/[\\/]+$/, "");
-  return trimmed.split(/[\\/]/).pop() || "output";
-}
-
-function pathParent(value: string): string {
-  const trimmed = value.replace(/[\\/]+$/, "");
-  const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
-  return index >= 0 ? trimmed.slice(0, index) || trimmed.slice(0, 1) : ".";
-}
-
-function joinPath(parent: string, child: string): string {
-  const separator = parent.includes("\\") && !parent.includes("/") ? "\\" : "/";
-  const trimmed = parent.replace(/[\\/]+$/, "");
-  return `${trimmed}${trimmed ? separator : separator}${child}`;
-}
-
-function outputStoreName(inputPath: string, inputKind: InputKind): string {
-  const base = pathBaseName(inputPath).replace(/\.zarr$/i, "") || "output";
-  return inputKind === "zarr" ? `${base}-processed.zarr` : `${base}.zarr`;
-}
-
-function defaultOutputPath(inputPath: string, inputKind: InputKind): string {
-  if (!inputPath) return "";
-  return joinPath(pathParent(inputPath), outputStoreName(inputPath, inputKind));
-}
-
 
 function App() {
   const [backend, setBackend] = useState<BackendInfo | null>(null);
