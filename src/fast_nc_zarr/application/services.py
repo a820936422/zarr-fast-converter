@@ -513,6 +513,15 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None, progres
         warnings.append(f"理论时间轴缺少 {len(scan.missing_times)} 个日期，转换时将写入空值切片。")
     if not scan.step_days:
         warnings.append("不同年份的文件名时间间隔不一致，需要用户确认年度时间规则。")
+    if inventory.coverage_start and scan.actual_times:
+        filename_start = str(scan.actual_times[0])[:10]
+        coverage_start = str(inventory.coverage_start)[:10]
+        if filename_start != coverage_start:
+            warnings.append(
+                f"文件名推断时间 {filename_start} 与数据内部覆盖开始日 "
+                f"{coverage_start} 不一致（来源：{inventory.internal_time_source}）；"
+                "请人工核对时间字段。"
+            )
     return _cache_inspection_result(InspectionResult(
         kind="source",
         path=source,
@@ -1084,6 +1093,15 @@ def format_source_inventory(
             f"模式：{'源数据 time 维度' if info.source_mode == 'dimension' else ('文件名 + time 组合' if info.source_mode == 'hybrid' else '文件名重建 time')}",
             f"引擎：{info.source_engine}",
             f"标准 shape(time, lat, lon)：({len(info.times)}, {len(info.lat_values)}, {len(info.lon_values)})",
+        ]
+    )
+    if info.coverage_start:
+        lines.append(
+            f"数据内部覆盖区间：{info.coverage_start} .. "
+            f"{info.coverage_end or '未知'}（来源：{info.internal_time_source or 'unknown'}）"
+        )
+    lines.extend(
+        [
             "",
             "变量：",
         ]

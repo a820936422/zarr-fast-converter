@@ -15,6 +15,7 @@ import xarray as xr
 from fast_nc_zarr.filename_mode import (
     FilenameTimeError,
     _hdf_eos_grid_values,
+    _hdf_eos_range_datetime,
     _hdf_eos_swath_axis,
     _hdf_eos_swath_structure,
     convert_filename,
@@ -183,6 +184,108 @@ class FilenameModeTests(unittest.TestCase):
             (folder / name).touch()
         with self.assertRaises(FilenameTimeError):
             scan_filename_times(folder)
+
+    def test_hdf_eos_range_datetime_parses_core_metadata(self) -> None:
+        metadata = (
+            "GROUP                  = RANGEDATETIME\n"
+            "  OBJECT               = RANGEBEGINNINGDATE\n"
+            "    VALUE              = \"2001-01-01\"\n"
+            "  END_OBJECT           = RANGEBEGINNINGDATE\n"
+            "  OBJECT               = RANGEENDINGDATE\n"
+            "    VALUE              = \"2001-12-31\"\n"
+            "  END_OBJECT           = RANGEENDINGDATE\n"
+            "END_GROUP              = RANGEDATETIME\n"
+        )
+        parsed = _hdf_eos_range_datetime(metadata)
+        self.assertEqual(parsed["range_beginning_date"], "2001-01-01")
+        self.assertEqual(parsed["range_ending_date"], "2001-12-31")
+        self.assertNotIn("production_datetime", parsed)
+        self.assertEqual(_hdf_eos_range_datetime("no time metadata at all"), {})
+
+    def test_automatic_rule_ignores_production_timestamps(self) -> None:
+        folder = ROOT / "production-timestamp"
+        folder.mkdir()
+        for name in (
+            "MCD12C1.A2001001.061.2022146170409.hdf",
+            "MCD12C1.A2002001.061.2022149015010.hdf",
+            "MCD12C1.A2003001.061.2022151221423.hdf",
+        ):
+            (folder / name).touch()
+        scan = scan_filename_times(folder)
+        self.assertEqual(scan.template, "doy")
+        self.assertEqual(scan.sample_start, 9)
+        self.assertEqual(
+            [str(value)[:10] for value in scan.actual_times],
+            ["2001-01-01", "2002-01-01", "2003-01-01"],
+        )
+
+    def test_annual_products_infer_one_point_per_year(self) -> None:
+        folder = ROOT / "annual-product"
+        folder.mkdir()
+        for name in (
+            "MCD12C1.A2001001.061.2022146170409.hdf",
+            "MCD12C1.A2002001.061.2022149015010.hdf",
+            "MCD12C1.A2003001.061.2022151221423.hdf",
+        ):
+            (folder / name).touch()
+        scan = scan_filename_times(folder)
+        self.assertTrue(scan.annual_points)
+        self.assertEqual(
+            [str(value)[:10] for value in scan.expected_times],
+            ["2001-01-01", "2002-01-01", "2003-01-01"],
+        )
+        self.assertEqual(scan.missing_times, ())
+
+    def test_annual_points_requires_one_observation_per_year(self) -> None:
+        folder = ROOT / "not-annual"
+        folder.mkdir()
+        for name in ("a_2001001.nc", "a_2001009.nc"):
+            (folder / name).touch()
+        scan = scan_filename_times(folder)
+        self.assertFalse(scan.annual_points)
+        self.assertEqual(len(scan.expected_times), 2)
+
+    def test_internal_coverage_mismatch_adds_warning(self) -> None:
+        import netCDF4
+
+        folder = ROOT / "coverage-mismatch"
+        folder.mkdir()
+        metadata = (
+            "GROUP                  = RANGEDATETIME\n"
+            "  OBJECT               = RANGEBEGINNINGDATE\n"
+            "    VALUE              = \"2005-01-01\"\n"
+            "  END_OBJECT           = RANGEBEGINNINGDATE\n"
+            "END_GROUP              = RANGEDATETIME\n"
+        )
+        lat = np.asarray([10.0, 20.0], dtype="float32")
+        lon = np.asarray([30.0, 40.0], dtype="float32")
+        for name in ("prod_2001001.hdf", "prod_2002001.hdf"):
+            with netCDF4.Dataset(folder / name, "w", format="NETCDF4") as dataset:
+                dataset.setncattr("CoreMetadata.0", metadata)
+                dataset.createDimension("lat", len(lat))
+                dataset.createDimension("lon", len(lon))
+                lat_variable = dataset.createVariable("lat", "f4", ("lat",))
+                lon_variable = dataset.createVariable("lon", "f4", ("lon",))
+                lat_variable[:] = lat
+                lon_variable[:] = lon
+                variable = dataset.createVariable("value", "f4", ("lat", "lon"))
+                variable[:] = np.arange(4, dtype="float32").reshape(2, 2)
+        from fast_nc_zarr.application.services import (
+            SourceInspectionConfig,
+            inspect_source,
+        )
+
+        result = inspect_source(
+            SourceInspectionConfig(folder, mode="filename", workers=1)
+        )
+        inventory = result.inventory
+        self.assertEqual(inventory.coverage_start, "2005-01-01")
+        self.assertEqual(inventory.internal_time_source, "hdf_eos_core_metadata")
+        self.assertTrue(
+            any("2005-01-01" in warning for warning in result.warnings),
+            f"expected coverage mismatch warning, got {result.warnings}",
+        )
+        self.assertEqual(len(inventory.times), 2)
 
     def test_manual_rule_allows_non_time_tokens_to_change(self) -> None:
         folder = ROOT / "manual"

@@ -195,6 +195,27 @@ class TimeMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不支持 calendar"):
             _normalize_daily_times((NonStandardDate(),), ROOT / "calendar.nc")
 
+    def test_noleap_calendar_is_accepted_as_day_aligned(self) -> None:
+        # noleap/365_day map 1:1 onto Gregorian ticks (only leap-day rules
+        # differ), so their ISO dates remain valid daily timestamps.
+        class NoLeapDate:
+            calendar = "noleap"
+
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            def __str__(self) -> str:
+                return self.text
+
+        normalized = _normalize_daily_times(
+            (NoLeapDate("2001-01-01 00:00:00"), NoLeapDate("2001-03-02 00:00:00")),
+            ROOT / "calendar.nc",
+        )
+        self.assertEqual(
+            [str(value)[:10] for value in normalized],
+            ["2001-01-01", "2001-03-02"],
+        )
+
 if __name__ == "__main__":
 
     unittest.main()

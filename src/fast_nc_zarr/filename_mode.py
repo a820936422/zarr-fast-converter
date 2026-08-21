@@ -103,6 +103,10 @@ class FilenameScan:
     missing_times: tuple[np.datetime64, ...]
     step_days: int
     annual_steps: tuple[tuple[int, int], ...] = ()
+    # True when exactly one observation per year was detected (for example
+    # annual products such as MCD12C1): the theoretical axis is one point per
+    # year instead of a daily cadence.
+    annual_points: bool = False
 
     @property
     def actual_keys(self) -> tuple[str, ...]:
@@ -218,6 +222,8 @@ def _expected_times(
     template: Template,
     step_days: int,
     annual_steps: dict[int, int] | None = None,
+    *,
+    annual_points: bool = False,
 ) -> tuple[np.datetime64, ...]:
     if not actual:
         raise FilenameTimeError("没有可用于构建时间轴的文件。")
@@ -233,6 +239,19 @@ def _expected_times(
         observed_by_year: dict[int, list[int]] = defaultdict(list)
         for item in actual:
             observed_by_year[item.year].append(item.timetuple().tm_yday)
+        if annual_points:
+            # Annual products (one observation per year, e.g. MCD12C1): the
+            # theoretical axis is exactly one point per year at the observed
+            # day of year, never an invented daily cadence.  Years without an
+            # observation still receive their anchor point so annual gaps are
+            # detected like any other missing time key.
+            for year in range(first.year, last.year + 1):
+                observed = observed_by_year.get(year, [])
+                point_doy = min(observed) if observed else base_start_doy
+                candidate = date(year, 1, 1) + timedelta(days=point_doy - 1)
+                if first <= candidate <= last:
+                    values.add(candidate)
+            return tuple(np.asarray(sorted(values), dtype="datetime64[ns]"))
         for year in range(first.year, last.year + 1):
             observed = observed_by_year.get(year, [])
             start_doy = min(observed) if observed else base_start_doy
@@ -301,6 +320,61 @@ def _repeated_date_like_positions(names: tuple[str, ...]) -> set[int]:
     return positions
 
 
+def _process_timestamp_positions(names: tuple[str, ...]) -> set[int]:
+    """Return changing positions that are production/processing timestamps.
+
+    HDF-EOS granules embed a processing timestamp in the filename (for
+    example MCD12C1 ``…2022146170409.hdf``: YYYYDDD HH MM SS, 13 digits, or
+    ``YYYYMMDDHHMMSS``, 14 digits).  The field is a per-granule process
+    artifact, not an observation time, so it must not make every candidate
+    date field ambiguous.
+    """
+    sample = names[0]
+    positions: set[int] = set()
+
+    def _parse(value: str, length: int) -> bool:
+        try:
+            if length == 13:
+                year, doy, hh, mm, ss = (
+                    int(value[0:4]),
+                    int(value[4:7]),
+                    int(value[7:9]),
+                    int(value[9:11]),
+                    int(value[11:13]),
+                )
+                return (
+                    2000 <= year <= 2099
+                    and 1 <= doy <= 366
+                    and 0 <= hh < 24
+                    and 0 <= mm < 60
+                    and 0 <= ss < 60
+                    and _date_from_parts("doy", (str(year), str(doy)))
+                    is not None
+                )
+            year, month, day = int(value[0:4]), int(value[4:6]), int(value[6:8])
+            return (
+                2000 <= year <= 2099
+                and 1 <= month <= 12
+                and _date_from_parts("ymd", (str(year), str(month), str(day)))
+                is not None
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    for match in re.finditer(r"\d+", sample):
+        start, end = match.span()
+        length = end - start
+        if length not in {13, 14}:
+            continue
+        values = tuple(name[start:end] for name in names)
+        if any(not value.isdigit() for value in values):
+            continue
+        if any(not _parse(value, length) for value in values):
+            continue
+        positions.update(range(start, end))
+    return positions
+
+
 def _automatic_rule_candidates(files: tuple[Path, ...], cancel_event=None) -> tuple[FilenameRuleCandidate, ...]:
     if not files:
         raise FilenameTimeError("没有可用于推断时间字段的文件。")
@@ -316,6 +390,8 @@ def _automatic_rule_candidates(files: tuple[Path, ...], cancel_event=None) -> tu
     if not changed_positions:
         raise FilenameTimeError("所有文件名都相同，无法推断时间字段。")
     repeated_date_like_positions = _repeated_date_like_positions(names)
+    process_timestamp_positions = _process_timestamp_positions(names)
+    ignorable_positions = repeated_date_like_positions | process_timestamp_positions
     suffix = files[0].suffix.lower()
     if any(path.suffix.lower() != suffix for path in files):
         raise FilenameTimeError("文件扩展名不一致，无法自动推断时间字段。")
@@ -342,10 +418,11 @@ def _automatic_rule_candidates(files: tuple[Path, ...], cancel_event=None) -> tu
                 # the directory.
                 continue
             outside_positions = changed_positions.difference(range(start, end))
-            if outside_positions and not outside_positions.issubset(repeated_date_like_positions):
+            if outside_positions and not outside_positions.issubset(ignorable_positions):
                 # Ignore only a repeated, valid date-like metadata field (for example
-                # a processing date); arbitrary changing tokens remain unsafe to
-                # ignore, and a second unique date field remains ambiguous.
+                # a processing date) or a per-granule production timestamp;
+                # arbitrary changing tokens remain unsafe to ignore, and a second
+                # unique date field remains ambiguous.
                 continue
             try:
                 dates = tuple(
@@ -457,6 +534,12 @@ def scan_filename_times(
     )
     if any(value < 1 for value in annual_steps.values()):
         raise FilenameTimeError("时间尺度必须是正整数天数。")
+    by_year_counts = Counter(item.year for item in actual_dates)
+    annual_points = bool(
+        template == "doy"
+        and len(actual_dates) > 1
+        and set(by_year_counts.values()) == {1}
+    )
     unique_steps = set(annual_steps.values())
     chosen_step = unique_steps.pop() if len(unique_steps) == 1 else 0
     expected = _expected_times(
@@ -464,6 +547,7 @@ def scan_filename_times(
         template,
         chosen_step or min(annual_steps.values()),
         annual_steps if template == "doy" else None,
+        annual_points=annual_points,
     )
     actual_keys = {time_key(item) for item in actual_np}
     missing = tuple(item for item in expected if time_key(item) not in actual_keys)
@@ -481,6 +565,7 @@ def scan_filename_times(
         missing_times=missing,
         step_days=chosen_step,
         annual_steps=tuple(sorted(annual_steps.items())),
+        annual_points=annual_points,
     )
 
 
@@ -609,6 +694,50 @@ class HdfEosSwath:
     geo_fields: tuple[str, ...]
     lat_field: str
     lon_field: str
+
+
+def _hdf_eos_range_datetime(metadata: Any) -> dict[str, str]:
+    """Parse HDF-EOS ``CoreMetadata.0`` temporal PDS objects.
+
+    HDF-EOS Grid/Swath products such as MCD12C1 carry no ``time`` dimension,
+    but their ``CoreMetadata.0`` ``RANGEDATETIME`` block declares the
+    authoritative data coverage:
+
+    - ``RANGEBEGINNINGDATE`` / ``RANGEBEGINNINGTIME``
+    - ``RANGEENDINGDATE`` / ``RANGEENDINGTIME``
+    - ``PRODUCTIONDATETIME`` (processing timestamp of the granule)
+
+    Returns the raw quoted values under ``range_beginning_date``,
+    ``range_beginning_time``, ``range_ending_date``, ``range_ending_time``
+    and ``production_datetime`` keys; empty dict when nothing parses.
+    """
+    text = str(metadata or "")
+    parsed: dict[str, str] = {}
+
+    def _value(object_name: str) -> str | None:
+        match = re.search(
+            r"OBJECT\s*=\s*" + object_name + r"(.*?)END_OBJECT",
+            text,
+            re.DOTALL,
+        )
+        if match is None:
+            return None
+        values = re.findall(r"VALUE\s*=\s*([^\n]+)", match.group(1))
+        if not values:
+            return None
+        return values[0].strip().strip('"')
+
+    for key, object_name in (
+        ("range_beginning_date", "RANGEBEGINNINGDATE"),
+        ("range_beginning_time", "RANGEBEGINNINGTIME"),
+        ("range_ending_date", "RANGEENDINGDATE"),
+        ("range_ending_time", "RANGEENDINGTIME"),
+        ("production_datetime", "PRODUCTIONDATETIME"),
+    ):
+        value = _value(object_name)
+        if value:
+            parsed[key] = value
+    return parsed
 
 
 def _hdf_eos_swath_structure(metadata: Any) -> HdfEosSwath | None:
@@ -1474,6 +1603,27 @@ def inspect_filename_inventory(
                 engine,
             )
             del reference_ds
+    coverage: dict[str, str] = {}
+    internal_time_source: str | None = None
+    if engine == "netcdf4" and scan.files:
+        # HDF-EOS Grid/Swath granules (e.g. MCD12C1) carry no time dimension,
+        # but their ``CoreMetadata.0`` ``RANGEDATETIME`` block declares the
+        # authoritative coverage.  Recover it so filename-time reconstruction
+        # can be cross-checked and the coverage semantics survive.
+        try:
+            import netCDF4 as _netCDF4
+
+            with _netCDF4.Dataset(scan.files[0]) as raw_dataset:
+                if "CoreMetadata.0" in raw_dataset.ncattrs():
+                    parsed = _hdf_eos_range_datetime(
+                        raw_dataset.getncattr("CoreMetadata.0")
+                    )
+                    if parsed:
+                        coverage = parsed
+                        internal_time_source = "hdf_eos_core_metadata"
+        except Exception:
+            coverage = {}
+            internal_time_source = None
     expected_lat_hash = _hash_axis(lat)
     expected_lon_hash = _hash_axis(lon)
     tasks = tuple(
@@ -1585,7 +1735,9 @@ def inspect_filename_inventory(
 
     full_times = np.asarray(scan.expected_times, dtype="datetime64[ns]")
     if scan.template == "doy":
-        if scan.step_days:
+        if scan.annual_points:
+            frequency, gaps = "年度（每年一个观测点）", []
+        elif scan.step_days:
             frequency, gaps = f"每 {scan.step_days} 天（按年度 DOY）", []
         else:
             rendered = ", ".join(f"{year}年={step}天" for year, step in scan.annual_steps)
@@ -1613,6 +1765,9 @@ def inspect_filename_inventory(
         filename_template=scan.template,
         filename_step_days=scan.step_days or None,
         filename_annual_steps=scan.annual_steps,
+        coverage_start=coverage.get("range_beginning_date"),
+        coverage_end=coverage.get("range_ending_date"),
+        internal_time_source=internal_time_source,
     )
 
 

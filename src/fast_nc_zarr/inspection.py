@@ -124,7 +124,25 @@ def _referenced_auxiliary_names(variables) -> set[str]:
     return referenced
 
 
-_SUPPORTED_CALENDARS = frozenset({"", "standard", "gregorian", "proleptic_gregorian", "julian"})
+# Calendars whose daily ticks map 1:1 onto the proleptic Gregorian axis.
+# ``noleap``/``365_day``/``366_day``/``all_leap`` differ only in leap-day
+# rules, so a cftime timestamp's ISO text is still a valid Gregorian date
+# (the converter keeps day precision).  ``360_day`` is deliberately NOT
+# supported: its 12×30-day year does not map 1:1 onto Gregorian ticks, so a
+# naive label mapping would silently shift the data against real time.
+_SUPPORTED_CALENDARS = frozenset(
+    {
+        "",
+        "standard",
+        "gregorian",
+        "proleptic_gregorian",
+        "julian",
+        "noleap",
+        "365_day",
+        "366_day",
+        "all_leap",
+    }
+)
 
 def _normalize_daily_times(values: tuple[Any, ...], path: Path | None = None) -> tuple[np.datetime64, ...]:
     """Normalize source timestamps to midnight dates.

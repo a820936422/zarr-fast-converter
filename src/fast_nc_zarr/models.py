@@ -136,6 +136,12 @@ class Inventory:
     filename_template: str | None = None
     filename_step_days: int | None = None
     filename_annual_steps: tuple[tuple[int, int], ...] = ()
+    # Authoritative time coverage recovered from the data itself (for example
+    # HDF-EOS ``CoreMetadata.0`` ``RANGEDATETIME``) when the source carries no
+    # time dimension.  ``internal_time_source`` names where it came from.
+    coverage_start: str | None = None
+    coverage_end: str | None = None
+    internal_time_source: str | None = None
 
     @property
     def reference_file(self) -> Path:
