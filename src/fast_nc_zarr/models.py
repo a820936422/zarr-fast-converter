@@ -142,6 +142,12 @@ class Inventory:
     coverage_start: str | None = None
     coverage_end: str | None = None
     internal_time_source: str | None = None
+    # Numeric data variables the filename mode detected but deliberately
+    # excluded from conversion because they carry an extra dimension beyond
+    # ``time/lat/lon`` (for example MCD12C1 ``Land_Cover_Type_1_Percent`` over
+    # its class dimension).  They are surfaced in the report and warnings so
+    # they are never silently dropped.
+    excluded_extra_dimension_variables: tuple[str, ...] = ()
 
     @property
     def reference_file(self) -> Path:

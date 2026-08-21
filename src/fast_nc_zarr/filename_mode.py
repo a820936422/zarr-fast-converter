@@ -1292,6 +1292,13 @@ def _rename_spatial_dims(ds):
         if set(variable.dims) == {"lat", "lon"}:
             ds[name] = variable.transpose("lat", "lon")
         else:
+            # Variables with an extra dimension beyond (lat, lon) cannot
+            # enter the canonical time/lat/lon output, but they must never
+            # disappear silently.  Record them so the inventory can surface
+            # them (report/warnings) and selecting them fails explicitly.
+            ds.attrs.setdefault(
+                "_fast_nc_zarr_excluded_extra_dimension_vars", []
+            ).append(str(name))
             ds = ds.drop_vars(name)
     return ds
 
@@ -1557,6 +1564,7 @@ def inspect_filename_inventory(
             pass
         else:
             rasterio_reference = True
+    excluded_extra: list[str] = []
     if not rasterio_reference:
         with _normalized_filename_dataset(scan.files[0], requested_engine) as (
             reference_ds,
@@ -1571,6 +1579,15 @@ def inspect_filename_inventory(
                 raise FilenameTimeError("源文件缺少可用的一维 lat/lon 坐标。")
             lat = np.asarray(reference_ds.lat.values).copy()
             lon = np.asarray(reference_ds.lon.values).copy()
+            # ``_rename_spatial_dims`` drops numeric variables with an extra
+            # dimension beyond (lat, lon) (e.g. MCD12C1 class-dimension
+            # ``Land_Cover_Type_*_Percent``) and records their names here so
+            # they surface in the report/warnings instead of vanishing.
+            excluded_extra = list(
+                reference_ds.attrs.get(
+                    "_fast_nc_zarr_excluded_extra_dimension_vars", ()
+                )
+            )
             reference_specs = []
             for name, variable in reference_ds.data_vars.items():
                 if variable.dims != ("lat", "lon") or np.dtype(variable.dtype).kind not in "biufc":
@@ -1768,6 +1785,7 @@ def inspect_filename_inventory(
         coverage_start=coverage.get("range_beginning_date"),
         coverage_end=coverage.get("range_ending_date"),
         internal_time_source=internal_time_source,
+        excluded_extra_dimension_variables=tuple(sorted(excluded_extra)),
     )
 
 

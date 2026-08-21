@@ -287,6 +287,56 @@ class FilenameModeTests(unittest.TestCase):
         )
         self.assertEqual(len(inventory.times), 2)
 
+    def test_extra_dimension_variables_are_surfaced_not_silently_dropped(self) -> None:
+        import netCDF4
+
+        folder = ROOT / "extra-dim"
+        folder.mkdir()
+        lat = np.asarray([10.0, 20.0], dtype="float32")
+        lon = np.asarray([30.0, 40.0], dtype="float32")
+        for name in ("prod_2001001.hdf", "prod_2002001.hdf"):
+            with netCDF4.Dataset(folder / name, "w", format="NETCDF4") as dataset:
+                dataset.createDimension("lat", len(lat))
+                dataset.createDimension("lon", len(lon))
+                dataset.createDimension("cls", 3)
+                lat_variable = dataset.createVariable("lat", "f4", ("lat",))
+                lon_variable = dataset.createVariable("lon", "f4", ("lon",))
+                lat_variable[:] = lat
+                lon_variable[:] = lon
+                value = dataset.createVariable("value", "f4", ("lat", "lon"))
+                value[:] = 1.0
+                percent = dataset.createVariable("percent", "f4", ("lat", "lon", "cls"))
+                percent[:] = 2.0
+        from fast_nc_zarr.application.services import (
+            ConversionConfig,
+            SourceInspectionConfig,
+            inspect_source,
+            preview_conversion,
+        )
+
+        result = inspect_source(
+            SourceInspectionConfig(folder, mode="filename", workers=1)
+        )
+        inventory = result.inventory
+        self.assertEqual(
+            inventory.excluded_extra_dimension_variables,
+            ("percent",),
+        )
+        self.assertTrue(
+            any("percent" in warning for warning in result.warnings),
+            f"expected excluded-variable warning, got {result.warnings}",
+        )
+        self.assertTrue(
+            any("已排除" in line for line in result.report.splitlines()),
+            "report must surface excluded variables",
+        )
+        config = ConversionConfig(
+            output=ROOT / "never.zarr",
+            variables=("percent",),
+        )
+        with self.assertRaisesRegex(ValueError, "额外维度"):
+            preview_conversion(result, config)
+
     def test_manual_rule_allows_non_time_tokens_to_change(self) -> None:
         folder = ROOT / "manual"
         folder.mkdir()

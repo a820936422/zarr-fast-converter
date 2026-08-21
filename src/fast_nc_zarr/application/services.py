@@ -522,6 +522,13 @@ def inspect_source(config: SourceInspectionConfig, *, cancel_event=None, progres
                 f"{coverage_start} 不一致（来源：{inventory.internal_time_source}）；"
                 "请人工核对时间字段。"
             )
+    if inventory.excluded_extra_dimension_variables:
+        warnings.append(
+            "源文件含 "
+            f"{len(inventory.excluded_extra_dimension_variables)} 个带额外维度的数值变量，"
+            "未纳入转换（当前转换仅支持 time/lat/lon）："
+            + ", ".join(inventory.excluded_extra_dimension_variables)
+        )
     return _cache_inspection_result(InspectionResult(
         kind="source",
         path=source,
@@ -1100,6 +1107,11 @@ def format_source_inventory(
             f"数据内部覆盖区间：{info.coverage_start} .. "
             f"{info.coverage_end or '未知'}（来源：{info.internal_time_source or 'unknown'}）"
         )
+    if info.excluded_extra_dimension_variables:
+        lines.append(
+            "已排除的额外维度变量（当前转换仅支持 time/lat/lon）："
+            + ", ".join(info.excluded_extra_dimension_variables)
+        )
     lines.extend(
         [
             "",
@@ -1269,7 +1281,16 @@ def _validate_variable_options(
     selected_names = tuple(selected) if selected else tuple(inventory.variables)
     unknown = sorted(set(selected_names) - set(inventory.variables))
     if unknown:
-        raise ValueError("未知变量：" + ", ".join(unknown))
+        excluded = set(inventory.excluded_extra_dimension_variables)
+        extra = sorted(name for name in unknown if name in excluded)
+        remaining = sorted(name for name in unknown if name not in excluded)
+        if extra:
+            raise ValueError(
+                "变量含额外维度，无法转换（当前转换仅支持 time/lat/lon）："
+                + ", ".join(extra)
+            )
+        if remaining:
+            raise ValueError("未知变量：" + ", ".join(remaining))
     unknown_options = sorted(
         (set(variable_names) | set(transforms)) - set(selected_names)
     )

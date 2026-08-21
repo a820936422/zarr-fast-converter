@@ -159,6 +159,21 @@ def _case_mcd12c1(spec: dict[str, Any], work_root: Path) -> dict[str, Any]:
             f"filename-reconstructed time {actual_first} != CoreMetadata "
             f"{expected_first}"
         )
+    expected_excluded = {
+        "Land_Cover_Type_1_Percent",
+        "Land_Cover_Type_2_Percent",
+        "Land_Cover_Type_3_Percent",
+    }
+    if set(inventory.excluded_extra_dimension_variables) != expected_excluded:
+        raise AssertionError(
+            f"expected excluded class-dimension variables "
+            f"{sorted(expected_excluded)}, got "
+            f"{inventory.excluded_extra_dimension_variables}"
+        )
+    if not any(
+        "额外维度" in warning for warning in result.warnings
+    ):
+        raise AssertionError("expected excluded-variable warning")
     return {
         "granules": len(names),
         "template": inventory.filename_template,
@@ -171,6 +186,10 @@ def _case_mcd12c1(spec: dict[str, Any], work_root: Path) -> dict[str, Any]:
         "coverage_start": inventory.coverage_start,
         "coverage_end": inventory.coverage_end,
         "internal_time_source": inventory.internal_time_source,
+        "excluded_extra_dimension_variables": list(
+            inventory.excluded_extra_dimension_variables
+        ),
+        "inventory_variable_count": len(inventory.variables),
         "warnings": list(result.warnings),
     }
 
