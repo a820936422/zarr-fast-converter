@@ -31,9 +31,16 @@ import traceback
 from typing import Any, Callable
 
 import numpy as np
+import rasterio
+from rasterio.crs import CRS
+from rasterio.transform import Affine
+from rasterio.windows import Window
 import xarray as xr
 
 from fast_nc_zarr.application.services import SourceInspectionConfig, inspect_source
+from fast_nc_zarr.engine import convert
+from fast_nc_zarr.filename_mode import FilenameTimeError, convert_filename
+from fast_nc_zarr.models import Selection
 from fast_nc_zarr.pipeline.engine import preview_pipeline, run_pipeline
 from fast_nc_zarr.pipeline.models import (
     PipelineConfig,
@@ -339,6 +346,199 @@ def _case_glass(spec: dict[str, Any], work_root: Path) -> dict[str, Any]:
     )
 
 
+def _synthetic_geotiffs(work_root: Path, *, rotated: bool) -> Path:
+    """Two single-day GeoTIFFs; optionally with a rotated affine transform."""
+    angle = np.radians(14.0)
+    rotated_transform = (
+        Affine.translation(-10.0, 40.0)
+        * Affine.rotation(angle)
+        * Affine.scale(0.1, 0.1)
+        * Affine.translation(-0.5, -0.5)
+    )
+    plain_transform = Affine.translation(-10.0, 40.0) * Affine.scale(0.1, 0.1)
+    folder = work_root / ("rotated" if rotated else "multiband")
+    folder.mkdir(parents=True, exist_ok=True)
+    height, width = 20, 24
+    crs = CRS.from_epsg(4326)
+    for doy in ("2001001", "2001009"):
+        base = (
+            np.arange(height * width, dtype="float32").reshape(height, width)
+            + float(doy[-2:])
+        )
+        name = f"{'rot' if rotated else 'mb'}_{doy}.tif"
+        transform = rotated_transform if rotated else plain_transform
+        with rasterio.open(
+            folder / name,
+            "w",
+            driver="GTiff",
+            height=height,
+            width=width,
+            count=3 if not rotated else 1,
+            dtype="float32",
+            crs=crs,
+            transform=transform,
+        ) as dataset:
+            if rotated:
+                dataset.write(base, 1)
+            else:
+                for band in (1, 2, 3):
+                    dataset.write((base * band).astype("float32"), band)
+    return folder
+
+
+def _case_multiband_rejected(work_root: Path) -> dict[str, Any]:
+    links = _synthetic_geotiffs(work_root, rotated=False)
+    try:
+        inspect_source(
+            SourceInspectionConfig(links, mode="filename", engine="rasterio", workers=1)
+        )
+    except FilenameTimeError as exc:
+        message = str(exc)
+        if "多" not in message or "band" not in message:
+            raise AssertionError(f"unexpected rejection message: {message}")
+        return {
+            "supported": False,
+            "reason": message,
+            "note": "多 band GeoTIFF 在 filename 模式被确定性拒绝（单 band 约束），与低层栅格读取语义一致",
+        }
+    raise AssertionError("multi-band GeoTIFF was accepted without rejection")
+
+
+def _case_rotated_geotiff(work_root: Path) -> dict[str, Any]:
+    links = _synthetic_geotiffs(work_root, rotated=True)
+    inspection = inspect_source(
+        SourceInspectionConfig(links, mode="filename", engine="rasterio", workers=1)
+    )
+    inventory = inspection.inventory
+    lat = np.asarray(inventory.lat_values)
+    lon = np.asarray(inventory.lon_values)
+    lat_regular = bool(
+        len(lat) > 1 and np.allclose(np.diff(lat), np.diff(lat)[0], rtol=1e-4)
+    )
+    lon_regular = bool(
+        len(lon) > 1 and np.allclose(np.diff(lon), np.diff(lon)[0], rtol=1e-4)
+    )
+    width = 12
+    lat0 = (len(lat) - width) // 2
+    lon0 = (len(lon) - width) // 2
+    with rasterio.open(links / "rot_2001001.tif") as dataset:
+        raw = np.asarray(
+            dataset.read(1, window=Window(lon0, lat0, width, width)), dtype="float32"
+        )
+    selection = Selection(
+        variables=("band_data",),
+        time_start=0,
+        time_stop=1,
+        lat_start=lat0,
+        lat_stop=lat0 + width,
+        lon_start=lon0,
+        lon_stop=lon0 + width,
+    )
+    output = work_root / "rotated-window.zarr"
+    _remove_output(output)
+    convert_filename(
+        inventory,
+        selection,
+        output,
+        auto_tune=False,
+        max_workers=1,
+        reserve_gib=0.25,
+        overwrite=True,
+        validate=True,
+        progress=False,
+    )
+    with xr.open_zarr(
+        output, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+    ) as result:
+        values = np.asarray(result["band_data"].values)
+        if values.shape != (1, width, width):
+            raise AssertionError(f"unexpected rotated-window shape: {values.shape}")
+        np.testing.assert_array_equal(values[0], raw)
+    return {
+        "supported": True,
+        "regular_grid_reconstructed": bool(lat_regular and lon_regular),
+        "georeprojection": False,
+        "note": (
+            "旋转仿射 GeoTIFF 按文件像素索引读取、坐标按规则网格重建（无地理重投影）；"
+            "转换值逐像素与栅格原始窗口读取一致"
+        ),
+        "window": {"time": [0, 1], "lat": [lat0, lat0 + width], "lon": [lon0, lon0 + width]},
+        "lat_first_last": [float(lat[0]), float(lat[-1])],
+        "lon_first_last": [float(lon[0]), float(lon[-1])],
+    }
+
+
+def _case_packed_preserved(work_root: Path) -> dict[str, Any]:
+    folder = work_root / "packed"
+    folder.mkdir(parents=True, exist_ok=True)
+    times = np.asarray(["2001-01-01"], dtype="datetime64[ns]")
+    lat = np.arange(10, 30, 2.0)
+    lon = np.arange(-20, 20, 2.0)
+    raw = np.arange(lat.size * lon.size, dtype="int16").reshape(1, lat.size, lon.size)
+    dataset = xr.Dataset(
+        {
+            "packed": (
+                ("time", "lat", "lon"),
+                raw,
+                {"scale_factor": 0.1, "add_offset": 100.0, "_FillValue": -9999},
+            )
+        },
+        coords={"time": times, "lat": lat, "lon": lon},
+    )
+    dataset.to_netcdf(folder / "input.nc", engine="h5netcdf")
+    dataset.close()
+    inspection = inspect_source(
+        SourceInspectionConfig(folder, mode="complete", engine="h5netcdf", workers=1)
+    )
+    inventory = inspection.inventory
+    selection = Selection(
+        variables=("packed",),
+        time_start=0,
+        time_stop=1,
+        lat_start=0,
+        lat_stop=len(lat),
+        lon_start=0,
+        lon_stop=len(lon),
+    )
+    output = work_root / "packed-out.zarr"
+    _remove_output(output)
+    convert(
+        inventory,
+        selection,
+        output,
+        auto_tune=False,
+        max_workers=1,
+        reserve_gib=0.25,
+        overwrite=True,
+        validate=True,
+        progress=False,
+    )
+    with xr.open_zarr(
+        output, consolidated=False, chunks=None, decode_times=False, mask_and_scale=False
+    ) as result:
+        values = np.asarray(result["packed"].values)
+        np.testing.assert_array_equal(values, raw)
+        attrs = dict(result["packed"].attrs)
+        for key, expected in (
+            ("_FillValue", -9999),
+            ("scale_factor", 0.1),
+            ("add_offset", 100.0),
+        ):
+            if attrs.get(key) != expected:
+                raise AssertionError(f"packing attr {key} mismatch: {attrs.get(key)!r}")
+    return {
+        "supported": True,
+        "values_preserved": True,
+        "attrs_preserved": True,
+        "dtype": "int16",
+        "resample_decode_covered_by": "glass_filename_fusion_gap_parity",
+        "note": (
+            "int16 + scale_factor/add_offset 打包整数：转换路径保留打包值与 CF attrs；"
+            "native 打包 int16 拒绝，重采样路径按 mask_and_scale 解码为物理值（GLASS case 覆盖）"
+        ),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -377,6 +577,27 @@ def main(argv: list[str] | None = None) -> int:
                 lambda: _case_glass(specs["glass_evi"], args.work_root),
             )
         )
+    cases.append(
+        _run_case(
+            "synthetic_multiband_geotiff_rejected",
+            EXACT,
+            lambda: _case_multiband_rejected(args.work_root),
+        )
+    )
+    cases.append(
+        _run_case(
+            "synthetic_rotated_geotiff_regular_grid",
+            EXACT,
+            lambda: _case_rotated_geotiff(args.work_root),
+        )
+    )
+    cases.append(
+        _run_case(
+            "synthetic_packed_preserved_convert",
+            EXACT,
+            lambda: _case_packed_preserved(args.work_root),
+        )
+    )
 
     passed = sum(bool(item["passed"]) for item in cases)
     failed = len(cases) - passed
